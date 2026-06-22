@@ -8,10 +8,15 @@ Point it at your database. It reads your RLS policies from the catalog and **aut
 
 ```bash
 pip install rlsautotest
+
+# Quick check: write a per-identity access report, then open rls-report.html in your browser (nothing saved)
+rlsautotest --db-url "$DATABASE_URL" --schema public --html rls-report.html
+
+# Or: generate a native pgTAP suite to commit and run in CI (pg_prove / supabase test db / psql)
 rlsautotest --db-url "$DATABASE_URL" --schema public --emit supabase/
-supabase test db                       # the generated suite runs natively
-rlsautotest --db-url "$DATABASE_URL" --schema public --report
 ```
+
+_Running the suite - on a local Supabase (`supabase test db`), `pg_prove`, or in CI - is covered in [INSTALL.md](INSTALL.md)._
 
 ## Demo
 
@@ -174,4 +179,6 @@ Built on [pgTAP](https://pgtap.org) and `pg_prove` (David Wheeler), the [basejum
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Copyright (c) 2026 Munaf Ibrahim Khatri.
+
+Licensed under Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

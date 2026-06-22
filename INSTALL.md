@@ -72,6 +72,18 @@ B2 is the step Path A skips: you inspect and own the tests before they become yo
 
 ---
 
+### Run on a local Supabase (`supabase test db`)
+
+Using the Supabase CLI? The emitted files run with its built-in test runner. Generate into your project's `supabase/` folder, pointing `--db-url` at your **local** dev database (default Postgres port `54322`), then start the stack and run:
+
+```bash
+rlsautotest --db-url "postgresql://postgres:postgres@127.0.0.1:54322/postgres" --schema public --emit supabase/
+supabase start          # requires Docker
+supabase test db        # runs pg_prove in the local container over supabase/tests/database/
+```
+
+A failing RLS assertion - or the `010-rls-enabled` guard catching a table with RLS off - fails the run, so it gates CI. No CLI or Docker? Use the `pg_prove` / `psql` commands from Path B above against the same local copy.
+
 ## How it works
 
 rlsautotest **reads your RLS policies** and tests *those exact policies on those exact tables*. Two consequences, and they matter:

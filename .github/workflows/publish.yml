@@ -8,12 +8,17 @@ jobs:
     runs-on: ubuntu-latest
     environment: pypi              # must match the PyPI trusted-publisher config (or remove from both)
     permissions:
-      id-token: write             # REQUIRED: lets PyPI verify GitHub via OIDC (no stored token)
+      id-token: write             # PyPI trusted publishing (OIDC) - no stored token
+      contents: write             # attach the built wheel + sdist to the GitHub Release
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install --upgrade build
-      - run: python -m build
+      - run: python -m build        # -> dist/*.whl + dist/*.tar.gz
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Attach wheel + sdist to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
