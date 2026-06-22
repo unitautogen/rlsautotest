@@ -1644,7 +1644,7 @@ def render_report_html(reps, schema):
  h1{{font-size:1.4rem;margin:0 0 .25rem}} .sub{{color:#666;margin:0 0 1rem}}
  .summary{{margin:.5rem 0 1rem}} .kpi{{font-weight:600}} .good{{color:#15803d}} .bad{{color:#b91c1c}}
  .ban{{padding:.6rem .8rem;border-radius:6px;margin:.4rem 0}}
- .ban.danger{{background:#fee2e2;border:1px solid #fca5a5}} .ban.warn{{background:#fef3c7;border:1px solid #fcd34d}}
+ .ban.danger{{background:#fee2e2;border:1px solid #fca5a5;color:#7f1d1d}} .ban.warn{{background:#fef3c7;border:1px solid #fcd34d;color:#92400e}}
  section.tbl{{margin:1.5rem 0}}
  section.tbl h2{{font-size:1.05rem;margin:0 0 .4rem}}
  .chip{{font-size:.72rem;font-weight:600;padding:.1rem .5rem;border-radius:999px;vertical-align:middle}}
@@ -1654,7 +1654,7 @@ def render_report_html(reps, schema):
  .grid th{{background:#f9fafb;font-weight:600;text-align:center}} .grid th:first-child{{text-align:left}}
  td.idn{{font-weight:600;white-space:nowrap}} .rolenote{{font-weight:400;color:#888;font-size:.78rem}}
  td.c{{text-align:center;font-size:1.05rem}}
- .pass{{background:#dcfce7;color:#15803d}} .none{{color:#cbd5e1}} .na{{color:#cbd5e1}}
+ .pass{{background:#dcfce7;color:#15803d}} .none{{color:#94a3b8}} .na{{color:#94a3b8}}
  .svc{{background:#f1f5f9;color:#475569}}
  .danger{{background:#dc2626;color:#fff;font-weight:700}} .fail{{background:#fee2e2;color:#b91c1c;font-weight:700}}
  ul.flags{{margin:.4rem 0 0;padding-left:1.1rem;color:#92400e;font-size:.85rem}}
