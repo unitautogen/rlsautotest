@@ -2,6 +2,8 @@
 
 **Deterministic pgTAP test generation for Postgres / Supabase Row-Level Security.**
 
+> **Status: beta (v0.x).** Actively developed and the CLI may still change - but it's built to **never emit a false-passing test**: anything it can't verify soundly is marked, not faked.
+
 Point it at your database. It reads your RLS policies from the catalog and **auto-generates both the tests and the seed data** — a native [pgTAP](https://pgtap.org) suite that *proves*, per table, per command, per identity, who can `SELECT` / `INSERT` / `UPDATE` / `DELETE` which rows, plus a per-identity access-matrix report and a CI gate that fails the build on any leak or unprotected table.
 
 ```bash

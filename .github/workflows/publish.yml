@@ -1,0 +1,19 @@
+name: publish
+on:
+  release:
+    types: [published]   # fires when you publish a GitHub Release
+
+jobs:
+  pypi:
+    runs-on: ubuntu-latest
+    environment: pypi              # must match the PyPI trusted-publisher config (or remove from both)
+    permissions:
+      id-token: write             # REQUIRED: lets PyPI verify GitHub via OIDC (no stored token)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install --upgrade build
+      - run: python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

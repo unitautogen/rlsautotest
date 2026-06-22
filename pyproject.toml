@@ -12,9 +12,11 @@ requires-python = ">=3.10"
 authors = [{ name = "Munaf Ibrahim Khatri" }]
 keywords = ["postgres", "postgresql", "supabase", "rls", "row-level-security", "pgtap", "testing", "security"]
 classifiers = [
+    "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
     "Topic :: Software Development :: Testing",
+    "Topic :: Security",
     "Topic :: Database",
 ]
 dependencies = [
