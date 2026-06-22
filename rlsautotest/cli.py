@@ -1,0 +1,2381 @@
+#!/usr/bin/env python3
+# Copyright 2026 Munaf Ibrahim Khatri
+# SPDX-License-Identifier: Apache-2.0
+"""testgen.rls - predicate-tree, command-aware RLS test generator.
+
+Per RLS_ARCHITECTURE.md. For EACH command we take the applicable policies, parse
+the right clause (USING for reads, WITH CHECK for INSERT) to DNF min-terms, and
+derive one identity class per min-term. Emits the role-switch AAA battery with:
+ - recursive ancestors-first FK seeding (multi-table / transitive chains),
+ - enum-aware fills + enum-typed RBAC labels,
+ - fresh-identity insert when the link column is unique/PK,
+ - (SELECT auth.uid()) wrapper unwrap, auth.role()='authenticated' open gate.
+Unhandled atoms -> reason-coded NOT_TESTABLE.
+
+  python -m testgen.rls --schema <s> --table <t> [--describe] [--out f.sql]
+"""
+from __future__ import annotations
+import argparse, json, re, sys
+import psycopg
+from pglast.parser import parse_sql_json
+
+
+# ---------- catalog helpers (self-contained; no external module deps) ----------
+def _columns(cur, schema, table):
+    cur.execute("""
+        SELECT a.attname, format_type(a.atttypid, a.atttypmod),
+               a.attnotnull, (a.atthasdef OR a.attidentity <> '') AS hasdef
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname=%s AND c.relname=%s AND a.attnum>0 AND NOT a.attisdropped
+        ORDER BY a.attnum""", (schema, table))
+    return cur.fetchall()
+
+
+def _fk_of(cur, schema, table, col):
+    cur.execute("""
+        SELECT nf.nspname, cf.relname, af.attname
+        FROM pg_constraint k
+        JOIN pg_class c   ON c.oid  = k.conrelid
+        JOIN pg_namespace n  ON n.oid  = c.relnamespace
+        JOIN pg_class cf  ON cf.oid = k.confrelid
+        JOIN pg_namespace nf ON nf.oid = cf.relnamespace
+        JOIN pg_attribute a  ON a.attrelid = k.conrelid  AND a.attnum  = k.conkey[1]
+        JOIN pg_attribute af ON af.attrelid = k.confrelid AND af.attnum = k.confkey[1]
+        WHERE n.nspname=%s AND c.relname=%s AND k.contype='f'
+              AND array_length(k.conkey,1)=1 AND a.attname=%s
+        LIMIT 1""", (schema, table, col))
+    return cur.fetchone()
+
+
+def _lit(typ):
+    t = typ.lower()
+    if "char" in t or "text" in t: return "'x'"
+    if "uuid" in t: return "'000000ff-0000-0000-0000-0000000000ff'"
+    if "bool" in t: return "false"
+    if any(k in t for k in ("int", "numeric", "real", "double", "decimal")): return "1"
+    if "timestamp" in t or "date" in t: return "now()"
+    if "json" in t: return "'{}'"
+    return "'x'"
+
+CV = ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"]
+MV = ["a0000001-0000-0000-0000-000000000001", "a0000002-0000-0000-0000-000000000002", "a0000003-0000-0000-0000-000000000003"]
+FOREIGN = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+NOBODY = "99999999-9999-9999-9999-999999999999"
+RIVAL_SUB = "b0000000-0000-0000-0000-0000000000bb"   # a DIFFERENT authenticated user who belongs to a DIFFERENT tenant (org B)
+RIVAL_ORG = "b0000000-0000-0000-0000-00000000b0b0"   # tenant B's scope value — proves "has tenancy, just not A's"
+INS = "cccccccc-cccc-cccc-cccc-cccccccccccc"   # fresh value for insert-into-own-scope tests
+ORDER = ["SELECT", "INSERT", "UPDATE", "DELETE"]
+
+
+# ---------- AST helpers (pglast / libpg_query) — the only parser; no regex on SQL ----------
+def _t(n): return next(iter(n)) if isinstance(n, dict) and n else None
+def _v(n): return n[_t(n)]
+def _names(lst): return ".".join(x.get("String", {}).get("sval", "") for x in (lst or []))
+
+
+def _where(clause):
+    try:
+        tree = json.loads(parse_sql_json(f"SELECT 1 WHERE {clause}"))
+        return tree["stmts"][0]["stmt"]["SelectStmt"].get("whereClause")
+    except Exception:
+        return None
+
+
+def _unwrap(n):
+    """Strip TypeCast and (SELECT expr) EXPR_SUBLINK wrappers to the inner node."""
+    while isinstance(n, dict) and n:
+        t = _t(n)
+        if t == "TypeCast":
+            n = _v(n).get("arg")
+        elif t == "SubLink" and _v(n).get("subLinkType") == "EXPR_SUBLINK":
+            tl = _v(n).get("subselect", {}).get("SelectStmt", {}).get("targetList", [])
+            n = tl[0].get("ResTarget", {}).get("val") if tl else None
+        else:
+            break
+    return n
+
+
+def _is_func(n, fq):
+    n = _unwrap(n)
+    return _t(n) == "FuncCall" and _names(_v(n).get("funcname")) == fq
+
+
+def _colname(n):
+    n = _unwrap(n)
+    if _t(n) == "ColumnRef":
+        fl = _v(n).get("fields", [])
+        return fl[-1].get("String", {}).get("sval") if fl else None
+    return None
+
+
+def _colqual(n):
+    n = _unwrap(n)
+    if _t(n) == "ColumnRef":
+        fl = [f.get("String", {}).get("sval") for f in _v(n).get("fields", [])]
+        if len(fl) >= 2: return fl[-2], fl[-1]
+        if fl: return None, fl[-1]
+    return None, None
+
+
+def _const(n):
+    n = _unwrap(n)
+    if _t(n) == "A_Const":
+        v = _v(n)
+        if "sval" in v: return v["sval"].get("sval")
+        if "ival" in v: return str(v["ival"].get("ival", 0))
+        if "boolval" in v: return "true" if v["boolval"].get("boolval") else "false"
+        if "fval" in v: return v["fval"].get("fval")
+    return None
+
+
+def _is_uuid(s):
+    return bool(s) and bool(re.fullmatch(r"[0-9a-fA-F-]{36}", s))
+
+
+def _jwt_keys(n):
+    """auth.jwt() -> 'a' ->> 'b' chain -> ['a','b']; else None."""
+    n = _unwrap(n); keys = []
+    while _t(n) == "A_Expr" and _names(_v(n).get("name")) in ("->", "->>"):
+        rk = _const(_v(n).get("rexpr"))
+        if rk is None: return None
+        keys.insert(0, rk); n = _unwrap(_v(n).get("lexpr"))
+    return keys if (keys and _is_func(n, "auth.jwt")) else None
+
+
+def _jwt_anywhere(n):
+    """Find the first auth.jwt() claim-key chain anywhere in a node tree (handles claim-in-variable)."""
+    if isinstance(n, dict):
+        k = _jwt_keys(n)
+        if k: return k
+        for v in n.values():
+            r = _jwt_anywhere(v)
+            if r: return r
+    elif isinstance(n, list):
+        for x in n:
+            r = _jwt_anywhere(x)
+            if r: return r
+    return None
+
+
+def _eq_pairs(n):
+    out = []
+    if not isinstance(n, dict): return out
+    if _t(n) == "BoolExpr":
+        for a in _v(n).get("args", []): out += _eq_pairs(a)
+    elif _t(n) == "A_Expr" and _names(_v(n).get("name")) == "=":
+        out.append((_v(n).get("lexpr"), _v(n).get("rexpr")))
+    return out
+
+
+def _membership(subselect, testexpr):
+    ss = (subselect or {}).get("SelectStmt", {})
+    frm = ss.get("fromClause", [])
+    if not frm or "RangeVar" not in frm[0]:
+        return {"kind": "unknown", "text": "membership-subquery"}
+    rv = frm[0]["RangeVar"]
+    mtable = (rv.get("schemaname") + "." if rv.get("schemaname") else "") + rv.get("relname", "")
+    alias = (rv.get("alias") or {}).get("aliasname") or rv.get("relname")
+    muser = mscope = rowscope = None
+    for (l, r) in _eq_pairs(ss.get("whereClause")):
+        if _is_func(l, "auth.uid") or _is_func(r, "auth.uid"):
+            _, muser = _colqual(r if _is_func(l, "auth.uid") else l)
+        else:
+            lq, lc = _colqual(l); rq, rc = _colqual(r)
+            if lc and rc:
+                if lq == alias: mscope, rowscope = lc, rc
+                elif rq == alias: mscope, rowscope = rc, lc
+    if testexpr is not None:
+        _, rowscope = _colqual(testexpr)
+        tl = ss.get("targetList", [])
+        if tl: mscope = _colname(tl[0].get("ResTarget", {}).get("val"))
+    if muser and mscope and rowscope:
+        return {"kind": "membership", "mtable": mtable, "muser_col": muser, "mscope_col": mscope, "row_scope_col": rowscope}
+    return {"kind": "unknown", "text": "membership-subquery"}
+
+
+def _folder_owner(ind, uid):
+    """(storage.foldername(<col>))[1] = auth.uid()[::text]  -> owner via path segment."""
+    if not _is_func(uid, "auth.uid") or _t(ind) != "A_Indirection":
+        return None
+    arg = _v(ind).get("arg")
+    if _t(arg) == "FuncCall" and _names(_v(arg).get("funcname")).split(".")[-1] == "foldername":
+        fa = _v(arg).get("args", [])
+        col = _colname(fa[0]) if fa else None
+        if col:
+            return {"kind": "folder_owner", "col": col}
+    return None
+
+
+def _classify_aexpr(a, cur):
+    kind = a.get("kind"); op = _names(a.get("name")); L = a.get("lexpr"); R = a.get("rexpr")
+    if kind == "AEXPR_OP_ANY" and op == "=":
+        if _is_func(L, "auth.uid") and _colname(R): return {"kind": "array_col", "col": _colname(R)}
+        if _is_func(R, "auth.uid") and _colname(L): return {"kind": "array_col", "col": _colname(L)}
+        return {"kind": "unknown", "text": "= ANY(...)"}
+    if kind != "AEXPR_OP": return {"kind": "unknown", "text": kind or "expr"}
+    if op in (">", "<", ">=", "<="):
+        if _is_func(R, "now") and _colname(L): return {"kind": "temporal", "col": _colname(L), "op": op}
+        if _is_func(L, "now") and _colname(R):
+            return {"kind": "temporal", "col": _colname(R), "op": {">": "<", "<": ">", ">=": "<=", "<=": ">="}[op]}
+        return {"kind": "unknown", "text": f"cmp {op}"}
+    if op != "=": return {"kind": "unknown", "text": f"op {op}"}
+    fo = _folder_owner(L, R) or _folder_owner(R, L)
+    if fo: return fo
+    if _is_func(L, "auth.uid") or _is_func(R, "auth.uid"):
+        other = R if _is_func(L, "auth.uid") else L
+        if _is_uuid(_const(other)): return {"kind": "const_identity", "value": _const(other)}
+        if _colname(other): return {"kind": "owner", "col": _colname(other)}
+        return {"kind": "unknown", "text": "auth.uid eq"}
+    if _is_func(L, "auth.role") or _is_func(R, "auth.role"):
+        other = R if _is_func(L, "auth.role") else L
+        return {"kind": "auth_role", "value": _const(other) or ""}
+    jl, jr = _jwt_keys(L), _jwt_keys(R)
+    if jl or jr:
+        keys = jl or jr; other = R if jl else L
+        if _colname(other): return {"kind": "tenant", "col": _colname(other), "keys": keys}
+        if _const(other) is not None: return {"kind": "claim_const", "keys": keys, "value": _const(other)}
+        return {"kind": "unknown", "text": "jwt eq"}
+    if _colname(L) and _const(R) is not None: return {"kind": "row_const", "col": _colname(L), "value": _const(R)}
+    if _colname(R) and _const(L) is not None: return {"kind": "row_const", "col": _colname(R), "value": _const(L)}
+    return {"kind": "unknown", "text": "eq"}
+
+
+def classify_node(n, cur=None):
+    """Classify one AST leaf node into an atom dict (same shapes build_class expects)."""
+    t = _t(n)
+    if t == "A_Const":
+        return {"kind": "_true_"} if _const(n) == "true" else {"kind": "unknown", "text": "const"}
+    if t == "ColumnRef":
+        return {"kind": "row_const", "col": _colname(n), "value": "true"} if _colname(n) else {"kind": "unknown", "text": "colref"}
+    if t == "SubLink":
+        v = _v(n); st = v.get("subLinkType")
+        if st == "EXISTS_SUBLINK": return _membership(v.get("subselect"), None)
+        if st == "ANY_SUBLINK": return _membership(v.get("subselect"), v.get("testexpr"))
+        if st == "EXPR_SUBLINK": return classify_node(_unwrap(n), cur)
+        return {"kind": "unknown", "text": st or "sublink"}
+    if t == "FuncCall":
+        v = _v(n); fn = _names(v.get("funcname")); args = v.get("args", [])
+        if args and _const(args[0]) is not None and cur and not any(b in fn for b in ("auth.", "now")):
+            info = _introspect_rbac(cur, fn, _const(args[0]))
+            if info: return {"kind": "rbac", **info}
+            cf = _introspect_claim_fn(cur, fn, _const(args[0]))
+            if cf: return {"kind": "claim_const", **cf}
+        return {"kind": "unknown", "text": f"function {fn}()"}
+    if t == "A_Expr":
+        return _classify_aexpr(_v(n), cur)
+    return {"kind": "unknown", "text": t or "node"}
+
+
+def _dnf_ast(n):
+    """Boolean AST -> DNF: list of min-terms, each a list of leaf nodes."""
+    t = _t(n)
+    if t == "BoolExpr":
+        bo = _v(n).get("boolop")
+        if bo == "OR_EXPR":
+            out = []
+            for a in _v(n).get("args", []): out += _dnf_ast(a)
+            return out
+        if bo == "AND_EXPR":
+            partial = [[]]
+            for a in _v(n).get("args", []):
+                partial = [m + s for m in partial for s in _dnf_ast(a)]
+            return partial
+    return [[n]]
+
+
+def _is_true_clause(q):
+    w = _where(q or "")
+    return _t(w) == "A_Const" and _const(w) == "true"
+
+
+def _find_queries(obj, out=None):
+    """Collect embedded SQL query strings from a parsed plpgsql tree (PLpgSQL_expr.query)."""
+    if out is None: out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "query" and isinstance(v, str): out.append(v)
+            else: _find_queries(v, out)
+    elif isinstance(obj, list):
+        for x in obj: _find_queries(x, out)
+    return out
+
+
+def _func_selects(cur, fn):
+    """Return (SelectStmt AST nodes inside fn's body, arg names) — SQL and plpgsql, via AST."""
+    parts = fn.split("."); name = parts[-1]; sch = parts[-2] if len(parts) > 1 else None
+    cur.execute("""SELECT p.prosrc, l.lanname, p.proargnames, pg_get_functiondef(p.oid)
+        FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE p.proname=%s AND (%s::text IS NULL OR n.nspname=%s) ORDER BY (n.nspname='public')::int LIMIT 1""", (name, sch, sch))
+    row = cur.fetchone()
+    if not row: return [], []
+    src, lang, argnames, fdef = row
+    queries = [src] if lang == "sql" else []
+    if lang == "plpgsql":
+        try:
+            from pglast import parse_plpgsql
+            queries = _find_queries(parse_plpgsql(fdef))
+        except Exception:
+            queries = []
+    selects = []
+    for qy in queries:
+        cands = [qy, "SELECT " + qy]        # plpgsql exprs are bare -> also try wrapped
+        if " := " in qy:                    # assignment "v := <expr>" -> parse the RHS
+            cands.append("SELECT " + qy.split(" := ", 1)[1])
+        for cand in cands:
+            try:
+                got = False
+                for st in json.loads(parse_sql_json(cand)).get("stmts", []):
+                    s = st.get("stmt", {}).get("SelectStmt")
+                    if s: selects.append(s); got = True
+                if got: break
+            except Exception:
+                pass
+    return selects, (argnames or [])
+
+
+def _introspect_rbac(cur, fn, arg):
+    """RBAC fn (AST): a SELECT over a (role, permission) table where the permission column is
+    compared to the fn's argument and the role column to the caller's JWT claim (inline OR via a
+    variable assigned from auth.jwt())."""
+    selects, argnames = _func_selects(cur, fn)
+    claim = None
+    for ss in selects:
+        claim = claim or _jwt_anywhere(ss)
+    if not claim:
+        return None
+    for ss in selects:
+        frm = ss.get("fromClause", [])
+        if not frm or "RangeVar" not in frm[0]: continue
+        rv = frm[0]["RangeVar"]; relname = rv.get("relname")
+        tbl = (rv.get("schemaname") + "." if rv.get("schemaname") else "") + relname
+        cur.execute("SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid WHERE c.relname=%s AND a.attnum>0 AND NOT a.attisdropped", (relname,))
+        tcols = {r[0] for r in cur.fetchall()}
+        role_col = perm_col = None
+        for (l, r) in _eq_pairs(ss.get("whereClause")):
+            lc, rc = _colname(l), _colname(r)
+            if lc in tcols: tcol, other = lc, rc
+            elif rc in tcols: tcol, other = rc, lc
+            else: continue
+            if other in argnames: perm_col = tcol
+            else: role_col = tcol
+        if role_col and perm_col:
+            role_label = "tg_role"
+            cur.execute("""SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder)
+                FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_type ty ON ty.oid=a.atttypid
+                JOIN pg_enum e ON e.enumtypid=ty.oid WHERE c.relname=%s AND a.attname=%s AND ty.typtype='e'""",
+                        (relname, role_col))
+            er = cur.fetchone()
+            if er and er[0]: role_label = er[0][0]
+            return {"fn": fn, "arg": arg, "claim": claim[-1], "rtable": tbl,
+                    "role_col": role_col, "perm_col": perm_col, "role_label": role_label}
+    return None
+
+
+def _introspect_claim_fn(cur, fn, arg):
+    """Boolean fn (AST) comparing a JWT claim to its argument (e.g. has_role) -> claim_const."""
+    selects, _ = _func_selects(cur, fn)
+    for ss in selects:
+        if ss.get("fromClause"): continue
+        exprs = [rt.get("ResTarget", {}).get("val") for rt in ss.get("targetList", [])]
+        if ss.get("whereClause"): exprs.append(ss.get("whereClause"))
+        for e in exprs:
+            for (l, r) in _eq_pairs(e):
+                jk = _jwt_keys(l) or _jwt_keys(r)
+                if jk and _colname(r if _jwt_keys(l) else l):
+                    return {"keys": [jk[-1]], "value": arg}
+    return None
+
+
+def _set_claim(c, keys, v):
+    d = c
+    for k in keys[:-1]:
+        d = d.setdefault(k, {})
+    d[keys[-1]] = v
+
+
+def build_class(min_term, idx):
+    claims = {"sub": CV[idx % len(CV)], "role": "authenticated"}
+    rowseed, aux, scalar_link, fk_val, handled, reason, has_temporal = {}, [], None, None, True, None, False
+    tenant_keys = []   # JWT claim path(s) this class scopes on (for building a rival-tenant negative control)
+    for at in min_term:
+        k = at["kind"]
+        if k == "owner":
+            v = CV[idx % len(CV)]; claims["sub"] = v; rowseed[at["col"]] = f"'{v}'"; scalar_link = at["col"]; fk_val = v
+        elif k == "const_identity":
+            claims["sub"] = at["value"]
+        elif k == "tenant":
+            v = CV[idx % len(CV)]; _set_claim(claims, at["keys"], v); rowseed[at["col"]] = f"'{v}'"; scalar_link = at["col"]; fk_val = v
+            tenant_keys.append(at["keys"])
+        elif k == "claim_const":
+            _set_claim(claims, at["keys"], at["value"])
+        elif k == "row_const":
+            rowseed[at["col"]] = f"'{at['value']}'"; scalar_link = at["col"]
+        elif k == "membership":
+            uid = MV[idx % len(MV)]; sc = CV[idx % len(CV)]; claims["sub"] = uid
+            rowseed[at["row_scope_col"]] = f"'{sc}'"; scalar_link = at["row_scope_col"]; fk_val = sc
+            aux.append({"table": at["mtable"], "cols": {at["muser_col"]: uid, at["mscope_col"]: sc},
+                        "kind": "membership", "muser_col": at["muser_col"], "mscope_col": at["mscope_col"]})
+        elif k == "array_col":
+            uid = CV[idx % len(CV)]; claims["sub"] = uid; rowseed[at["col"]] = f"ARRAY['{uid}']::uuid[]"
+        elif k == "temporal":
+            has_temporal = True
+            rowseed[at["col"]] = "now() + interval '1 day'" if at["op"].startswith(">") else "now() - interval '1 day'"
+        elif k == "rbac":
+            lbl = at.get("role_label", "tg_role"); claims[at["claim"]] = lbl
+            aux.append({"table": at["rtable"], "cols": {at["role_col"]: lbl, at["perm_col"]: at["arg"]}, "kind": "rbac"})
+        elif k == "folder_owner":
+            uid = CV[idx % len(CV)]; claims["sub"] = uid; rowseed[at["col"]] = f"'{uid}/x'"; scalar_link = at["col"]
+        elif k == "auth_role":
+            pass
+        else:
+            handled, reason = False, f"unhandled atom: {at.get('text')}"
+    return {"idx": idx, "claims": claims, "rowseed": rowseed, "aux": aux, "scalar_link": scalar_link,
+            "fk_val": fk_val, "rowlinked": bool(rowseed), "handled": handled, "reason": reason,
+            "has_temporal": has_temporal, "kinds": [a["kind"] for a in min_term], "tenant_keys": tenant_keys}
+
+
+def _cmd_dnf(pols, cmd, clause, cur):
+    apps = [p for p in pols if p[2].upper() in (cmd, "ALL")]
+    perm = [p for p in apps if p[1] == "PERMISSIVE"]
+    restr = [p for p in apps if p[1] == "RESTRICTIVE"]
+
+    def eff(p):
+        # INSERT is checked by WITH CHECK; but a FOR-ALL / INSERT policy that omits WITH CHECK
+        # falls back to its USING (qual) for the insert check (Postgres semantics:
+        # "if WITH CHECK is omitted, the USING expression is used for both"). So a USING-only
+        # PERMISSIVE *or* RESTRICTIVE policy must NOT be dropped from the INSERT plan — otherwise
+        # a compound (permissive owner AND restrictive tenant) INSERT is only half-synthesized.
+        if cmd == "INSERT":
+            return p[5] if p[5] is not None else p[4]
+        return p[clause]
+
+    dnf, seen, is_open = [], set(), False
+    for p in perm:
+        pe = eff(p)
+        w = _where(pe) if pe else None
+        if w is None:
+            if pe: dnf.append([{"kind": "unknown", "text": "parse-fail"}])
+            continue
+        for mt in _dnf_ast(w):
+            atoms = [a for a in (classify_node(n, cur) for n in mt) if a.get("kind") != "_true_"]
+            for a in atoms:
+                if a.get("kind") == "auth_role" and a.get("value") == "authenticated": is_open = True
+            if not atoms: is_open = True
+            key = tuple(sorted(f"{a.get('kind')}|{a.get('col')}|{a.get('value')}|{a.get('mtable')}" for a in atoms))
+            if key not in seen: seen.add(key); dnf.append(atoms)
+    rest = []
+    for p in restr:
+        pe = eff(p)
+        w = _where(pe) if pe else None
+        if w:
+            for mt in _dnf_ast(w): rest += [classify_node(n, cur) for n in mt]
+    dnf = [mt + rest for mt in dnf]
+    return dnf, bool(perm), is_open
+
+
+def analyze(cur, schema, table):
+    cur.execute("SELECT policyname, permissive, cmd, roles, qual, with_check FROM pg_policies WHERE schemaname=%s AND tablename=%s", (schema, table))
+    pols = cur.fetchall()
+    cmds = set()
+    for p in pols:
+        cmds |= ({"SELECT", "INSERT", "UPDATE", "DELETE"} if p[2].upper() == "ALL" else {p[2].upper()})
+    per = {}
+    for cmd in cmds:
+        clause = 5 if cmd == "INSERT" else 4
+        dnf, has_pol, is_open = _cmd_dnf(pols, cmd, clause, cur)
+        per[cmd] = {"classes": [build_class(t, i) for i, t in enumerate(dnf)], "open": is_open, "has_pol": has_pol}
+        if cmd == "SELECT":
+            per[cmd]["anon_open"] = any(("public" in (p[3] or []) or "anon" in (p[3] or [])) and _is_true_clause(p[4])
+                                        for p in pols if p[2].upper() in ("SELECT", "ALL") and p[1] == "PERMISSIVE")
+    notes = []
+    for p in pols:
+        if p[2].upper() in ("SELECT", "ALL") and p[1] == "PERMISSIVE" and _is_true_clause(p[4]):
+            notes.append(f"policy {p[0]}: SELECT USING (true) -> every {p[3]} sees ALL rows (review)")
+        if p[2].upper() == "INSERT" and _is_true_clause(p[5]):
+            notes.append(f"policy {p[0]}: INSERT WITH CHECK (true) -> any {p[3]} may write any row (review)")
+    return pols, per, sorted(cmds, key=lambda c: ORDER.index(c) if c in ORDER else 9), notes
+
+
+def _unq(v):
+    return v[1:-1] if isinstance(v, str) and v.startswith("'") and v.endswith("'") else v
+
+
+def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols):
+    """Shared seeding + per-command plan computation used by BOTH the nested and flat emitters."""
+    q = f"{schema}.{table}"
+    all_h = [c for cmd in cmds for c in per[cmd]["classes"] if c["handled"]]
+    seen_k, rowlinked = set(), []
+    for c in all_h:
+        if c["rowlinked"]:
+            key = (tuple(sorted(c["rowseed"].items())), tuple(sorted((a["table"], tuple(sorted(a["cols"].items()))) for a in c["aux"])))
+            if key not in seen_k: seen_k.add(key); rowlinked.append(c)
+    any_grant = any(not c["rowlinked"] for c in all_h)
+    primary = rowlinked[0] if rowlinked else None
+    pkind = primary["kinds"][0] if primary and primary["kinds"] else None
+    total_rows = (len(rowlinked) + 1) if rowlinked else (2 if any_grant else 0)
+
+    def fill(t):
+        base = t.split("(")[0].strip()
+        return f"'{enums[base][0]}'::{base}" if base in enums else _lit(t)
+    def pick(t):
+        base = t.split("(")[0].strip(); tl = t.lower()
+        if base in enums: return f"'{enums[base][0]}'::{base}"
+        if "uuid" in tl: return "'000000c1-0000-0000-0000-0000000000c1'"
+        if any(k in tl for k in ("int", "numeric", "real", "double", "serial")): return "1"
+        if "bool" in tl: return "false"
+        return "'x'"
+
+    stmts, seen = [], set()
+    def ensure(tbl, col, val):
+        k = (tbl, col, val)
+        if k in seen: return
+        seen.add(k)
+        fks = fkmap.get(tbl, {}); vals = {col: val}
+        for (n, t, nn, hd) in colsmap.get(tbl, []):
+            if n == col or not nn or hd: continue
+            vals[n] = pick(t) if n in fks else fill(t)
+        for n, v in vals.items():
+            if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
+        stmts.append(f"  INSERT INTO {tbl}({', '.join(vals)}) VALUES ({', '.join(vals.values())}) ON CONFLICT DO NOTHING;")
+    def _distinct(t, salt):
+        tl = t.lower(); base = t.split("(")[0].strip()
+        if base in enums: return f"'{enums[base][0]}'::{base}"
+        if "char" in tl or "text" in tl: return f"'usr{salt}'"
+        if any(k in tl for k in ("int", "serial", "numeric", "real", "double")): return str(1000 + salt)
+        return fill(t)
+    def row_values(tbl, fixed, salt=0):
+        vals = dict(fixed); fks = fkmap.get(tbl, {})
+        for (n, t, nn, hd) in colsmap.get(tbl, []):
+            if n in vals or not nn or hd: continue
+            if n in fks: vals[n] = pick(t)
+            elif tbl == q and n in unique_cols: vals[n] = _distinct(t, salt)
+            else: vals[n] = fill(t)
+        return vals
+    def anc(vals, tbl):
+        fks = fkmap.get(tbl, {})
+        for n, v in vals.items():
+            if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
+    def insert(tbl, vals, conflict=False):
+        return f"  INSERT INTO {tbl}({', '.join(vals)}) VALUES ({', '.join(vals.values())})" + (" ON CONFLICT DO NOTHING" if conflict else "") + ";"
+    def foreign_val(kind):
+        if kind == "array_col": return f"ARRAY['{FOREIGN}']::uuid[]"
+        if kind == "temporal": return "now() - interval '1 day'"
+        if kind == "folder_owner": return f"'{FOREIGN}/x'"
+        return f"'{FOREIGN}'"
+
+    for at in {a["table"] for c in all_h for a in c["aux"]}:
+        stmts.append(f"  DELETE FROM {at};")
+    for c in rowlinked:
+        v = row_values(q, c["rowseed"], salt=c["idx"]); anc(v, q); stmts.append(insert(q, v))
+        if c["has_temporal"]:
+            tcol = [k for k in c["rowseed"] if "now()" in c["rowseed"][k]][0]
+            v2 = row_values(q, {**c["rowseed"], tcol: "now() - interval '1 day'"}, salt=c["idx"] + 50); anc(v2, q); stmts.append(insert(q, v2) + "  -- expired")
+    if primary:
+        ov = {}
+        if primary["scalar_link"]: ov[primary["scalar_link"]] = foreign_val(pkind)
+        for col in primary["rowseed"]:
+            if "ARRAY[" in primary["rowseed"][col]: ov[col] = foreign_val("array_col")
+            elif "now()" in primary["rowseed"][col]: ov[col] = "now() + interval '1 day'"
+        v = row_values(q, {**primary["rowseed"], **ov}, salt=99); anc(v, q); stmts.append(insert(q, v) + "  -- foreign")
+    elif any_grant:
+        for i in range(2):
+            v = row_values(q, {}, salt=i); anc(v, q); stmts.append(insert(q, v))
+    aux_seen = set()
+    for c in all_h:
+        for a in c["aux"]:
+            ak = (a["table"], tuple(sorted(a["cols"].items())))
+            if ak in aux_seen: continue
+            aux_seen.add(ak)
+            av = {k: f"'{val}'" for k, val in a["cols"].items()}
+            v = row_values(a["table"], av); anc(v, a["table"]); stmts.append(insert(a["table"], v, conflict=True))
+
+    # ── rival tenant: the "authenticated, not authorized" negative control is a LEGITIMATE user of a
+    #    DIFFERENT tenant (org B), not a no-tenant outsider — so a green block proves cross-tenant isolation
+    #    (having tenancy != having A's tenancy), and a buggy policy like `org_id IS NOT NULL` is caught.
+    rival_claims = {"sub": RIVAL_SUB, "role": "authenticated"}
+    rival_on = False
+    for c in all_h:
+        for ks in c.get("tenant_keys", []):
+            _set_claim(rival_claims, ks, RIVAL_ORG); rival_on = True
+    def _touches(t0):                                  # t0 + its transitive FK-parent tables
+        seen, st = set(), [t0]
+        while st:
+            t = st.pop()
+            if t in seen: continue
+            seen.add(t)
+            for (pt, _pc) in fkmap.get(t, {}).values(): st.append(pt)
+        return seen
+    seen_m = set()
+    for c in all_h:
+        for a in c.get("aux", []):
+            if a.get("kind") != "membership": continue
+            mk = (a["table"], a["muser_col"], a["mscope_col"])
+            if mk in seen_m: continue
+            seen_m.add(mk)
+            if q in _touches(a["table"]):
+                continue   # seeding the rival here would insert a visible row INTO the table under test -> skip (fall back to NOBODY)
+            rv = row_values(a["table"], {a["muser_col"]: f"'{RIVAL_SUB}'", a["mscope_col"]: f"'{RIVAL_ORG}'"})
+            anc(rv, a["table"]); stmts.append(insert(a["table"], rv, conflict=True) + "  -- rival tenant (org B) membership")
+            rival_on = True
+
+    # INSERT-test rows: fresh value when link is unique/PK (avoids PK collision); pre-seed ancestors
+    insert_plan = {}
+    if "INSERT" in cmds:
+        for c in [x for x in per["INSERT"]["classes"] if x["handled"]]:
+            if c["rowlinked"]:
+                if c["scalar_link"] in unique_cols and c["claims"].get("sub") == _unq(c["rowseed"].get(c["scalar_link"], "")):
+                    iclaims = {**c["claims"], "sub": INS}; ifixed = {**c["rowseed"], c["scalar_link"]: f"'{INS}'"}
+                else:
+                    iclaims, ifixed = c["claims"], c["rowseed"]
+                iv = row_values(q, ifixed, salt=200 + c["idx"]); anc(iv, q)
+                insert_plan[c["idx"]] = (json.dumps(iclaims), iv)
+            else:
+                iv = row_values(q, {primary["scalar_link"]: foreign_val(pkind)} if primary and primary["scalar_link"] else {}, salt=250); anc(iv, q)
+                insert_plan[c["idx"]] = (json.dumps(c["claims"]), iv)
+    nobody_ins = row_values(q, primary["rowseed"], salt=300) if primary else (row_values(q, {}, salt=301) if any_grant else None)
+    seed = "\n".join(stmts)
+    return {"q": q, "seed": seed, "total_rows": total_rows, "insert_plan": insert_plan,
+            "nobody_ins": nobody_ins, "primary": primary, "pkind": pkind, "rowlinked": rowlinked,
+            "any_grant": any_grant, "fill": fill, "foreign_val": foreign_val,
+            "rival": {"on": rival_on, "claims": json.dumps(rival_claims)}}
+
+
+def emit(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols):
+    S = _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols)
+    q = S["q"]; cls = f"test_{table}"
+    seed = S["seed"]; total_rows = S["total_rows"]; insert_plan = S["insert_plan"]
+    nobody_ins = S["nobody_ins"]; primary = S["primary"]; pkind = S["pkind"]
+    rowlinked = S["rowlinked"]; fill = S["fill"]; foreign_val = S["foreign_val"]
+
+    out = [f"""-- GENERATED by testgen.rls (command-aware, deep-seeding) from {q}. Do not edit.
+{_PGTAP_ENSURE}
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} TO authenticated;
+GRANT SELECT ON ALL TABLES IN SCHEMA {schema} TO anon;
+DROP SCHEMA IF EXISTS {cls} CASCADE;
+CREATE SCHEMA {cls};
+CREATE FUNCTION {cls}._seed() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  SET LOCAL ROLE service_role;
+  DELETE FROM {q};
+{seed}
+END $$;
+"""]
+    n = [0]
+    def fn(name, decl, actsql, cj, asserts, role="authenticated"):
+        n[0] += 1
+        a = "\n".join(f"  RETURN NEXT {x};" for x in asserts)
+        return f"""CREATE FUNCTION {cls}.test_{n[0]:02d}_{name}() RETURNS SETOF TEXT LANGUAGE plpgsql AS $$
+DECLARE runner text := current_user; {decl}
+BEGIN
+  PERFORM {cls}._seed();
+  PERFORM set_config('request.jwt.claims', '{cj}', true);
+  SET LOCAL ROLE {role};
+{actsql}
+  EXECUTE format('SET LOCAL ROLE %I', runner);
+{a}
+END $$;
+"""
+    cj = lambda c: json.dumps(c["claims"])
+    NB = json.dumps({"sub": NOBODY, "role": "authenticated"})
+
+    for cmd in cmds:
+        pc = per[cmd]; classes = [c for c in pc["classes"] if c["handled"]]
+        if cmd == "SELECT":
+            for c in classes:
+                exp = total_rows if not c["rowlinked"] else 1
+                out.append(fn(f"select_b{c['idx']}", "k int;", f"  SELECT count(*) INTO k FROM {q};", cj(c),
+                              [f"is(k, {exp}, 'SELECT branch {c['idx']}: {'sees all (open/grant)' if not c['rowlinked'] else 'sees only its own row'}')"]))
+            anon_exp = total_rows if pc.get("anon_open") else 0
+            out.append(fn("select_anon", "k int;", f"  SELECT count(*) INTO k FROM {q};", "",
+                          [f"is(k, {anon_exp}, 'SELECT: anon sees {('all (public policy)' if pc.get('anon_open') else 'nothing')}')"], role="anon"))
+            if not pc["open"] and classes:
+                out.append(fn("select_nobody_denied", "k int;", f"  SELECT count(*) INTO k FROM {q};", NB, ["is(k, 0, 'SELECT: unauthorized sees nothing')"]))
+        elif cmd == "INSERT":
+            for c in classes:
+                if c["idx"] in insert_plan:
+                    icl, iv = insert_plan[c["idx"]]
+                    out.append(fn(f"insert_b{c['idx']}_ok", "got text;", f"  BEGIN INSERT INTO {q}({', '.join(iv)}) VALUES ({', '.join(iv.values())}); got:='OK'; EXCEPTION WHEN others THEN got:=SQLSTATE; END;", icl,
+                                  [f"is(got, 'OK', 'INSERT branch {c['idx']}: authorized may write')"]))
+            if not pc["open"] and nobody_ins:
+                out.append(fn("insert_nobody_denied", "got text;", f"  BEGIN INSERT INTO {q}({', '.join(nobody_ins)}) VALUES ({', '.join(nobody_ins.values())}); got:='NO ERROR'; EXCEPTION WHEN insufficient_privilege THEN got:=SQLSTATE; WHEN others THEN got:=SQLSTATE; END;", NB,
+                              ["is(got, '42501', 'INSERT: unauthorized cannot write')"]))
+        elif cmd == "UPDATE" and (upd := next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in {x for cc in rowlinked for x in cc['rowseed']} and not h0), None)):
+            for c in classes:
+                out.append(fn(f"update_b{c['idx']}_ok", "m int;", f"  UPDATE {q} SET {upd[0]}={fill(upd[1])}; GET DIAGNOSTICS m=ROW_COUNT;", cj(c),
+                              [f"cmp_ok(m, '>=', 1, 'UPDATE branch {c['idx']}: authorized may update its rows')"]))
+                if c["rowlinked"] and c["scalar_link"] and c["fk_val"] and c["scalar_link"] not in unique_cols:
+                    out.append(fn(f"update_b{c['idx']}_reassign_denied", "got text;", f"  BEGIN UPDATE {q} SET {c['scalar_link']}='{FOREIGN}'; got:='NO ERROR'; EXCEPTION WHEN insufficient_privilege THEN got:=SQLSTATE; WHEN others THEN got:=SQLSTATE; END;", cj(c),
+                                  [f"is(got, '42501', 'UPDATE branch {c['idx']}: cannot move row out of scope')"]))
+            if classes:
+                out.append(fn("update_nobody_denied", "m int;", f"  UPDATE {q} SET {upd[0]}={fill(upd[1])}; GET DIAGNOSTICS m=ROW_COUNT;", NB, ["is(m, 0, 'UPDATE: unauthorized affects 0 rows')"]))
+        elif cmd == "DELETE":
+            for c in classes:
+                out.append(fn(f"delete_b{c['idx']}_ok", "m int;", f"  DELETE FROM {q}; GET DIAGNOSTICS m=ROW_COUNT;", cj(c),
+                              [f"cmp_ok(m, '>=', 1, 'DELETE branch {c['idx']}: authorized may delete its rows')"]))
+            if classes:
+                out.append(fn("delete_nobody_denied", "m int;", f"  DELETE FROM {q}; GET DIAGNOSTICS m=ROW_COUNT;", NB, ["is(m, 0, 'DELETE: unauthorized affects 0 rows')"]))
+    out.append(f"\nSELECT * FROM runtests('{cls}'::name);\n")
+    return "".join(out)
+
+
+def _qlit(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, helpers=True, grants_map=None, conn=None):
+    """Native Supabase FLAT pgTAP form: begin; plan(N); inline AAA; finish(); rollback.
+
+    helpers=True (DEFAULT): tests read natively — tests.create_supabase_user / authenticate_as /
+      clear_authentication for identity, with tests.get_supabase_uid() substituted into the seed's
+      owner columns. Custom-claim (tenant/RBAC) classes keep a direct set_config (no helper exists).
+      Requires the tests.* helpers (basejump, or the rlsautotest offline shim emitted in 000-setup).
+    helpers=False (--no-helpers): fully self-contained — inline set_config + SET LOCAL ROLE, ensures
+      pgtap, no 000-hook dependency; one file runs standalone."""
+    S = _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols)
+    q = S["q"]; seed = S["seed"]; total_rows = S["total_rows"]
+    insert_plan = S["insert_plan"]; nobody_ins = S["nobody_ins"]; fill = S["fill"]
+    rowlinked = S["rowlinked"]
+    cj = lambda c: json.dumps(c["claims"])
+    NB = json.dumps({"sub": NOBODY, "role": "authenticated"})
+
+    # helper-mode: create test users whose uid IS our seed uuid, so NO substitution is needed — the seed
+    # stays literal and authenticate_as('u_N') returns exactly that uuid as auth.uid(). Pure-owner classes
+    # (incl. owner/folder/membership/nobody) use authenticate_as; custom-claim (tenant/RBAC) keep set_config.
+    body, n, sp = [], [0], [0]
+    umap = {}
+    def user_for(sub):
+        if sub not in umap: umap[sub] = f"u_{len(umap)}"
+        return umap[sub]
+    def ident(cjson, role):
+        if role == "anon" or cjson == "":
+            return ["SELECT tests.clear_authentication();"] if helpers else ["SELECT set_config('request.jwt.claims', '', true);", "SET LOCAL ROLE anon;"]
+        if helpers:
+            d = json.loads(cjson)
+            if set(d) <= {"sub", "role"} and d.get("role") == "authenticated" and d.get("sub") and _is_uuid(d["sub"]):
+                return [f"SELECT tests.authenticate_as('{user_for(d['sub'])}');"]
+        return [f"SELECT set_config('request.jwt.claims', {_qlit(cjson)}, true);", f"SET LOCAL ROLE {role};"]
+    # restore the seeded precondition after a mutating test by RE-SEEDING (not SAVEPOINT/ROLLBACK):
+    # real pgTAP keeps its test counter in txn-local state, and ROLLBACK TO SAVEPOINT would unwind it
+    # (-> "planned N ran M" under pg_prove). Re-seeding isolates without touching the counter; the outer
+    # ROLLBACK still discards everything at the end.
+    reseed = f"RESET ROLE;\nDELETE FROM {q};\n{seed}"
+    def read_test(cjson, role, assertion):
+        n[0] += 1; body.extend(ident(cjson, role)); body.append(assertion); body.append("RESET ROLE;")
+    def mut_test(cjson, role, assertion):
+        n[0] += 1; body.extend(ident(cjson, role)); body.append(assertion); body.append(reseed)
+    def desc(d): return _qlit(d)
+    # Real effective grants for the client roles (NOT re-granted): we PROVE actual access, never assume it.
+    gmap = grants_map or {}
+    def geff(role, cmd): return gmap.get((role, cmd), True)   # default True when no DB context
+    # pick a plain writable column for the denial UPDATE (avoid identity/generated cols -> parse error before the ACL check)
+    _wcol = next((nn0 for (nn0, tt0, c0, h0) in cols
+                  if nn0 not in {x for cc in rowlinked for x in cc['rowseed']} and not h0),
+                 (cols[0][0] if cols else None))
+    _deny_stmt = {"SELECT": f"SELECT 1 FROM {q}",
+                  "INSERT": f"INSERT INTO {q} DEFAULT VALUES",
+                  "UPDATE": (f"UPDATE {q} SET {_wcol}={_wcol}" if _wcol else None),
+                  "DELETE": f"DELETE FROM {q}"}
+    def deny(cmd, cjson, role, who):
+        """Prove an action is denied (missing grant / schema usage -> 42501)."""
+        sx = _deny_stmt.get(cmd)
+        if not sx: return
+        a = f"SELECT throws_ok( $$ {sx} $$, '42501', NULL, {desc(cmd + ': ' + who + ' has no grant - denied')} );"
+        (read_test if cmd == "SELECT" else mut_test)(cjson, role, a)
+
+    for cmd in (cmds if conn is None else ()):   # DERIVE path (no DB) — probe path below when conn given
+        pc = per[cmd]; classes = [c for c in pc["classes"] if c["handled"]]
+        auth_ok = geff("authenticated", cmd); anon_ok = geff("anon", cmd)
+        if cmd == "SELECT":
+            if auth_ok:
+                for c in classes:
+                    exp = total_rows if not c["rowlinked"] else 1
+                    lbl = "sees all (open/grant)" if not c["rowlinked"] else "sees only its own row"
+                    read_test(cj(c), "authenticated", f"SELECT is( (SELECT count(*) FROM {q})::int,{exp}, {desc('SELECT branch ' + str(c['idx']) + ': ' + lbl)} );")
+                if not pc["open"] and classes:
+                    read_test(NB, "authenticated", f"SELECT is( (SELECT count(*) FROM {q})::int,0, {desc('SELECT: unauthorized sees nothing')} );")
+                elif pc["open"]:
+                    # public read (USING true): a non-owner authenticated user also sees all rows — assert it (not skip)
+                    read_test(NB, "authenticated", f"SELECT is( (SELECT count(*) FROM {q})::int,{total_rows}, {desc('SELECT: a non-owner user also sees all rows (public read)')} );")
+            else:
+                deny("SELECT", NB, "authenticated", "authenticated")
+            if anon_ok:
+                anon_exp = total_rows if pc.get("anon_open") else 0
+                read_test("", "anon", f"SELECT is( (SELECT count(*) FROM {q})::int,{anon_exp}, {desc('SELECT: anon sees ' + ('all (public policy)' if pc.get('anon_open') else 'nothing'))} );")
+            else:
+                deny("SELECT", "", "anon", "anon")
+        elif cmd == "INSERT":
+            if auth_ok:
+                for c in classes:
+                    if c["idx"] in insert_plan:
+                        icl, iv = insert_plan[c["idx"]]
+                        ins = f"INSERT INTO {q}({', '.join(iv)}) VALUES ({', '.join(iv.values())})"
+                        mut_test(icl, "authenticated", f"SELECT lives_ok( $$ {ins} $$, {desc('INSERT branch ' + str(c['idx']) + ': authorized may write')} );")
+                if not pc["open"] and nobody_ins:
+                    ins = f"INSERT INTO {q}({', '.join(nobody_ins)}) VALUES ({', '.join(nobody_ins.values())})"
+                    mut_test(NB, "authenticated", f"SELECT throws_ok( $$ {ins} $$, '42501', NULL, {desc('INSERT: unauthorized cannot write')} );")
+            else:
+                deny("INSERT", NB, "authenticated", "authenticated")
+            if not anon_ok:
+                deny("INSERT", "", "anon", "anon")                       # no grant -> denied
+            elif nobody_ins:                                            # anon HAS the grant -> prove the real RLS outcome
+                ins = f"INSERT INTO {q}({', '.join(nobody_ins)}) VALUES ({', '.join(nobody_ins.values())})"
+                if pc.get("anon_open") or pc.get("open"):
+                    mut_test("", "anon", f"SELECT lives_ok( $$ {ins} $$, {desc('INSERT: anon CAN write (policy permits anon) - REVIEW')} );")
+                else:
+                    mut_test("", "anon", f"SELECT throws_ok( $$ {ins} $$, '42501', NULL, {desc('INSERT: anon has grant but is blocked by RLS')} );")
+        elif cmd == "UPDATE":
+            upd = next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in {x for cc in rowlinked for x in cc['rowseed']} and not h0), None)
+            if auth_ok:
+                if upd:
+                    for c in classes:
+                        mut_test(cj(c), "authenticated", f"SELECT isnt_empty( $$ UPDATE {q} SET {upd[0]}={fill(upd[1])} RETURNING 1 $$, {desc('UPDATE branch ' + str(c['idx']) + ': authorized may update its rows')} );")
+                        if c["rowlinked"] and c["scalar_link"] and c["fk_val"] and c["scalar_link"] not in unique_cols:
+                            mut_test(cj(c), "authenticated", f"SELECT throws_ok( $$ UPDATE {q} SET {c['scalar_link']}='{FOREIGN}' $$, '42501', NULL, {desc('UPDATE branch ' + str(c['idx']) + ': cannot move row out of scope')} );")
+                    if classes:
+                        mut_test(NB, "authenticated", f"SELECT is_empty( $$ UPDATE {q} SET {upd[0]}={fill(upd[1])} RETURNING 1 $$, {desc('UPDATE: unauthorized affects 0 rows')} );")
+            else:
+                deny("UPDATE", NB, "authenticated", "authenticated")
+            if not anon_ok:
+                deny("UPDATE", "", "anon", "anon")
+            elif upd:                                                   # anon HAS the grant -> prove the real RLS outcome
+                if pc.get("anon_open") or pc.get("open"):
+                    mut_test("", "anon", f"SELECT isnt_empty( $$ UPDATE {q} SET {upd[0]}={fill(upd[1])} RETURNING 1 $$, {desc('UPDATE: anon CAN modify rows (policy permits anon) - REVIEW')} );")
+                else:
+                    mut_test("", "anon", f"SELECT is_empty( $$ UPDATE {q} SET {upd[0]}={fill(upd[1])} RETURNING 1 $$, {desc('UPDATE: anon has grant but RLS blocks (0 rows)')} );")
+        elif cmd == "DELETE":
+            if auth_ok:
+                for c in classes:
+                    mut_test(cj(c), "authenticated", f"SELECT isnt_empty( $$ DELETE FROM {q} RETURNING 1 $$, {desc('DELETE branch ' + str(c['idx']) + ': authorized may delete its rows')} );")
+                if classes:
+                    mut_test(NB, "authenticated", f"SELECT is_empty( $$ DELETE FROM {q} RETURNING 1 $$, {desc('DELETE: unauthorized affects 0 rows')} );")
+            else:
+                deny("DELETE", NB, "authenticated", "authenticated")
+            if not anon_ok:
+                deny("DELETE", "", "anon", "anon")
+            else:                                                       # anon HAS the grant -> prove the real RLS outcome
+                if pc.get("anon_open") or pc.get("open"):
+                    mut_test("", "anon", f"SELECT isnt_empty( $$ DELETE FROM {q} RETURNING 1 $$, {desc('DELETE: anon CAN delete rows (policy permits anon) - REVIEW')} );")
+                else:
+                    mut_test("", "anon", f"SELECT is_empty( $$ DELETE FROM {q} RETURNING 1 $$, {desc('DELETE: anon has grant but RLS blocks (0 rows)')} );")
+
+    if conn is not None:   # PROBE path: observe the REAL outcome of each identity x command on the copy, then bake it
+        arrange_stmts = [s for s in _split_statements(f"DELETE FROM {q};\n{seed}") if s.strip()]
+        _fk_cols = set(fkmap.get(f"{schema}.{table}", {}))   # avoid FK cols: SET fk=fk triggers an RI check (parent access), not the table's own UPDATE perm
+        _rowseed = {x for cc in rowlinked for x in cc['rowseed']}
+        upd_col = (next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0 and nn0 not in _fk_cols), None)
+                   or next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0), None))
+        def pident(cjson, role):
+            if role == "anon" or cjson == "":
+                return ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"]
+            return [f"SELECT set_config('request.jwt.claims', {_qlit(cjson)}, true)", f"SET LOCAL ROLE {role}"]
+        def identities(classes):
+            # who-labels feed both the baked test descriptions and the report parser (_table_report).
+            # 'authenticated, authorized/not authorized' = same `authenticated` role, different JWT claims.
+            out = [(f"authenticated, authorized (branch {c['idx']})", cj(c), "authenticated", c) for c in classes]
+            # negative control: a legitimate user of a DIFFERENT tenant when the table is tenant/membership-scoped,
+            # else a generic other authenticated user (NOBODY).
+            if S.get("rival", {}).get("on"):
+                out.append(("authenticated, not authorized (other tenant)", S["rival"]["claims"], "authenticated", None))
+            else:
+                out.append(("authenticated, not authorized", NB, "authenticated", None))
+            out.append(("anon", "", "anon", None))
+            return out
+        udfs = _policy_bool_udfs(conn, schema, table)   # opaque boolean fns the policies delegate to (mock fallback)
+        def mock_one(val, assertion, write):
+            """Replace every policy UDF with a constant `val` (FakeFunction), act, assert, restore, re-seed."""
+            n[0] += 1
+            body.extend(f"CREATE OR REPLACE FUNCTION {u['q']}({u['args']}) RETURNS boolean LANGUAGE sql AS $$ SELECT {val} $$;" for u in udfs)
+            body.append(f"SELECT set_config('request.jwt.claims', {_qlit(NB)}, true);")   # semicolon-terminated (script context)
+            body.append("SET LOCAL ROLE authenticated;")
+            body.append(assertion)
+            body.append("RESET ROLE;")
+            body.extend((u['def'].rstrip().rstrip(';') + ";") for u in udfs)   # restore the REAL functions (CREATE OR REPLACE)
+            if write:
+                body.append(reseed)
+        def mock_emit(cmd):
+            """Opaque-function-gated command: prove the policy WIRES to the function, both directions.
+            (Wiring proof — the function's own logic is out of scope / tested by the function engine.)"""
+            if not udfs:
+                return
+            fns = ", ".join(u["name"] + "()" for u in udfs)
+            if cmd == "SELECT":
+                mock_one("true",  f"SELECT is( (SELECT count(*) FROM {q})::int, {total_rows}, {desc('SELECT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", False)
+                mock_one("false", f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", False)
+                return
+            if cmd == "INSERT":
+                if not nobody_ins: return
+                action = f"INSERT INTO {q}({', '.join(nobody_ins)}) VALUES ({', '.join(nobody_ins.values())})"
+            elif cmd == "UPDATE":
+                if not upd_col: return
+                action = f"UPDATE {q} SET {upd_col[0]}={fill(upd_col[1])}"
+            else:
+                action = f"DELETE FROM {q}"
+            mock_one("true",  f"SELECT isnt_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True)
+            mock_one("false", f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True)
+        coltypes = {nn0: tt0 for (nn0, tt0, c0, h0) in cols}
+        def _spair(typ):
+            t = typ.lower()
+            if "uuid" in t: return ("aaaaaaaa-0000-4000-8000-00000000aaaa", "bbbbbbbb-0000-4000-8000-00000000bbbb")
+            if any(k in t for k in ("int", "numeric", "double", "real", "decimal")): return ("424242", "515151")
+            return ("rls_synth_a", "rls_synth_b")
+        def _vlit(typ, s):
+            t = typ.lower()
+            return s if any(k in t for k in ("int", "numeric", "double", "real", "decimal")) else "'" + s + "'"
+        def _claims_for(gate, V):
+            base = {"sub": NOBODY, "role": "authenticated"}
+            if gate["kind"] != "guc":
+                node = [V] if gate["kind"] == "claim_array" else V
+                for k in reversed(gate["path"]):
+                    node = {k: node}
+                base.update(node)
+            return json.dumps(base)
+        def synth_emit(cmd, gate):
+            """Drive an opaque GUC/claim-gated command by SETTING the input (GUC / JWT claim) and SEEDING a
+            matching row, then probe-verify. Returns True if handled, False to fall through (e.g. unsatisfiable FK)."""
+            req, bad = _synth_required_cols(conn, schema, table, fkmap)
+            if bad: return False
+            ctype = coltypes.get(gate["col"], "text")
+            Va, Vb = _spair(ctype)
+            seedcols = {gate["col"]: _vlit(ctype, Va)}
+            for rn, rt in req:
+                if rn != gate["col"]: seedcols[rn] = fill(rt)
+            seedrow = f"INSERT INTO {q}({', '.join(seedcols)}) VALUES ({', '.join(seedcols.values())})"
+            if cmd == "UPDATE":
+                wc = upd_col
+                if not wc or wc[0] == gate["col"]: return True   # gate owned, but no safe col to UPDATE -> emit nothing (honest), don't fall to the leaky identity loop
+                act = f"UPDATE {q} SET {wc[0]}={fill(wc[1])}"
+            elif cmd == "DELETE": act = f"DELETE FROM {q}"
+            elif cmd == "INSERT": act = seedrow
+            else: act = None
+            def one(who, V, role):
+                guc = (gate["name"], V) if (gate["kind"] == "guc" and V is not None) else None
+                claims = None if role == "anon" else _claims_for(gate, V)
+                pid = ([f"SELECT set_config('{guc[0]}', '{guc[1]}', true)"] if guc else [])
+                pid += (["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"] if role == "anon"
+                        else [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true)", "SET LOCAL ROLE authenticated"])
+                arrange = [f"DELETE FROM {q}"] + ([] if cmd == "INSERT" else [seedrow])
+                if cmd == "SELECT":
+                    o = _probe(conn, arrange, pid, "read", f"SELECT count(*) FROM {q}")
+                    asrt = (f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s)')} );" if o[0] == "count"
+                            else f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );")
+                else:
+                    o = _probe(conn, arrange, pid, "write", act)
+                    if o[0] == "err": asrt = f"SELECT throws_ok( $$ {act} $$, '{o[1]}', NULL, {desc(cmd + ': ' + who + ' denied (' + o[1] + ')')} );"
+                    elif o[0] == "rows" and o[1] >= 1: asrt = f"SELECT isnt_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affected ' + str(o[1]) + ' row(s)')} );"
+                    else: asrt = f"SELECT is_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affects 0 rows')} );"
+                n[0] += 1
+                body.append("RESET ROLE;")
+                body.append(f"DELETE FROM {q};")
+                if cmd != "INSERT": body.append(seedrow + ";")
+                if guc: body.append(f"SELECT set_config('{guc[0]}', '{guc[1]}', true);")
+                body.extend(["SELECT set_config('request.jwt.claims', '', true);", "SET LOCAL ROLE anon;"] if role == "anon"
+                            else [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true);", "SET LOCAL ROLE authenticated;"])
+                body.append(asrt)
+                body.append("RESET ROLE;")
+                body.append(reseed)
+            one("authenticated, authorized", Va, "authenticated")
+            one("authenticated, not authorized", Vb, "authenticated")
+            one("anon", Vb if gate["kind"] == "guc" else None, "anon")   # GUC: give anon a valid (mismatch) value so the ::uuid cast can't 22P02
+            return True
+        def synth_recursion_emit(cmd, rg):
+            """Seed an ancestor chain (root owned by the user + a descendant) so a self-referential
+            hierarchy policy admits the descendant; probe-verify. SELECT only."""
+            if cmd != "SELECT": return False
+            owner, sfk, pk = rg["owner"], rg["self_fk"], rg["pk"]
+            req, _ = _synth_required_cols(conn, schema, table, fkmap)
+            fkc = set(fkmap.get(f"{schema}.{table}", {}))
+            extra = {}
+            for rn, rt in req:
+                if rn in (owner, sfk): continue
+                if rn in fkc: return False   # another required FK we can't parent -> honest fall-through
+                extra[rn] = fill(rt)
+            xc = ("" if not extra else ", " + ", ".join(extra))
+            xv = ("" if not extra else ", " + ", ".join(extra.values()))
+            U, U2 = "cccccccc-0000-4000-8000-00000000cccc", "dddddddd-0000-4000-8000-00000000dddd"
+            arrange = [f"DELETE FROM {q}",
+                       f"INSERT INTO auth.users(id) VALUES ('{U}') ON CONFLICT DO NOTHING",
+                       f"INSERT INTO {q}({owner}{xc}) VALUES ('{U}'{xv})",                                   # root owned by U
+                       f"INSERT INTO {q}({sfk}{xc}) VALUES ((SELECT {pk} FROM {q} WHERE {owner}='{U}' ORDER BY {pk} LIMIT 1){xv})"]  # descendant under root
+            def one(who, sub, role):
+                claims = None if role == "anon" else json.dumps({"sub": sub, "role": "authenticated"})
+                pidl = (["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"] if role == "anon"
+                        else [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true)", "SET LOCAL ROLE authenticated"])
+                o = _probe(conn, arrange, pidl, "read", f"SELECT count(*) FROM {q}")
+                asrt = (f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s) (recursive hierarchy)')} );" if o[0] == "count"
+                        else f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );")
+                n[0] += 1
+                body.append("RESET ROLE;")
+                body.extend(a + ";" for a in arrange)
+                body.extend(s + ";" for s in pidl)
+                body.append(asrt); body.append("RESET ROLE;"); body.append(reseed)
+            one("authenticated, authorized", U, "authenticated")
+            one("authenticated, not authorized", U2, "authenticated")
+            one("anon", None, "anon")
+            return True
+        _cur = conn.cursor()   # every command that HAS a policy (analyzer's cmds may omit opaque-fn ones)
+        _cur.execute("SELECT DISTINCT cmd FROM pg_policies WHERE schemaname=%s AND tablename=%s", (schema, table))
+        _pol = set()
+        for (_cm,) in _cur.fetchall():
+            _pol |= set(_CMDS4) if _cm == "ALL" else ({_cm} if _cm in _CMDS4 else set())
+        for cmd in [c for c in _CMDS4 if c in (set(cmds) | _pol)]:
+            classes = [c for c in per.get(cmd, {}).get("classes", []) if c["handled"]]
+            if not classes:
+                gate = _synth_gate(conn, schema, table, cmd, coltypes)   # GUC / JWT-claim gate -> SET the input + SEED a match
+                if gate and synth_emit(cmd, gate):
+                    continue
+                rg = _synth_recursion_gate(conn, schema, table, fkmap)   # self-referential hierarchy -> SEED an ancestor chain
+                if rg and synth_recursion_emit(cmd, rg):
+                    continue
+                if udfs:                                                  # opaque function -> MOCK it (wiring)
+                    mock_emit(cmd)
+            for who, cjson, role, c in identities(classes):
+                if cmd == "SELECT":
+                    o = _probe(conn, arrange_stmts, pident(cjson, role), "read", f"SELECT count(*) FROM {q}")
+                    if o[0] == "count":
+                        read_test(cjson, role, f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s)')} );")
+                    else:
+                        read_test(cjson, role, f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );")
+                    continue
+                if cmd == "INSERT":
+                    icols = insert_plan[c["idx"]][1] if (c is not None and c["idx"] in insert_plan) else nobody_ins
+                    if not icols: continue
+                    action = f"INSERT INTO {q}({', '.join(icols)}) VALUES ({', '.join(icols.values())})"
+                elif cmd == "UPDATE":
+                    if not upd_col: continue
+                    # SET <plain non-FK col> = <literal>: needs ONLY the UPDATE privilege (a literal RHS
+                    # avoids the SELECT-on-read requirement of `col=col`), and a non-FK col avoids an RI
+                    # false-denial. upd_col already excludes FK/identity/handled cols.
+                    action = f"UPDATE {q} SET {upd_col[0]}={fill(upd_col[1])}"
+                else:
+                    action = f"DELETE FROM {q}"
+                o = _probe(conn, arrange_stmts, pident(cjson, role), "write", action)
+                if o[0] == "err":
+                    mut_test(cjson, role, f"SELECT throws_ok( $$ {action} $$, '{o[1]}', NULL, {desc(cmd + ': ' + who + ' denied (' + o[1] + ')')} );")
+                elif o[0] == "rows" and o[1] >= 1:
+                    mut_test(cjson, role, f"SELECT isnt_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affected ' + str(o[1]) + ' row(s)')} );")
+                else:
+                    mut_test(cjson, role, f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affects 0 rows')} );")
+
+    body_text = "\n".join(body)
+    if helpers:
+        creates = "\n".join(
+            f"INSERT INTO auth.users (id, email, raw_user_meta_data, raw_app_meta_data, created_at, updated_at) "
+            f"VALUES ('{sub}', concat('{sub}', '@test.com'), jsonb_build_object('test_identifier', '{nm}'), '{{}}'::jsonb, now(), now()) ON CONFLICT (id) DO NOTHING;"
+            for sub, nm in umap.items())
+        header = f"""-- GENERATED by rlsautotest (flat, helper-mode) from {q}.
+-- {_TAGLINE} {_TAGLINE2}
+-- Native pgTAP using the tests.* helpers (basejump or the rlsautotest offline shim in 000-setup-tests-hooks.sql).
+-- Test users are created with fixed uids (= the seed uuids) so authenticate_as() lines up with the seed.
+{_PGTAP_ENSURE}
+BEGIN;
+SELECT plan({n[0]});
+-- Arrange: create test users (fixed uids), then seed as the privileged (RLS-bypassing) connection role.
+-- NOTE: grants are NOT re-granted — tests run against the database's real grants so a missing grant is proven, not masked.
+{creates}
+DELETE FROM {q};
+{seed}
+"""
+    else:
+        header = f"""-- GENERATED by rlsautotest (flat, self-contained / --no-helpers) from {q}.
+-- {_TAGLINE} {_TAGLINE2}
+-- Native pgTAP. Runs standalone via `supabase test db`, pg_prove, or psql. No 000-hook needed.
+{_PGTAP_ENSURE}
+BEGIN;
+SELECT plan({n[0]});
+-- Arrange: seed as the privileged (RLS-bypassing) connection role.
+-- NOTE: grants are NOT re-granted — tests run against the database's real grants so a missing grant is proven, not masked.
+DELETE FROM {q};
+{seed}
+"""
+    return header + "\n" + body_text + "\n\nSELECT * FROM finish();\nROLLBACK;\n"
+
+
+def coverage(per, cmds):
+    o = c = 0
+    for cmd in cmds:
+        for cl in per[cmd]["classes"]:
+            for _ in ("authorized", "unauthorized"):
+                o += 1
+                if cl["handled"]: c += 1
+    return c, o
+
+
+def _sq(name):
+    return name.split(".", 1) if "." in name else ("public", name)
+
+
+_FK_SQL = """SELECT a.attname, nf.nspname, cf.relname, af.attname
+FROM pg_constraint k
+JOIN pg_class c ON c.oid=k.conrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+JOIN pg_class cf ON cf.oid=k.confrelid JOIN pg_namespace nf ON nf.oid=cf.relnamespace
+JOIN pg_attribute a ON a.attrelid=k.conrelid AND a.attnum=k.conkey[1]
+JOIN pg_attribute af ON af.attrelid=k.confrelid AND af.attnum=k.confkey[1]
+WHERE n.nspname=%s AND c.relname=%s AND k.contype='f' AND array_length(k.conkey,1)=1"""
+
+
+_SHIM = r"""-- rlsautotest offline shim: basejump-API-compatible tests.* helpers, no database.dev / network.
+-- Emitted only when basejump's supabase_test_helpers are NOT already installed.
+CREATE SCHEMA IF NOT EXISTS tests;
+GRANT USAGE ON SCHEMA tests TO anon, authenticated, service_role;
+CREATE OR REPLACE FUNCTION tests.create_supabase_user(identifier text, email text DEFAULT NULL, phone text DEFAULT NULL, metadata jsonb DEFAULT NULL)
+RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path = auth, pg_temp AS $fn$
+DECLARE user_id uuid;
+BEGIN
+  user_id := gen_random_uuid();
+  INSERT INTO auth.users (id, email, phone, raw_user_meta_data, raw_app_meta_data, created_at, updated_at)
+  VALUES (user_id, coalesce(email, concat(user_id, '@test.com')), phone,
+          jsonb_build_object('test_identifier', identifier) || coalesce(metadata, '{}'::jsonb), '{}'::jsonb, now(), now());
+  RETURN user_id;
+END $fn$;
+CREATE OR REPLACE FUNCTION tests.get_supabase_uid(identifier text)
+RETURNS uuid LANGUAGE plpgsql SECURITY DEFINER SET search_path = auth, pg_temp AS $fn$
+DECLARE u uuid;
+BEGIN
+  SELECT id INTO u FROM auth.users WHERE raw_user_meta_data ->> 'test_identifier' = identifier LIMIT 1;
+  IF u IS NULL THEN RAISE EXCEPTION 'User with identifier % not found', identifier; END IF;
+  RETURN u;
+END $fn$;
+CREATE OR REPLACE FUNCTION tests.get_supabase_user(identifier text)
+RETURNS json LANGUAGE plpgsql SECURITY DEFINER SET search_path = auth, pg_temp AS $fn$
+DECLARE j json;
+BEGIN
+  SELECT json_build_object('id', id, 'email', email, 'phone', phone,
+         'raw_user_meta_data', raw_user_meta_data, 'raw_app_meta_data', raw_app_meta_data) INTO j
+  FROM auth.users WHERE raw_user_meta_data ->> 'test_identifier' = identifier LIMIT 1;
+  IF j IS NULL OR j -> 'id' IS NULL THEN RAISE EXCEPTION 'User with identifier % not found', identifier; END IF;
+  RETURN j;
+END $fn$;
+CREATE OR REPLACE FUNCTION tests.authenticate_as(identifier text) RETURNS void LANGUAGE plpgsql AS $fn$
+DECLARE u json;
+BEGIN
+  u := tests.get_supabase_user(identifier);
+  PERFORM set_config('role', 'authenticated', true);
+  PERFORM set_config('request.jwt.claims', json_build_object('sub', u ->> 'id', 'role', 'authenticated', 'email', u ->> 'email',
+          'phone', u ->> 'phone', 'user_metadata', u -> 'raw_user_meta_data', 'app_metadata', u -> 'raw_app_meta_data')::text, true);
+END $fn$;
+CREATE OR REPLACE FUNCTION tests.authenticate_as_service_role() RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN PERFORM set_config('role', 'service_role', true); PERFORM set_config('request.jwt.claims', null, true); END $fn$;
+CREATE OR REPLACE FUNCTION tests.clear_authentication() RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN PERFORM set_config('role', 'anon', true); PERFORM set_config('request.jwt.claims', null, true); END $fn$;
+"""
+
+
+_PGTAP_ENSURE = r"""-- Make pgTAP available with ZERO setup: use the real extension if installed; otherwise load a minimal,
+-- TAP-compatible shim. The shim is created ONLY when pgTAP is absent, so a real install (e.g. on Supabase)
+-- is always preferred and never shadowed. Numbering uses a sequence so it survives SAVEPOINT rollbacks.
+DO $rlsa$
+BEGIN
+  BEGIN CREATE EXTENSION IF NOT EXISTS pgtap; EXCEPTION WHEN OTHERS THEN NULL; END;
+  IF to_regprocedure('plan(integer)') IS NULL THEN
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public._rlsa_num() RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER AS $q$ BEGIN RETURN nextval('__rlsa_tapno'); END $q$ $b$;
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public._rlsa_ok(boolean, text) RETURNS text LANGUAGE sql AS $q$ SELECT (CASE WHEN $1 THEN 'ok ' ELSE 'not ok ' END) || public._rlsa_num() || ' - ' || coalesce($2,'') $q$ $b$;
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public.plan(integer) RETURNS text LANGUAGE plpgsql SECURITY DEFINER AS $q$ BEGIN EXECUTE 'DROP SEQUENCE IF EXISTS pg_temp.__rlsa_tapno'; EXECUTE 'CREATE TEMP SEQUENCE __rlsa_tapno'; RETURN '1..'||$1; END $q$ $b$;
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public.finish() RETURNS SETOF text LANGUAGE plpgsql AS $q$ BEGIN RETURN; END $q$ $b$;
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public.is(anyelement, anyelement, text) RETURNS text LANGUAGE sql AS $q$ SELECT public._rlsa_ok($1 IS NOT DISTINCT FROM $2, $3) $q$ $b$;
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public.lives_ok(text, text) RETURNS text LANGUAGE plpgsql AS $q$ BEGIN EXECUTE $1; RETURN public._rlsa_ok(true, $2); EXCEPTION WHEN OTHERS THEN RETURN public._rlsa_ok(false, $2); END $q$ $b$;
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public.throws_ok(text, text, text, text) RETURNS text LANGUAGE plpgsql AS $q$ BEGIN EXECUTE $1; RETURN public._rlsa_ok(false, $4); EXCEPTION WHEN OTHERS THEN RETURN public._rlsa_ok(SQLSTATE = $2, $4); END $q$ $b$;
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public.is_empty(text, text) RETURNS text LANGUAGE plpgsql AS $q$ DECLARE r record; f boolean := false; BEGIN FOR r IN EXECUTE $1 LOOP f := true; EXIT; END LOOP; RETURN public._rlsa_ok(NOT f, $2); END $q$ $b$;
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public.isnt_empty(text, text) RETURNS text LANGUAGE plpgsql AS $q$ DECLARE r record; f boolean := false; BEGIN FOR r IN EXECUTE $1 LOOP f := true; EXIT; END LOOP; RETURN public._rlsa_ok(f, $2); END $q$ $b$;
+  END IF;
+END
+$rlsa$;"""
+
+
+def _basejump_present(cur):
+    cur.execute("SELECT to_regprocedure('tests.authenticate_as(text)') IS NOT NULL")
+    return bool(cur.fetchone()[0])
+
+
+_HOOK_SELFTEST = (
+    "\n-- Make this setup hook a VALID, trivially-passing pgTAP test. Runners that execute every .sql\n"
+    "-- file in the folder (pg_prove, `supabase test db`) would otherwise report 'No plan found in TAP\n"
+    "-- output' for a hook that emits no assertions and fail the whole run. The setup above runs OUTSIDE\n"
+    "-- any transaction so it persists for the test files that follow; only this one assertion is the test.\n"
+    "SELECT plan(1);\n"
+    "SELECT is(1, 1, 'rlsautotest setup hook loaded');\n"
+    "SELECT * FROM finish();\n")
+
+
+def setup_hook_sql(basejump_present):
+    """000-setup-tests-hooks.sql content: pgtap + (offline shim iff basejump absent) + a self-test pass."""
+    head = ("-- GENERATED by rlsautotest. Pre-test hook (runs first, alphabetically).\n"
+            f"-- {_TAGLINE} {_TAGLINE2}\n" + _PGTAP_ENSURE + "\n")
+    if basejump_present:
+        return head + "-- basejump supabase_test_helpers detected; using them.\n" + _HOOK_SELFTEST
+    return head + "\n" + _SHIM + _HOOK_SELFTEST
+
+
+def rls_tables(cur, schema):
+    """Every RLS-enabled table in the schema that has at least one policy (test-generation targets)."""
+    cur.execute("""SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname=%s AND c.relkind='r' AND c.relrowsecurity
+          AND EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid=c.oid)
+        ORDER BY c.relname""", (schema,))
+    return [r[0] for r in cur.fetchall()]
+
+
+def all_tables(cur, schema):
+    """Every base table in the schema, with (name, rls_enabled, has_policy) — for the exposure scan."""
+    cur.execute("""SELECT c.relname, c.relrowsecurity,
+                          EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid=c.oid)
+        FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname=%s AND c.relkind='r' ORDER BY c.relname""", (schema,))
+    return [(r[0], bool(r[1]), bool(r[2])) for r in cur.fetchall()]
+
+
+def _exposed(cur, schema, table):
+    """True if anon/authenticated holds any table privilege (i.e. RLS-off here = readable/writable via API)."""
+    cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('anon','authenticated')")
+    roles = [r[0] for r in cur.fetchall()]
+    for role in roles:
+        cur.execute("SELECT bool_or(has_table_privilege(%s, %s, priv)) FROM unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS priv",
+                    (role, f"{schema}.{table}"))
+        if cur.fetchone()[0]:
+            return True
+    return False
+
+
+def _effective_grants(cur, schema, table):
+    """Real effective table access for the client roles: schema USAGE AND the per-command table privilege.
+    Reads the catalog (no mutation). A missing grant => that command is denied regardless of RLS."""
+    cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('authenticated','anon')")
+    present = {r[0] for r in cur.fetchall()}
+    g = {}
+    for role in ("authenticated", "anon"):
+        if role not in present:
+            for cmd in _CMDS4: g[(role, cmd)] = False
+            continue
+        cur.execute("SELECT has_schema_privilege(%s, %s, 'USAGE')", (role, schema))
+        usage = bool(cur.fetchone()[0])
+        for cmd in _CMDS4:
+            if not usage:
+                g[(role, cmd)] = False; continue
+            cur.execute("SELECT has_table_privilege(%s, %s, %s)", (role, f"{schema}.{table}", cmd))
+            g[(role, cmd)] = bool(cur.fetchone()[0])
+    return g
+
+
+def _probe(conn, arrange, ident_sqls, kind, action_sql):
+    """Run ONE identity x command at generation time on a COPY and observe the real outcome
+    (arrange -> become identity -> act), then roll everything back. Returns:
+      ('count', n) for a read, ('rows', n) for a write that ran, ('err', sqlstate) for a denial/error.
+    This is how the generator PROVES effective access (grant AND RLS) instead of inferring it."""
+    cur = conn.cursor()
+    cur.execute("SAVEPOINT _rlsa_probe")
+    result = ("err", "XX000")
+    try:
+        cur.execute("RESET ROLE")
+        for s in arrange:
+            if s.strip(): cur.execute(s)
+        for s in ident_sqls:
+            cur.execute(s)
+        if kind == "read":
+            cur.execute(action_sql); result = ("count", int(cur.fetchone()[0]))
+        else:
+            cur.execute(action_sql); result = ("rows", cur.rowcount)
+    except Exception as e:
+        result = ("err", getattr(e, "sqlstate", None) or "XX000")
+    try:
+        cur.execute("ROLLBACK TO SAVEPOINT _rlsa_probe"); cur.execute("RELEASE SAVEPOINT _rlsa_probe")
+    except Exception:
+        pass
+    return result
+
+
+def _policy_bool_udfs(conn, schema, table):
+    """User-defined boolean functions referenced by this table's policies — candidates to MOCK when the
+    policy delegates the decision to an opaque function we can't drive via real inputs (RBAC etc.)."""
+    cur = conn.cursor()
+    cur.execute("SELECT coalesce(qual,'')||' '||coalesce(with_check,'') FROM pg_policies WHERE schemaname=%s AND tablename=%s", (schema, table))
+    blob = " ".join((r[0] or "") for r in cur.fetchall())
+    if not blob.strip():
+        return []
+    cur.execute("""SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid), pg_get_functiondef(p.oid)
+        FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_type t ON t.oid=p.prorettype
+        WHERE t.typname='bool' AND n.nspname NOT IN ('pg_catalog','information_schema','auth')""")
+    out = []
+    for nsp, name, args, fdef in cur.fetchall():
+        qual = re.search(r'\b' + re.escape(nsp) + r'\.' + re.escape(name) + r'\s*\(', blob)   # schema.fn(
+        bare = re.search(r'(?<![\w.])' + re.escape(name) + r'\s*\(', blob)                    # fn( not preceded by a dot
+        if qual or bare:
+            out.append({"name": name, "q": f'"{nsp}"."{name}"', "args": args, "def": fdef})
+    return out
+
+
+def _synth_required_cols(conn, schema, table, fkmap):
+    """NOT NULL, no-default, non-identity/generated columns (must be filled to insert a row).
+    Returns (cols list of (name,type), has_unsatisfiable_fk) — bail if a required col is a FK we can't parent."""
+    cur = conn.cursor()
+    cur.execute("""SELECT a.attname, format_type(a.atttypid,a.atttypmod)
+        FROM pg_attribute a
+        WHERE a.attrelid = format('%%I.%%I', %s::text, %s::text)::regclass AND a.attnum>0 AND NOT a.attisdropped
+          AND a.attnotnull AND a.attidentity='' AND a.attgenerated=''
+          AND NOT EXISTS (SELECT 1 FROM pg_attrdef d WHERE d.adrelid=a.attrelid AND d.adnum=a.attnum)""", (schema, table))
+    req = [(r[0], r[1]) for r in cur.fetchall()]
+    fk_cols = set(fkmap.get(f"{schema}.{table}", {}))
+    return req, any(c in fk_cols for c, _ in req)
+
+
+def _synth_gate(conn, schema, table, cmd, coltypes):
+    """If the (single) policy for cmd gates on `col = <session GUC / JWT claim>` or `col = ANY(<array claim>)`,
+    return a plan to synthesize a matching identity. Probe-verified downstream, so a wrong guess is harmless."""
+    fld = "with_check" if cmd == "INSERT" else "qual"
+    cur = conn.cursor()
+    cur.execute(f"SELECT {fld} FROM pg_policies WHERE schemaname=%s AND tablename=%s AND cmd IN (%s,'ALL')", (schema, table, cmd))
+    exprs = [r[0] for r in cur.fetchall() if r[0]]
+    if len(exprs) != 1:
+        return None
+    e = exprs[0]
+    m = re.search(r'\(?\s*([a-z_][a-z0-9_]*)\s*\)?\s*=\s*\(*\s*current_setting\(\s*\'([^\']+)\'', e, re.I)
+    if m and m.group(1) in coltypes:
+        return {"col": m.group(1), "kind": "guc", "name": m.group(2)}
+    if "auth.jwt()" in e:
+        col = re.search(r'\(?\s*([a-z_][a-z0-9_]*)\s*\)?\s*(?:::\s*\w+)?\s*(?:=|IN\b)', e, re.I)   # tolerate (col)::text = / IN (...)
+        keys = re.findall(r"'([^']+)'::text", e)
+        if col and col.group(1) in coltypes and keys:
+            arr = ("jsonb_array_elements" in e) or re.search(r'=\s*ANY', e, re.I)
+            return {"col": col.group(1), "kind": "claim_array" if arr else "claim_scalar", "path": keys}
+    return None
+
+
+def _synth_recursion_gate(conn, schema, table, fkmap):
+    """A SELECT policy that walks a self-referential hierarchy (WITH RECURSIVE over this table) from an
+    owner=auth.uid() base. Returns {owner, self_fk, pk} to seed an ancestor chain, or None."""
+    fks = fkmap.get(f"{schema}.{table}", {})
+    self_fk = pk = None
+    for col, (parent, pcol) in fks.items():
+        if parent in (f"{schema}.{table}", table):
+            self_fk, pk = col, pcol; break
+    if not self_fk:
+        return None
+    cur = conn.cursor()
+    cur.execute("SELECT qual FROM pg_policies WHERE schemaname=%s AND tablename=%s AND cmd IN ('SELECT','ALL')", (schema, table))
+    for (qy,) in cur.fetchall():
+        if not qy or "recursive" not in qy.lower() or "auth.uid()" not in qy.lower():
+            continue
+        m = re.search(r'([a-z_][a-z0-9_]*)\s*=\s*\(*\s*(?:SELECT\s+)?auth\.uid\(\)', qy, re.I) \
+            or re.search(r'auth\.uid\(\)\s*\)*\s*=\s*([a-z_][a-z0-9_]*)', qy, re.I)
+        if m:
+            return {"owner": m.group(1), "self_fk": self_fk, "pk": pk}
+    return None
+
+
+def _load_ctx(cur, schema, table):
+    pols, per, cmds, notes = analyze(cur, schema, table)
+    cols = _columns(cur, schema, table)
+    fkmap, colsmap = {}, {}
+    def load(tbl):
+        if tbl in colsmap: return
+        s2, t2 = _sq(tbl); colsmap[tbl] = _columns(cur, s2, t2)
+        cur.execute(_FK_SQL, (s2, t2))
+        fks = {col: (f"{ps}.{pt}", pc) for (col, ps, pt, pc) in cur.fetchall()}
+        fkmap[tbl] = fks
+        for parent, _pc in fks.values(): load(parent)
+    load(f"{schema}.{table}")
+    for cmd in cmds:
+        for c in per[cmd]["classes"]:
+            for au in c["aux"]: load(au["table"])
+    cur.execute("SELECT t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_type t JOIN pg_enum e ON e.enumtypid=t.oid GROUP BY 1")
+    enums = {r[0]: r[1] for r in cur.fetchall()}
+    cur.execute("""SELECT a.attname FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+        JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=ANY(i.indkey)
+        WHERE n.nspname=%s AND c.relname=%s AND i.indisunique AND array_length(i.indkey,1)=1""", (schema, table))
+    unique_cols = {r[0] for r in cur.fetchall()}
+    cov, tot = coverage(per, cmds)
+    grants = _effective_grants(cur, schema, table)
+    return dict(per=per, cmds=cmds, notes=notes, cols=cols, fkmap=fkmap, colsmap=colsmap,
+                enums=enums, unique_cols=unique_cols, cov=cov, tot=tot, grants=grants)
+
+
+def _emit_both(schema, table, ctx, helpers, conn=None):
+    nt = "".join(f"-- FOOTGUN NOTE: {x}\n" for x in ctx["notes"])
+    args = (schema, table, ctx["per"], ctx["cmds"], ctx["cols"], ctx["fkmap"], ctx["colsmap"], ctx["enums"], ctx["unique_cols"])
+    return nt + emit_flat(*args, helpers=helpers, grants_map=ctx.get("grants"), conn=conn), nt + emit(*args)
+
+
+_CMDS4 = ["SELECT", "INSERT", "UPDATE", "DELETE"]
+
+
+def _split_statements(sql):
+    """Split a SQL script on top-level ';', respecting $tag$...$tag$ dollar-quoted bodies,
+    '...' string literals, and -- line comments (each can contain a ';' that must NOT split).
+    psycopg3 execute() runs only one statement at a time."""
+    out, buf, i, n, tag = [], [], 0, len(sql), None
+    while i < n:
+        if tag:
+            if sql.startswith(tag, i): buf.append(tag); i += len(tag); tag = None; continue
+            buf.append(sql[i]); i += 1; continue
+        ch = sql[i]
+        if ch == "-" and i + 1 < n and sql[i + 1] == "-":          # -- line comment
+            j = sql.find("\n", i); j = n if j == -1 else j
+            buf.append(sql[i:j]); i = j; continue
+        if ch == "'":                                               # '...' string literal ('' = escaped quote)
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'": j += 2; continue
+                    j += 1; break
+                j += 1
+            buf.append(sql[i:j]); i = j; continue
+        m = re.match(r"\$[a-zA-Z0-9_]*\$", sql[i:])
+        if m:
+            tag = m.group(0); buf.append(tag); i += len(tag); continue
+        if ch == ";": out.append("".join(buf)); buf = []; i += 1; continue
+        buf.append(ch); i += 1
+    if "".join(buf).strip(): out.append("".join(buf))
+    return [s for s in out if s.strip()]
+
+
+_REPORT_SKIP = re.compile(r"^\s*(BEGIN|COMMIT|ROLLBACK)\s*;?\s*$|FROM\s+finish\s*\(", re.I)
+_DENY_WORDS = ("unauthorized", "anon", "nothing", "cannot", "affects 0", "out of scope")
+
+# Attribution / funnel — rlsautotest is the free PostgreSQL member of the UnitAutogen family.
+_HOME = "https://github.com/unitautogen"
+_TAGLINE = "rlsautotest is part of UnitAutogen — automated unit-test generation for your database."
+_TAGLINE2 = "Need it for SQL Server (tSQLt), Oracle, or Azure? " + _HOME
+
+
+def _table_report(cur, conn, schema, table, helpers):
+    """Run the SELF-CONTAINED flat battery (robust: seeds as the connection role, no service_role /
+    shim dependency) statement-by-statement, collect each pgTAP assertion's returned line, and parse
+    its descriptive label into a grant/deny matrix. Rolled back so nothing persists."""
+    ctx = _load_ctx(cur, schema, table)
+    flat = _emit_both(schema, table, ctx, helpers=False, conn=conn)[0]
+    taplines = []
+    try:
+        for st in _split_statements(flat):
+            if not st.strip() or _REPORT_SKIP.match(st):
+                continue
+            cur.execute(st)
+            if cur.description:
+                try:
+                    for r in cur.fetchall():
+                        v = r[0]
+                        if isinstance(v, str) and (v.startswith("ok") or v.startswith("not ok")):
+                            taplines.append(v)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        conn.rollback()
+    cells = {}
+    idgrid = {}   # cmd -> { identity -> {"exp": <should-be-able>, "pass": <test passed>} }
+    for ln in taplines:
+        m = re.match(r"(ok|not ok)\b.*?-\s*(.*)$", ln.strip())
+        if not m: continue
+        passed = m.group(1) == "ok"; label = m.group(2)
+        cmd = next((c for c in _CMDS4 if label.upper().startswith(c)), None)
+        if not cmd: continue
+        low = label.lower()
+        side = "deny" if any(k in low for k in _DENY_WORDS) else "grant"
+        d = cells.setdefault(cmd, {}); d[side] = d.get(side, True) and passed
+        # per-identity classification (for the access matrix)
+        if "out of scope" in low:        # sub-deny on an authorized row; not a primary cell
+            continue
+        # identity from the label
+        if "anon" in low:
+            ident = "anon"
+        elif any(k in low for k in ("not authoriz", "other user", "non-owner", "unauthorized")):
+            ident = "other"   # authenticated but NOT authorized by the policy
+        else:
+            ident = "authorized"
+        # can/blocked from the observed outcome (probe labels) or the derived wording (fallback)
+        if any(k in low for k in ("denied", " 0 row", "sees nothing", "blocks", "cannot")):
+            exp = False
+        elif any(k in low for k in ("sees all", "public", "permits", "row(s)", "may ", " can ")):
+            exp = True
+        else:
+            exp = True
+        g = idgrid.setdefault(cmd, {}).setdefault(ident, {"exp": exp, "pass": True})
+        g["exp"] = exp; g["pass"] = g["pass"] and passed
+    cur.execute("SELECT c.relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relname=%s", (schema, table))
+    r = cur.fetchone(); rls_on = bool(r and r[0])
+    cur.execute("SELECT cmd FROM pg_policies WHERE schemaname=%s AND tablename=%s", (schema, table))
+    pol = set()
+    for (cmd,) in cur.fetchall():
+        pol |= set(_CMDS4) if cmd == "ALL" else {cmd}
+    notes = list(ctx["notes"])
+    if any("[mocked" in ln for ln in taplines):
+        notes.append("opaque policy function(s) were MOCKED to prove the policy delegates correctly (wiring) — the function's own logic is NOT verified here; test it separately")
+    if any("42P17" in ln or "infinite recursion" in ln.lower() for ln in taplines):
+        notes.append("BROKEN POLICY: a policy queries its own table (self-referential) -> Postgres raises 'infinite recursion detected in policy' -> the table is UNREADABLE by everyone. Use a SECURITY DEFINER helper function instead.")
+    return {"table": table, "rls_enabled": rls_on, "policied": sorted(pol),
+            "cells": cells, "idgrid": idgrid, "footguns": notes, "coverage": [ctx["cov"], ctx["tot"]]}
+
+
+def emit_rls_guard(cur, schema):
+    """Schema-wide guard suite: every table reachable by anon/authenticated MUST have RLS enabled.
+    Emitted as 010-rls-enabled.test.sql so a table shipped without RLS becomes a FAILING test —
+    closes the 'no policy => no test => CI green' hole. Returns SQL, or None if nothing reachable."""
+    reach = [t for (t, _rls, _pol) in all_tables(cur, schema) if _exposed(cur, schema, t)]
+    if not reach:
+        return None
+    lines = ["-- GENERATED by rlsautotest. Schema-wide guard: every table reachable by anon/authenticated must have RLS enabled.",
+             f"-- {_TAGLINE} {_TAGLINE2}",
+             "-- A table granted to anon/authenticated but with RLS OFF fails here (it would otherwise pass CI silently).",
+             _PGTAP_ENSURE, "BEGIN;", f"SELECT plan({len(reach)});"]
+    for t in reach:
+        lit = f"'\"{schema}\".\"{t}\"'::regclass"
+        lines.append(f"SELECT is( (SELECT relrowsecurity FROM pg_class WHERE oid = {lit}), true, "
+                     f"'{schema}.{t}: RLS must be enabled (table is reachable by anon/authenticated)' );")
+    lines += ["SELECT * FROM finish();", "ROLLBACK;", ""]
+    return "\n".join(lines)
+
+
+# identities shown as rows in each table's access grid (key, display label)
+# Rows in each table's access grid: (internal key, display label).
+# NOTE: 'authorized' and 'other' are NOT Postgres roles — both connect as the `authenticated`
+# role and differ only by JWT identity/claims. Only service_role / authenticated / anon are real
+# DB roles. Labels say so explicitly so the grid isn't misread as a per-role matrix.
+_ID_ROWS = [("service_role", "service_role"), ("authorized", "authenticated, authorized"),
+            ("other", "authenticated, not authorized"), ("anon", "anon")]
+
+
+def _id_cell(rep, ident, cmd):
+    """One identity x command cell -> (glyph, css-class, title).
+    glyph: ✓ can · blocked ✗ should-be-allowed-but-blocked.  class 'danger' = can-but-shouldn't (hole)."""
+    rls_on = rep["rls_enabled"]; policied = rep.get("policied", []); exposed = rep.get("exposed")
+    if ident == "service_role":
+        return ("✓", "svc", "service_role bypasses RLS — full, unfiltered access")
+    if not rls_on:
+        if ident == "anon":
+            if cmd == "SELECT":
+                return ("✓", "danger", "RLS off — anon can read every row") if exposed else ("·", "none", "anon has no table grant")
+            return ("·", "none", "anon has no write grant")
+        # authorized / other == authenticated identities; RLS off = unfiltered
+        if exposed:
+            return ("✓", "danger", "RLS off — any authenticated user has unfiltered access")
+        return ("·", "none", "RLS off, but no client grant — unreachable via the API")
+    if cmd not in policied:
+        return ("·", "none", "no policy for this command (implicit deny)")
+    g = rep.get("idgrid", {}).get(cmd, {}).get(ident)
+    if not g:
+        if ident == "anon" and cmd != "SELECT":
+            return ("·", "none", "anon has no write grant")
+        return ("–", "na", "not tested")
+    exp, passed = g["exp"], g["pass"]
+    observed_can = exp if passed else (not exp)
+    if passed:
+        return ("✓", "pass", "can — enforced as declared") if observed_can else ("·", "none", "blocked — enforced as declared")
+    if observed_can:
+        return ("✓", "danger", "SHOULD be blocked but CAN act — security hole")
+    return ("✗", "fail", "SHOULD be allowed but is blocked — policy too strict")
+
+
+def _table_status(r):
+    if not r["rls_enabled"]:
+        return ("⛔ RLS OFF — exposed", "danger") if r.get("exposed") else ("⚠ RLS OFF (no client grant)", "warn")
+    return ("RLS on", "on")
+
+
+def render_report_text(reps):
+    out = []
+    exposed = [r["table"] for r in reps if not r["rls_enabled"] and r.get("exposed")]
+    if exposed:
+        out.append("⛔ EXPOSED — RLS OFF and readable/writable by anon/authenticated: " + ", ".join(exposed))
+        out.append("")
+    for r in reps:
+        st, _ = _table_status(r)
+        out.append(f"{r['table']}  [{st}]")
+        out.append(f"  {'identity':<31}" + "".join(f"{c:<9}" for c in _CMDS4))
+        for key, lbl in _ID_ROWS:
+            line = f"  {lbl:<31}"
+            for c in _CMDS4:
+                g, cls, _ = _id_cell(r, key, c)
+                glyph = g + ("!" if cls == "danger" else "")   # ! = behaves wrong (hole)
+                line += f"{glyph:<9}"
+            out.append(line)
+        for fn in r["footguns"]:
+            out.append(f"    ! footgun: {fn}")
+        out.append("")
+    out.append("legend: ✓ can · blocked/none ✗ should-be-allowed-but-blocked  ✓! = should be blocked but CAN (security hole)  – not tested")
+    out.append("service_role bypasses RLS by design (always full access).")
+    out.append("note: 'authenticated, authorized' and 'authenticated, not authorized' are the SAME Postgres role (authenticated) under different JWT identities/claims — NOT separate DB roles. Only service_role, authenticated and anon are real Postgres roles; 'authorized' vs 'not authorized' is the policy outcome for that identity.")
+    out.append("")
+    out.append(_TAGLINE + " " + _TAGLINE2)
+    return "\n".join(out)
+
+
+def render_report_html(reps, schema):
+    import html as _h
+    esc = _h.escape
+    exposed = [r["table"] for r in reps if not r["rls_enabled"] and r.get("exposed")]
+    offsafe = [r["table"] for r in reps if not r["rls_enabled"] and not r.get("exposed")]
+    def has_hole(r):
+        return any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _ID_ROWS for c in _CMDS4)
+    holes = [r["table"] for r in reps if has_hole(r)]
+    ok_tables = [r for r in reps if r["rls_enabled"] and not has_hole(r)]
+    # order: tables with holes/exposure first, then the rest
+    order = sorted(reps, key=lambda r: (not has_hole(r), r["table"]))
+    blocks = []
+    for r in order:
+        st, stcls = _table_status(r)
+        grid_rows = []
+        for key, lbl in _ID_ROWS:
+            tds = []
+            for c in _CMDS4:
+                g, cls, title = _id_cell(r, key, c)
+                tds.append(f'<td class="c {cls}" title="{esc(title)}">{g}</td>')
+            note = ' <span class="rolenote">bypasses RLS</span>' if key == "service_role" else ""
+            grid_rows.append(f'<tr><td class="idn">{esc(lbl)}{note}</td>{"".join(tds)}</tr>')
+        flags = "".join(f'<li>{esc(f)}</li>' for f in r.get("footguns", []))
+        flags_html = f'<ul class="flags">{flags}</ul>' if flags else ""
+        blocks.append(
+            f'<section class="tbl"><h2>{esc(r["table"])} <span class="chip {stcls}">{esc(st)}</span></h2>'
+            f'<table class="grid"><thead><tr><th>identity</th>'
+            + "".join(f"<th>{c}</th>" for c in _CMDS4) + "</tr></thead><tbody>"
+            + "".join(grid_rows) + f"</tbody></table>{flags_html}</section>")
+    banner = ""
+    if exposed:
+        banner += f'<div class="ban danger"><b>⛔ Exposed</b> — RLS is OFF and these tables are readable/writable by anon/authenticated: {esc(", ".join(exposed))}</div>'
+    if offsafe:
+        banner += f'<div class="ban warn"><b>⚠ RLS off</b> (no client grant, but unprotected): {esc(", ".join(offsafe))}</div>'
+    summary = (f'{len(reps)} table(s) &middot; '
+               f'<span class="kpi {"bad" if exposed else "good"}">{len(exposed)} exposed</span> &middot; '
+               f'<span class="kpi {"bad" if holes else "good"}">{len(holes)} with problems</span> &middot; '
+               f'<span class="kpi good">{len(ok_tables)} enforced as declared</span>')
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>rlsautotest — RLS report ({esc(schema)})</title>
+<style>
+ body{{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:2rem;color:#1a1a1a}}
+ h1{{font-size:1.4rem;margin:0 0 .25rem}} .sub{{color:#666;margin:0 0 1rem}}
+ .summary{{margin:.5rem 0 1rem}} .kpi{{font-weight:600}} .good{{color:#15803d}} .bad{{color:#b91c1c}}
+ .ban{{padding:.6rem .8rem;border-radius:6px;margin:.4rem 0}}
+ .ban.danger{{background:#fee2e2;border:1px solid #fca5a5}} .ban.warn{{background:#fef3c7;border:1px solid #fcd34d}}
+ section.tbl{{margin:1.5rem 0}}
+ section.tbl h2{{font-size:1.05rem;margin:0 0 .4rem}}
+ .chip{{font-size:.72rem;font-weight:600;padding:.1rem .5rem;border-radius:999px;vertical-align:middle}}
+ .chip.on{{background:#e0f2fe;color:#075985}} .chip.danger{{background:#fee2e2;color:#b91c1c}} .chip.warn{{background:#fef3c7;color:#92400e}}
+ table.grid{{border-collapse:collapse;min-width:32rem}}
+ .grid th,.grid td{{border:1px solid #e5e7eb;padding:.4rem .7rem}}
+ .grid th{{background:#f9fafb;font-weight:600;text-align:center}} .grid th:first-child{{text-align:left}}
+ td.idn{{font-weight:600;white-space:nowrap}} .rolenote{{font-weight:400;color:#888;font-size:.78rem}}
+ td.c{{text-align:center;font-size:1.05rem}}
+ .pass{{background:#dcfce7;color:#15803d}} .none{{color:#cbd5e1}} .na{{color:#cbd5e1}}
+ .svc{{background:#f1f5f9;color:#475569}}
+ .danger{{background:#dc2626;color:#fff;font-weight:700}} .fail{{background:#fee2e2;color:#b91c1c;font-weight:700}}
+ ul.flags{{margin:.4rem 0 0;padding-left:1.1rem;color:#92400e;font-size:.85rem}}
+ .legend{{color:#666;font-size:.85rem;margin-top:1.5rem;max-width:48rem}}
+ .footer{{color:#888;font-size:.8rem;margin-top:1.2rem;border-top:1px solid #eee;padding-top:.6rem}}
+</style></head><body>
+<h1>RLS access report</h1>
+<p class="sub">schema <code>{esc(schema)}</code> &middot; generated by <a href="{_HOME}">rlsautotest</a></p>
+<div class="summary">{summary}</div>
+{banner}
+{"".join(blocks)}
+<p class="legend"><b>Each row is an identity, each column a command.</b>
+ <span class="c pass">✓</span> can &middot; <span class="c none">·</span> blocked &middot;
+ <span class="c danger">✓</span> can but <b>should be blocked</b> (security hole) &middot;
+ <span class="c fail">✗</span> should be allowed but is blocked &middot; – not tested.
+ <b>service_role</b> bypasses RLS by design. “Enforced as declared” means the database behaves the way your
+ policies say — not that the policies are what you intended.</p>
+<p class="legend"><b>About the identities:</b> <code>authenticated, authorized</code> and
+ <code>authenticated, not authorized</code> are the <b>same Postgres role</b> (<code>authenticated</code>)
+ under different JWT identities/claims — they are <b>not</b> separate database roles. Only
+ <code>service_role</code>, <code>authenticated</code> and <code>anon</code> are real Postgres roles;
+ “authorized” vs “not authorized” is simply whether that identity passes the table’s policies.</p>
+<p class="footer">{esc(_TAGLINE)} <a href="{_HOME}">Need it for SQL Server (tSQLt), Oracle, or Azure?</a></p>
+</body></html>
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUBCOMMAND HANDLERS  (lint · snapshot · diff · users · coverage · init)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SEV_ORDER = {"INFO": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+_SEV_ICON  = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "INFO": "🔵"}
+
+
+# ── lint ─────────────────────────────────────────────────────────────────────
+def _lint_table(cur, schema, table):
+    """Static analysis of one table's RLS policies — no test execution."""
+    cur.execute("""SELECT c.relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                   WHERE n.nspname=%s AND c.relname=%s""", (schema, table))
+    row = cur.fetchone()
+    if not row:
+        return []
+    rls_on = bool(row[0])
+    cur.execute("""SELECT policyname, permissive, roles, cmd, qual, with_check
+                   FROM pg_policies WHERE schemaname=%s AND tablename=%s ORDER BY policyname""",
+                (schema, table))
+    policies = cur.fetchall()
+    findings = []
+
+    if not rls_on and policies:
+        findings.append(("L008", "MEDIUM", table, None, "RLS disabled but policies exist — policies are dead (never evaluated)"))
+        return findings
+
+    if not policies:
+        if rls_on:
+            findings.append(("L004", "HIGH", table, None,
+                              "RLS enabled but no policies — all access implicitly denied for every role"))
+        return findings
+
+    # derive which commands have at least one policy
+    expanded = set()
+    for (_, _, _, cmd, _, _) in policies:
+        c = (cmd or "ALL").upper()
+        expanded |= ({"SELECT","INSERT","UPDATE","DELETE"} if c == "ALL" else {c})
+    if "DELETE" not in expanded:
+        findings.append(("L010", "INFO", table, None,
+                          "No DELETE policy — implicit deny for DELETE (add one or document intent)"))
+
+    for (pname, permissive, roles, cmd, qual, with_check) in policies:
+        cmd_eff = (cmd or "ALL").upper()
+        q = (qual or "").strip()
+        wc = (with_check or "").strip()
+        role_list = list(roles or [])
+
+        # L001: USING(true) on a permissive policy
+        if q.lower() in ("true", "(true)") and permissive == "PERMISSIVE":
+            anon_in = not role_list or "anon" in role_list
+            findings.append(("L001", "CRITICAL" if anon_in else "HIGH", table, pname,
+                              "USING(true) — permissive open read; " +
+                              ("anon + authenticated" if anon_in else "authenticated") +
+                              " users can read ALL rows"))
+
+        # L002: WITH CHECK(true) on a permissive policy
+        if wc.lower() in ("true", "(true)") and permissive == "PERMISSIVE":
+            findings.append(("L002", "CRITICAL", table, pname,
+                              "WITH CHECK(true) — permissive open write; authorized users can write any row"))
+
+        # L003: UPDATE/ALL with USING but no WITH CHECK
+        if cmd_eff in ("UPDATE", "ALL") and q and not wc:
+            findings.append(("L003", "HIGH", table, pname,
+                              "UPDATE policy has USING but no WITH CHECK — rows can be moved out of authorized scope"))
+
+        # L009: USING ≠ WITH CHECK on UPDATE (asymmetric scope)
+        if cmd_eff in ("UPDATE", "ALL") and q and wc and q.lower() != wc.lower():
+            findings.append(("L009", "INFO", table, pname,
+                              f"USING ≠ WITH CHECK: read scope ({q[:60]!r}) differs from write scope ({wc[:60]!r})"))
+
+        # L005: opaque user-defined function in policy (not auth.* / pg_catalog)
+        both = f"{q} {wc}"
+        udfs = re.findall(r'\b(?!auth\.|pgsodium\.|extensions\.|pg_catalog\.)([a-z_]\w*\.[a-z_]\w*)\s*\(', both, re.I)
+        udfs = [u for u in udfs if not u.startswith(("storage.", "public."))]
+        if udfs:
+            findings.append(("L005", "HIGH", table, pname,
+                              f"Policy calls user-defined function(s): {udfs} — logic is opaque and won't be auto-tested by rlsautotest"))
+
+        # L007: permissive policy grants anon full SELECT with no real restriction
+        if permissive == "PERMISSIVE" and "anon" in role_list and cmd_eff in ("SELECT","ALL"):
+            if q.lower() in ("true", "(true)"):
+                findings.append(("L007", "MEDIUM", table, pname,
+                                  "Permissive policy grants anon full SELECT — verify public read is intentional"))
+
+        # L006: self-referential policy → infinite recursion risk
+        full_table = f"{schema}.{table}"
+        if re.search(rf'\b{re.escape(table)}\b', both, re.I) or full_table.lower() in both.lower():
+            findings.append(("L006", "HIGH", table, pname,
+                              f"Policy references its own table ({table}) in the predicate — "
+                              f"risk of infinite recursion; use a SECURITY DEFINER helper fn instead"))
+
+    return findings
+
+
+def cmd_lint():
+    """rlsautotest lint — static analysis of RLS policy expressions (no test execution)."""
+    ap = argparse.ArgumentParser(prog="rlsautotest lint",
+                                 description="Static analysis of RLS policy expressions.")
+    ap.add_argument("--schema", required=True)
+    ap.add_argument("--table", help="analyze one table; omit for all tables in the schema")
+    ap.add_argument("--db-url", help="Postgres connection string (else PG* env)")
+    ap.add_argument("--json", metavar="FILE", help="write findings as JSON")
+    ap.add_argument("--min-severity", choices=["INFO","MEDIUM","HIGH","CRITICAL"], default="INFO",
+                    help="minimum severity to report (default: INFO)")
+    a = ap.parse_args(sys.argv[2:])
+    try: sys.stdout.reconfigure(encoding="utf-8")
+    except Exception: pass
+
+    with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
+        if a.table:
+            tables = [a.table]
+        else:
+            cur.execute("""SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                           WHERE n.nspname=%s AND c.relkind='r' ORDER BY c.relname""", (a.schema,))
+            tables = [r[0] for r in cur.fetchall()]
+        all_findings = []
+        for t in tables:
+            all_findings.extend(_lint_table(cur, a.schema, t))
+
+    min_sev = _SEV_ORDER[a.min_severity]
+    filtered = [(rid, sev, tbl, pol, msg) for (rid, sev, tbl, pol, msg) in all_findings
+                if _SEV_ORDER.get(sev, 0) >= min_sev]
+    filtered.sort(key=lambda x: (-_SEV_ORDER.get(x[1], 0), x[2], x[3] or ""))
+
+    if a.json:
+        data = [{"rule": r, "severity": s, "table": t, "policy": p, "message": m}
+                for (r, s, t, p, m) in filtered]
+        open(a.json, "w", encoding="utf-8").write(json.dumps(data, indent=2))
+
+    if not filtered:
+        print(f"✅  No issues found in {a.schema} schema (min-severity={a.min_severity})")
+        return
+    print(f"\nrlsautotest lint — {a.schema}  [{len(filtered)} finding(s)]\n")
+    cur_table = None
+    for (rid, sev, tbl, pol, msg) in filtered:
+        if tbl != cur_table:
+            print(f"  {a.schema}.{tbl}")
+            cur_table = tbl
+        pol_tag = f"  [{pol}]" if pol else ""
+        print(f"    {_SEV_ICON.get(sev,'·')} {rid} {sev}{pol_tag}: {msg}")
+    print()
+    n_crit = sum(1 for (_, s, *_) in filtered if s == "CRITICAL")
+    n_high = sum(1 for (_, s, *_) in filtered if s == "HIGH")
+    if n_crit or n_high:
+        sys.exit(1)
+
+
+# ── snapshot ─────────────────────────────────────────────────────────────────
+def cmd_snapshot():
+    """rlsautotest snapshot — save current RLS policy state to a JSON file."""
+    import datetime, os
+    ap = argparse.ArgumentParser(prog="rlsautotest snapshot",
+                                 description="Save current RLS policy state for later diff.")
+    ap.add_argument("--schema", required=True)
+    ap.add_argument("--db-url", help="Postgres connection string (else PG* env)")
+    ap.add_argument("--out", default=".rlsautotest/snapshot.json",
+                    help="output path (default: .rlsautotest/snapshot.json)")
+    a = ap.parse_args(sys.argv[2:])
+
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+    with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT schemaname, tablename, policyname, permissive, roles::text, cmd, qual, with_check
+            FROM pg_policies WHERE schemaname=%s ORDER BY tablename, policyname""", (a.schema,))
+        pol_rows = cur.fetchall()
+        cur.execute("""SELECT c.relname, c.relrowsecurity
+            FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname=%s AND c.relkind='r' ORDER BY c.relname""", (a.schema,))
+        table_rows = cur.fetchall()
+
+    snapshot = {
+        "schema": a.schema,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "tables": {r[0]: {"rls_enabled": bool(r[1])} for r in table_rows},
+        "policies": [{"schema": r[0], "table": r[1], "name": r[2], "permissive": r[3],
+                       "roles": r[4], "cmd": r[5], "qual": r[6], "with_check": r[7]}
+                      for r in pol_rows],
+    }
+    open(a.out, "w", encoding="utf-8").write(json.dumps(snapshot, indent=2))
+    print(f"Snapshot saved: {os.path.abspath(a.out)}")
+    print(f"  {len(snapshot['policies'])} policies across {len(table_rows)} tables  "
+          f"(timestamp: {snapshot['timestamp']})")
+
+
+# ── diff ─────────────────────────────────────────────────────────────────────
+def cmd_diff():
+    """rlsautotest diff — compare current RLS policies vs a saved snapshot."""
+    ap = argparse.ArgumentParser(prog="rlsautotest diff",
+                                 description="Compare current RLS policies vs saved snapshot.")
+    ap.add_argument("--schema", required=True)
+    ap.add_argument("--db-url", help="Postgres connection string (else PG* env)")
+    ap.add_argument("--snapshot", default=".rlsautotest/snapshot.json",
+                    help="snapshot file (default: .rlsautotest/snapshot.json)")
+    ap.add_argument("--json", metavar="FILE", help="write diff output as JSON")
+    a = ap.parse_args(sys.argv[2:])
+    try: sys.stdout.reconfigure(encoding="utf-8")
+    except Exception: pass
+
+    try:
+        saved = json.loads(open(a.snapshot, encoding="utf-8").read())
+    except FileNotFoundError:
+        print(f"No snapshot at {a.snapshot}. Run first:\n"
+              f"  rlsautotest snapshot --schema {a.schema}", file=sys.stderr)
+        sys.exit(2)
+
+    with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT tablename, policyname, permissive, roles::text, cmd, qual, with_check
+            FROM pg_policies WHERE schemaname=%s ORDER BY tablename, policyname""", (a.schema,))
+        curr_pols = {(r[0], r[1]): {"table": r[0], "name": r[1], "permissive": r[2],
+                                      "roles": r[3], "cmd": r[4], "qual": r[5], "with_check": r[6]}
+                     for r in cur.fetchall()}
+        cur.execute("""SELECT c.relname, c.relrowsecurity
+            FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname=%s AND c.relkind='r' ORDER BY c.relname""", (a.schema,))
+        curr_tables = {r[0]: bool(r[1]) for r in cur.fetchall()}
+
+    def _sig(p): return (p.get("permissive"), p.get("roles"), p.get("cmd"),
+                          p.get("qual"), p.get("with_check"))
+
+    saved_pols = {(p["table"], p["name"]): p for p in saved.get("policies", [])}
+    added   = [curr_pols[k] for k in curr_pols if k not in saved_pols]
+    removed = [saved_pols[k] for k in saved_pols if k not in curr_pols]
+    changed = []
+    for k in curr_pols:
+        if k in saved_pols and _sig(curr_pols[k]) != _sig(saved_pols[k]):
+            changed.append({"table": k[0], "name": k[1],
+                             "before": saved_pols[k], "after": curr_pols[k]})
+
+    saved_tables = {t: v.get("rls_enabled") for t, v in saved.get("tables", {}).items()}
+    rls_changes = [{"table": t, "before": saved_tables[t], "after": cur_rls}
+                   for t, cur_rls in curr_tables.items()
+                   if t in saved_tables and bool(saved_tables[t]) != bool(cur_rls)]
+
+    result = {"added": added, "removed": removed, "changed": changed, "rls_changes": rls_changes,
+              "snapshot_timestamp": saved.get("timestamp", "?")}
+    if a.json:
+        open(a.json, "w", encoding="utf-8").write(json.dumps(result, indent=2))
+
+    total = len(added) + len(removed) + len(changed) + len(rls_changes)
+    if total == 0:
+        print(f"✅  No policy changes since snapshot ({saved.get('timestamp','?')})")
+        return
+
+    print(f"\nrlsautotest diff — {a.schema}  vs  {a.snapshot}  ({saved.get('timestamp','?')})\n")
+    for p in added:
+        print(f"  ✅ ADDED    {p['table']}.{p['name']}  cmd={p['cmd']}  permissive={p['permissive']}")
+    for p in removed:
+        print(f"  🗑  REMOVED  {p['table']}.{p['name']}  cmd={p['cmd']}")
+    for c in changed:
+        print(f"  ✏  CHANGED  {c['table']}.{c['name']}")
+        b, af = c["before"], c["after"]
+        for field in ("permissive", "roles", "cmd", "qual", "with_check"):
+            bv, av = b.get(field), af.get(field)
+            if bv != av:
+                print(f"       {field}: {bv!r}  →  {av!r}")
+    for r in rls_changes:
+        icon = "🔒" if r["after"] else "🔓"
+        state = "ENABLED" if r["after"] else "DISABLED"
+        print(f"  {icon} RLS {state}  {r['table']}")
+    print()
+    # Exit 1 if any security-reducing change (policy removed, RLS disabled, or USING/WITH CHECK widened)
+    security_reduced = bool(removed or [r for r in rls_changes if not r["after"]])
+    if security_reduced:
+        print("⚠  Security-reducing changes detected (exit 1 — CI gate; pass --no-fail to suppress)")
+        sys.exit(1)
+
+
+# ── users ─────────────────────────────────────────────────────────────────────
+def cmd_users():
+    """rlsautotest users — list users from auth.users for testing context."""
+    ap = argparse.ArgumentParser(prog="rlsautotest users",
+                                 description="List users from auth.users for --as-user testing.")
+    ap.add_argument("--db-url", help="Postgres connection string (else PG* env)")
+    ap.add_argument("--limit", type=int, default=25, help="max rows (default: 25)")
+    ap.add_argument("--json", metavar="FILE", help="write as JSON")
+    a = ap.parse_args(sys.argv[2:])
+    try: sys.stdout.reconfigure(encoding="utf-8")
+    except Exception: pass
+
+    with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
+        try:
+            cur.execute("""SELECT id, email, phone, role, created_at,
+                                  raw_app_meta_data::text, raw_user_meta_data::text
+                           FROM auth.users ORDER BY created_at DESC LIMIT %s""", (a.limit,))
+            rows = cur.fetchall()
+        except Exception as e:
+            if "auth" in str(e).lower() or "does not exist" in str(e).lower():
+                print("auth.users not found. Is this a Supabase database? (auth schema required)", file=sys.stderr)
+                sys.exit(2)
+            raise
+
+    if not rows:
+        print("No users in auth.users. Add users via Supabase Dashboard → Authentication.")
+        return
+    if a.json:
+        data = [{"id": str(r[0]), "email": r[1], "phone": r[2], "role": r[3],
+                 "created_at": str(r[4]), "app_metadata": r[5], "user_metadata": r[6]}
+                for r in rows]
+        open(a.json, "w", encoding="utf-8").write(json.dumps(data, indent=2))
+
+    print(f"\nrlsautotest users — {len(rows)} user(s)\n")
+    print(f"  {'ID':<38}  {'EMAIL / PHONE':<30}  {'ROLE':<15}  CREATED")
+    print("  " + "─" * 95)
+    for (uid, email, phone, role, created, _app, _meta) in rows:
+        ident = email or phone or "—"
+        print(f"  {str(uid):<38}  {ident:<30}  {(role or '—'):<15}  {str(created)[:19]}")
+    print(f"\nTest from a real user's perspective:\n"
+          f"  rlsautotest --schema <s> --report --as-user <email>\n")
+
+
+# ── coverage ─────────────────────────────────────────────────────────────────
+def cmd_coverage():
+    """rlsautotest coverage — RLS policy obligation-surface coverage report."""
+    ap = argparse.ArgumentParser(prog="rlsautotest coverage",
+                                 description="Report what fraction of RLS obligations are covered by the generated battery.")
+    ap.add_argument("--schema", required=True)
+    ap.add_argument("--table", help="one table only")
+    ap.add_argument("--db-url", help="Postgres connection string (else PG* env)")
+    ap.add_argument("--json", metavar="FILE", help="write as JSON")
+    a = ap.parse_args(sys.argv[2:])
+    try: sys.stdout.reconfigure(encoding="utf-8")
+    except Exception: pass
+
+    CMDS = ("SELECT", "INSERT", "UPDATE", "DELETE")
+    def _expand(c):
+        return set(CMDS) if (c or "ALL").upper() == "ALL" else {(c or "").upper()}
+    # The obligations our battery asserts (authorized + unauthorized per policied command)
+    BATTERY_OBL = {(c, p)
+                   for c in CMDS
+                   for p in ("authorized", "unauthorized")}
+
+    with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
+        cur.execute("""SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                       WHERE n.nspname=%s AND c.relkind='r' AND c.relrowsecurity ORDER BY c.relname""",
+                    (a.schema,))
+        rls_tables_all = [r[0] for r in cur.fetchall()]
+        if a.table:
+            rls_tables_all = [t for t in rls_tables_all if t == a.table]
+        rows_out = []
+        for t in rls_tables_all:
+            cur.execute("SELECT cmd FROM pg_policies WHERE schemaname=%s AND tablename=%s", (a.schema, t))
+            cmds = set()
+            for (c,) in cur.fetchall():
+                cmds |= _expand(c)
+            cmds &= set(CMDS)
+            obligations = {(c, p) for c in cmds for p in ("authorized", "unauthorized")}
+            covered = obligations & BATTERY_OBL
+            uncovered = sorted(obligations - covered)
+            pct = round(len(covered) / len(obligations) * 100, 1) if obligations else 0.0
+            rows_out.append({"table": t, "policy_commands": sorted(cmds),
+                              "obligations": len(obligations), "covered": len(covered),
+                              "coverage": pct,
+                              "uncovered": [f"{c}/{p}" for (c, p) in uncovered]})
+
+    if a.json:
+        open(a.json, "w", encoding="utf-8").write(json.dumps(rows_out, indent=2))
+    if not rows_out:
+        print(f"No RLS-enabled tables in schema {a.schema}.", file=sys.stderr); sys.exit(2)
+
+    tot_o = sum(r["obligations"] for r in rows_out)
+    tot_c = sum(r["covered"] for r in rows_out)
+    overall = round(tot_c / tot_o * 100, 1) if tot_o else 0.0
+    print(f"\nrlsautotest coverage — {a.schema}  [{overall:.1f}% overall]\n")
+    print(f"  {'TABLE':<30}  {'COV%':>6}  {'COVERED':>8}  UNCOVERED")
+    print("  " + "─" * 75)
+    for r in rows_out:
+        filled = int(r["coverage"] // 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        unc = ", ".join(r["uncovered"]) or "—"
+        print(f"  {r['table']:<30}  {r['coverage']:>5.1f}%  {r['covered']:>2}/{r['obligations']:<2}  {bar}  {unc}")
+    print(f"\n  Overall: {tot_c}/{tot_o} obligations covered ({overall:.1f}%)")
+    print(f"\n  Tip: 'rlsautotest --schema {a.schema} --report' executes the battery and shows the identity matrix.\n")
+
+
+# ── init ─────────────────────────────────────────────────────────────────────
+def cmd_init():
+    """rlsautotest init — discover tables and RLS/policy status in a schema."""
+    ap = argparse.ArgumentParser(prog="rlsautotest init",
+                                 description="Discover tables, RLS status, and grants in a schema.")
+    ap.add_argument("--schema", required=True)
+    ap.add_argument("--db-url", help="Postgres connection string (else PG* env)")
+    ap.add_argument("--json", metavar="FILE", help="write as JSON")
+    a = ap.parse_args(sys.argv[2:])
+    try: sys.stdout.reconfigure(encoding="utf-8")
+    except Exception: pass
+
+    with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.relname,
+                   c.relrowsecurity,
+                   COUNT(DISTINCT p.policyname)                                                AS policy_count,
+                   COUNT(DISTINCT CASE WHEN a.grantee='authenticated' THEN a.privilege_type END) AS auth_grants,
+                   COUNT(DISTINCT CASE WHEN a.grantee='anon'          THEN a.privilege_type END) AS anon_grants
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN pg_policies p
+                   ON p.schemaname = n.nspname AND p.tablename = c.relname
+            LEFT JOIN information_schema.role_table_grants a
+                   ON a.table_schema = n.nspname AND a.table_name = c.relname
+                  AND a.grantee IN ('authenticated','anon')
+            WHERE n.nspname=%s AND c.relkind='r'
+            GROUP BY c.relname, c.relrowsecurity
+            ORDER BY c.relname""", (a.schema,))
+        rows = cur.fetchall()
+
+    if not rows:
+        print(f"No tables found in schema {a.schema}.", file=sys.stderr); sys.exit(2)
+    if a.json:
+        data = [{"table": r[0], "rls_enabled": bool(r[1]), "policy_count": int(r[2]),
+                 "auth_grants": int(r[3]), "anon_grants": int(r[4])} for r in rows]
+        open(a.json, "w", encoding="utf-8").write(json.dumps(data, indent=2))
+
+    print(f"\nrlsautotest init — {a.schema}  [{len(rows)} table(s)]\n")
+    print(f"  {'TABLE':<32}  {'RLS':<5}  {'POLICIES':>9}  {'AUTH':>5}  {'ANON':>5}  STATUS")
+    print("  " + "─" * 72)
+    n_exposed = 0
+    for (name, rls_on, pol_cnt, auth_g, anon_g) in rows:
+        icon = "🔒" if rls_on else "🔓"
+        status_parts = []
+        if not rls_on and (auth_g or anon_g):
+            status_parts.append("⚠ EXPOSED")
+            n_exposed += 1
+        elif rls_on and pol_cnt == 0:
+            status_parts.append("no policies (implicit deny)")
+        elif rls_on:
+            status_parts.append("protected")
+        else:
+            status_parts.append("RLS off (internal?)")
+        print(f"  {name:<32}  {icon} {'ON' if rls_on else 'OFF':<3}  {int(pol_cnt):>5} pol  "
+              f"{int(auth_g):>5}g  {int(anon_g):>5}g  {', '.join(status_parts)}")
+    n_rls = sum(1 for r in rows if r[1])
+    print(f"\n  Summary: {n_rls}/{len(rows)} tables RLS-enabled"
+          + (f"  ⚠ {n_exposed} exposed (RLS off + client grant)" if n_exposed else " ✅"))
+    print(f"\n  Next steps:")
+    print(f"    rlsautotest lint     --schema {a.schema}              # static analysis")
+    print(f"    rlsautotest snapshot --schema {a.schema}              # save policy baseline")
+    print(f"    rlsautotest --schema {a.schema} --html rls-report.html  # full probe report")
+    print()
+
+
+# ── as-user probe ─────────────────────────────────────────────────────────────
+def _as_user_report(conn, cur, schema, table, user_id, app_meta, user_meta):
+    """Quick per-command probe as a specific auth.users identity."""
+    claims = json.dumps({"sub": str(user_id), "role": "authenticated",
+                          "app_metadata": app_meta or {}, "user_metadata": user_meta or {}})
+    CMDS4 = ["SELECT", "INSERT", "UPDATE", "DELETE"]
+    results = {}
+    for cmd in CMDS4:
+        sp = f"_asuser_{cmd.lower()}"
+        try:
+            if cmd == "SELECT":
+                action = f"SELECT count(*) FROM {schema}.{table}"
+            elif cmd == "INSERT":
+                cur.execute(f"SELECT attname, format_type(atttypid,atttypmod) FROM pg_attribute a "
+                            f"JOIN pg_class c ON c.oid=a.attrelid "
+                            f"JOIN pg_namespace n ON n.oid=c.relnamespace "
+                            f"WHERE n.nspname=%s AND c.relname=%s AND a.attnum>0 AND NOT a.attisdropped "
+                            f"LIMIT 1", (schema, table))
+                col_row = cur.fetchone()
+                if not col_row:
+                    results[cmd] = "–"
+                    continue
+                col, typ = col_row
+                action = f"INSERT INTO {schema}.{table}({col}) VALUES (NULL::text::{typ}) RETURNING 1"
+            elif cmd == "UPDATE":
+                cur.execute(f"SELECT attname FROM pg_attribute a "
+                            f"JOIN pg_class c ON c.oid=a.attrelid "
+                            f"JOIN pg_namespace n ON n.oid=c.relnamespace "
+                            f"WHERE n.nspname=%s AND c.relname=%s AND a.attnum>0 AND NOT a.attisdropped "
+                            f"AND format_type(a.atttypid,a.atttypmod) IN ('text','varchar','character varying') "
+                            f"LIMIT 1", (schema, table))
+                col_row = cur.fetchone()
+                if not col_row:
+                    results[cmd] = "–"
+                    continue
+                action = f"UPDATE {schema}.{table} SET {col_row[0]}={col_row[0]} RETURNING 1"
+            else:  # DELETE
+                action = f"DELETE FROM {schema}.{table} RETURNING 1"
+
+            cur.execute("SAVEPOINT " + sp)
+            cur.execute("SELECT set_config('request.jwt.claims', %s, true)", (claims,))
+            cur.execute("SET LOCAL ROLE authenticated")
+            try:
+                cur.execute(action)
+                if cmd == "SELECT":
+                    n = (cur.fetchone() or [0])[0]
+                    results[cmd] = f"✓ ({n} row{'s' if n != 1 else ''})"
+                else:
+                    rows_affected = cur.rowcount
+                    results[cmd] = f"✓ ({rows_affected} row{'s' if rows_affected != 1 else ''})"
+            except Exception as e:
+                sqlstate = getattr(e, "sqlstate", None) or str(e)[:8]
+                results[cmd] = f"✗ blocked ({sqlstate})"
+            finally:
+                cur.execute("ROLLBACK TO SAVEPOINT " + sp)
+                cur.execute("RELEASE SAVEPOINT " + sp)
+                cur.execute("RESET ROLE")
+        except Exception:
+            results[cmd] = "–"
+    return results
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DISPATCH TABLE for subcommands
+# ══════════════════════════════════════════════════════════════════════════════
+_SUBCMDS = {
+    "lint": cmd_lint,
+    "snapshot": cmd_snapshot,
+    "diff": cmd_diff,
+    "users": cmd_users,
+    "coverage": cmd_coverage,
+    "init": cmd_init,
+}
+
+
+def main():
+    import os, pathlib
+    # ── subcommand dispatch (lint / snapshot / diff / users / coverage / init) ──
+    if len(sys.argv) > 1 and sys.argv[1] in _SUBCMDS:
+        return _SUBCMDS[sys.argv[1]]()
+
+    ap = argparse.ArgumentParser(prog="rlsautotest", description="Generate native pgTAP RLS tests for Supabase/Postgres.")
+    ap.add_argument("--schema", required=True)
+    ap.add_argument("--table", help="single table; omit (with --emit) to do every RLS table in the schema")
+    ap.add_argument("--emit", metavar="DIR", help="write the Supabase suite layout under DIR: native pgTAP into DIR/tests/database/rls/, nested debug into DIR/.rlsautotest/debug/")
+    ap.add_argument("--label", help="emit into a named subfolder rls/<label>/ — give each database its own label when generating for several")
+    ap.add_argument("--out", help="single-table: write nested (debug) pgTAP here")
+    ap.add_argument("--flat", help="single-table: write native flat pgTAP here")
+    ap.add_argument("--setup", help="single-table: write 000-setup-tests-hooks.sql here")
+    ap.add_argument("--describe", action="store_true")
+    ap.add_argument("--no-helpers", action="store_true", help="emit fully self-contained tests (no tests.* helpers / no 000-hook)")
+    ap.add_argument("--db-url", help="Postgres connection string (else uses PG* env)")
+    ap.add_argument("--report", action="store_true", help="run the suite and print the grant/deny coverage matrix")
+    ap.add_argument("--report-json", help="write the matrix as JSON to this path")
+    ap.add_argument("--html", help="run the suite and write an HTML report to this path (the single-command routine)")
+    ap.add_argument("--no-fail", action="store_true", help="with --report/--html: do NOT exit non-zero on problems (default: exit 1 if any table is exposed or any check fails — for CI gating)")
+    ap.add_argument("--quiet", action="store_true", help="with --report/--html: only show tables with issues (suppress clean tables)")
+    ap.add_argument("--parallel", type=int, default=1, metavar="N",
+                    help="run N tables in parallel for --report/--html (default: 1 = sequential)")
+    ap.add_argument("--as-user", metavar="EMAIL",
+                    help="after --report: show what a specific auth.users identity can/cannot do")
+    a = ap.parse_args()
+    try: sys.stdout.reconfigure(encoding="utf-8")   # render matrix glyphs on Windows too
+    except Exception: pass
+    helpers = not a.no_helpers
+    report_gate = 0   # exit code for the report/emit paths (1 if CI-gating problems found)
+    with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
+        if a.report or a.html:
+            if a.table:
+                cur.execute("""SELECT c.relrowsecurity, EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid=c.oid)
+                    FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relname=%s""",
+                            (a.schema, a.table))
+                row = cur.fetchone()
+                tabs = [(a.table, bool(row[0]), bool(row[1]))] if row else []
+            else:
+                tabs = all_tables(cur, a.schema)
+            # ── parallel or sequential table probing ──────────────────────────
+            def _probe_one(t_tuple):
+                t, rls_on, has_pol = t_tuple
+                if rls_on and has_pol:
+                    rep = _table_report(cur, conn, a.schema, t, helpers)
+                else:
+                    fg = []
+                    if rls_on and not has_pol:   # RLS on, zero policies = deny-all to client roles (safe if intentional, else unintentionally inaccessible)
+                        fg.append("RLS is ENABLED but NO POLICY is defined -> every client role (anon/authenticated) is denied ALL access. Safe if intentional (deny-all); otherwise the table is unintentionally inaccessible -> add a policy.")
+                    rep = {"table": t, "rls_enabled": rls_on, "policied": [], "cells": {}, "footguns": fg, "coverage": [0, 0]}
+                rep["has_policy"] = has_pol
+                rep["exposed"] = (not rls_on) and _exposed(cur, a.schema, t)
+                return rep
+
+            n_parallel = max(1, getattr(a, "parallel", 1))
+            if n_parallel > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=n_parallel) as _ex:
+                    reps = list(_ex.map(_probe_one, tabs))
+            else:
+                reps = [_probe_one(t) for t in tabs]
+
+            # ── --quiet: suppress tables with no issues ───────────────────────
+            if getattr(a, "quiet", False):
+                def _has_issues(r):
+                    if r.get("exposed"): return True
+                    if r.get("footguns"): return True
+                    if any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _ID_ROWS for c in _CMDS4):
+                        return True
+                    return False
+                reps_display = [r for r in reps if _has_issues(r)]
+                if not reps_display:
+                    print(f"✅  All {len(reps)} table(s) clean — no issues found.")
+                    if not a.no_fail:
+                        sys.exit(0)
+            else:
+                reps_display = reps
+
+            if a.report_json:
+                open(a.report_json, "w", encoding="utf-8").write(json.dumps(reps, indent=2))
+            if a.html:
+                open(a.html, "w", encoding="utf-8").write(render_report_html(reps_display, a.schema))
+                _abs = os.path.abspath(a.html)
+                print(f"HTML report for {len(reps_display)} table(s) written to:\n  {_abs}")
+                try:    # clickable file:// URL in most terminals
+                    print(f"  {pathlib.Path(_abs).as_uri()}")
+                except Exception: pass
+                print(f"\n{_TAGLINE} {_TAGLINE2}")
+            if a.report or not a.html:
+                print(render_report_text(reps_display))
+            # CI gate: fail on any exposed table (RLS off + reachable), any failing/leaking check, or a broken policy
+            exposed_any = [r["table"] for r in reps if r.get("exposed")]
+            holes_any = [r["table"] for r in reps
+                         if any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _ID_ROWS for c in _CMDS4)]
+            broken_any = [r["table"] for r in reps if any("BROKEN POLICY" in f for f in r.get("footguns", []))]
+            if exposed_any or holes_any or broken_any:
+                bits = []
+                if exposed_any: bits.append(f"{len(exposed_any)} exposed table(s): {', '.join(exposed_any)}")
+                if holes_any:   bits.append(f"{len(holes_any)} table(s) with policy holes/failures: {', '.join(holes_any)}")
+                if broken_any:  bits.append(f"{len(broken_any)} broken/unreadable table(s): {', '.join(broken_any)}")
+                print("\nFAIL: " + "; ".join(bits) + ("" if a.no_fail else "  (exit 1 — CI gate; pass --no-fail to suppress)"))
+                report_gate = 0 if a.no_fail else 1
+            # ── --as-user: probe from a real auth.users identity ──────────────
+            if getattr(a, "as_user", None):
+                try:
+                    cur.execute("SELECT id, raw_app_meta_data, raw_user_meta_data FROM auth.users WHERE email=%s",
+                                (a.as_user,))
+                    u_row = cur.fetchone()
+                    if not u_row:
+                        print(f"\n⚠  --as-user: no auth.users row with email={a.as_user!r}. "
+                              f"Run 'rlsautotest users' to see available identities.")
+                    else:
+                        u_id, app_meta_raw, user_meta_raw = u_row
+                        app_meta = json.loads(app_meta_raw) if app_meta_raw else {}
+                        user_meta = json.loads(user_meta_raw) if user_meta_raw else {}
+                        print(f"\n── as-user: {a.as_user} ({u_id}) ─────────────────────────────")
+                        print(f"  {'TABLE':<32}  {'SELECT':>12}  {'INSERT':>12}  {'UPDATE':>12}  {'DELETE':>12}")
+                        print("  " + "─" * 74)
+                        probe_tabs = [a.table] if a.table else [r["table"] for r in reps if r.get("rls_enabled")]
+                        for t in probe_tabs:
+                            res = _as_user_report(conn, cur, a.schema, t, u_id, app_meta, user_meta)
+                            row_cells = [res.get(c, "–") for c in ["SELECT", "INSERT", "UPDATE", "DELETE"]]
+                            print(f"  {t:<32}  {row_cells[0]:>12}  {row_cells[1]:>12}  {row_cells[2]:>12}  {row_cells[3]:>12}")
+                        print()
+                except Exception as e:
+                    if "auth" in str(e).lower() or "does not exist" in str(e).lower():
+                        print(f"\n⚠  --as-user requires auth.users (Supabase): {e}")
+                    else:
+                        raise
+
+            if not a.emit:        # if --emit was also given, fall through and write the test files too
+                sys.exit(report_gate)
+        if a.emit:
+            tdir = os.path.join(a.emit, "tests", "database", "rls", *( [a.label] if a.label else [] ))
+            ddir = os.path.join(a.emit, ".rlsautotest", "debug", *( [a.label] if a.label else [] ))
+            os.makedirs(tdir, exist_ok=True); os.makedirs(ddir, exist_ok=True)
+            if helpers:
+                hookpath = os.path.join(tdir, "000-setup-tests-hooks.sql")
+                if not os.path.exists(hookpath):   # non-destructive: never clobber an existing hook
+                    open(hookpath, "w", encoding="utf-8").write(setup_hook_sql(_basejump_present(cur)))
+            guard = emit_rls_guard(cur, a.schema)   # schema-wide "RLS must be enabled" guard
+            if guard:
+                open(os.path.join(tdir, "010-rls-enabled.test.sql"), "w", encoding="utf-8").write(guard)
+            tables = [a.table] if a.table else rls_tables(cur, a.schema)
+            for i, t in enumerate(sorted(tables), start=1):
+                ctx = _load_ctx(cur, a.schema, t)
+                flat, nested = _emit_both(a.schema, t, ctx, helpers, conn=conn)
+                num = f"{100 + i:03d}"
+                open(os.path.join(tdir, f"{num}-rls-{t}.test.sql"), "w", encoding="utf-8").write(flat)
+                open(os.path.join(ddir, f"{t}.debug.sql"), "w", encoding="utf-8").write(nested)
+                print(f"  {a.schema}.{t}: coverage={ctx['cov']}/{ctx['tot']} -> {num}-rls-{t}.test.sql")
+            print(f"emitted {len(tables)} test file(s) into:\n  {os.path.abspath(tdir)}")
+            if guard:
+                print("  + 010-rls-enabled.test.sql (guard: fails if a reachable table has RLS off)")
+            print(f"run them with:\n  pg_prove -d \"<your copy>\" {os.path.join(tdir, '*.sql')}")
+            print(f"\n{_TAGLINE} {_TAGLINE2}")
+            sys.exit(report_gate)
+        if not a.table:
+            ap.error("--table is required unless --emit is used")
+        ctx = _load_ctx(cur, a.schema, a.table)
+        if a.describe:
+            print(f"\n{a.schema}.{a.table}  commands={ctx['cmds']}  unique={sorted(ctx['unique_cols'])}")
+            for cmd in ctx["cmds"]:
+                pc = ctx["per"][cmd]
+                d = [("GRANT" if not c["rowlinked"] else "+".join(c["kinds"])) + ("" if c["handled"] else f"(NT:{c['reason']})") for c in pc["classes"]]
+                print(f"  {cmd}: open={pc['open']} classes=[{', '.join(d) or 'none'}]")
+            for x in ctx["notes"]: print(f"  NOTE: {x}")
+            print(f"  coverage: {ctx['cov']}/{ctx['tot']}")
+            return
+        flat, nested = _emit_both(a.schema, a.table, ctx, helpers, conn=conn)
+        hook = setup_hook_sql(_basejump_present(cur)) if (a.setup and helpers) else None
+    if a.out: open(a.out, "w", encoding="utf-8").write(nested)
+    if a.flat: open(a.flat, "w", encoding="utf-8").write(flat)
+    if a.setup and hook: open(a.setup, "w", encoding="utf-8").write(hook)
+    print(f"cmds={ctx['cmds']} coverage={ctx['cov']}/{ctx['tot']} helpers={helpers} -> out={a.out} flat={a.flat} setup={a.setup if (a.setup and hook) else None}")
+
+
+if __name__ == "__main__":
+    main()

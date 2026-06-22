@@ -1,0 +1,12 @@
+rlsautotest
+Copyright 2026 Munaf Ibrahim Khatri
+
+This product includes software developed by Munaf Ibrahim Khatri (the UnitAutogen project).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file.
+
+This tool generates tests that run on pgTAP (https://pgtap.org) and is
+compatible with the basejump Supabase test helpers
+(https://github.com/usebasejump/supabase-test-helpers). It parses SQL using
+pglast / libpg_query (https://github.com/lelit/pglast). These are independent
+projects under their own licenses and are not distributed as part of this work.

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlsautotest"
+version = "0.1.0"
+description = "Deterministic pgTAP test generation for Postgres/Supabase Row-Level Security (RLS) policies."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [{ name = "Munaf Ibrahim Khatri" }]
+keywords = ["postgres", "postgresql", "supabase", "rls", "row-level-security", "pgtap", "testing", "security"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Database",
+]
+dependencies = [
+    "psycopg[binary]>=3.1",
+    "pglast>=7",
+]
+
+[project.urls]
+Homepage = "https://github.com/unitautogen/rlsautotest"
+Issues = "https://github.com/unitautogen/rlsautotest/issues"
+
+[project.scripts]
+rlsautotest = "rlsautotest.cli:main"
+
+[tool.setuptools]
+packages = ["rlsautotest"]

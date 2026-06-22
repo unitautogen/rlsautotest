@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+out/
+.rlsautotest/
+*.json
+!examples/**/*.json
+# internal project brain / handoff — NEVER publish (contains strategy, competitor notes, launch plan)
+CLAUDE.md
+# scratch / generated report + emitted-suite artifacts
+*.html
+.pytest_cache/
+rls-tests/
+rls_suite/
+rls_helper/

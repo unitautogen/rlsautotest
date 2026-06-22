@@ -1,0 +1,51 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e . pytest
+      - run: pytest -q
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Postgres + pgTAP
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql postgresql-contrib
+          PGVER=$(pg_lsclusters -h | awk '{print $1; exit}')
+          sudo apt-get install -y "postgresql-${PGVER}-pgtap" || sudo apt-get install -y pgtap || true
+          sudo pg_ctlcluster "${PGVER}" main start || sudo service postgresql start
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb app
+          sudo -u postgres psql -d app -c "CREATE EXTENSION IF NOT EXISTS pgtap;"
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e .
+      - name: Generate and run the RLS suite
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/app
+        run: |
+          # load the example schemas that are expected to be green (owner-scoped + multi-tenant).
+          # exotic.sql is intentionally NOT loaded here: it contains a deliberately broken policy to
+          # demonstrate detection, so it is meant to fail the gate, not pass it.
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/schema.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/tenancy.sql
+          rc=0
+          for schema in public tenancy; do
+            echo "===== schema: $schema ====="
+            rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --emit "out_$schema"
+            for f in "out_$schema"/tests/database/rls/*.sql; do
+              echo "== $f =="
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=0 -f "$f" | tee /tmp/tap.txt
+              grep -q '^ *not ok' /tmp/tap.txt && rc=1 || true
+            done
+            rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --report --no-fail
+          done
+          exit $rc
