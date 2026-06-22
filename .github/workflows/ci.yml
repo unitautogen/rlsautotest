@@ -37,8 +37,9 @@ jobs:
           # demonstrate detection, so it is meant to fail the gate, not pass it.
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/schema.sql
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/tenancy.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/rbac.sql
           rc=0
-          for schema in public tenancy; do
+          for schema in public tenancy rbac; do
             echo "===== schema: $schema ====="
             rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --emit "out_$schema"
             for f in "out_$schema"/tests/database/rls/*.sql; do

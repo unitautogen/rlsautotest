@@ -725,6 +725,50 @@ def _qlit(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
+def _mock_valid_row(schema, table, fkmap, colsmap, enums):
+    """Build (fk_parent_insert_stmts, {col: literal}) for ONE valid row of schema.table.
+    Used to seed the precondition for opaque-function-gated write tests (the mock path): when a
+    table's only policies delegate to an opaque boolean fn, there's no 'handled' class and thus
+    no base seed, so the engine has no row to INSERT/UPDATE/DELETE. This synthesizes one — FK
+    parents seeded recursively (ON CONFLICT DO NOTHING), required (NOT NULL, no-default,
+    non-identity) columns filled with type-valid literals."""
+    q = f"{schema}.{table}"
+
+    def _fill(t):
+        base = t.split("(")[0].strip()
+        return f"'{enums[base][0]}'::{base}" if (base in enums and enums[base]) else _lit(t)
+
+    def _pick(t):
+        base = t.split("(")[0].strip(); tl = t.lower()
+        if base in enums and enums[base]: return f"'{enums[base][0]}'::{base}"
+        if "uuid" in tl: return "'000000c1-0000-0000-0000-0000000000c1'"
+        if any(k in tl for k in ("int", "numeric", "real", "double", "serial", "decimal")): return "1"
+        if "bool" in tl: return "false"
+        return "'x'"
+
+    stmts, seen = [], set()
+
+    def ensure(tbl, col, val):
+        k = (tbl, col, val)
+        if k in seen: return
+        seen.add(k)
+        fks = fkmap.get(tbl, {}); vals = {col: val}
+        for (n, t, nn, hd) in colsmap.get(tbl, []):
+            if n == col or not nn or hd: continue
+            vals[n] = _pick(t) if n in fks else _fill(t)
+        for n, v in vals.items():
+            if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
+        stmts.append(f"INSERT INTO {tbl}({', '.join(vals)}) VALUES ({', '.join(vals.values())}) ON CONFLICT DO NOTHING")
+
+    fks = fkmap.get(q, {}); row = {}
+    for (n, t, nn, hd) in colsmap.get(q, []):
+        if not nn or hd: continue
+        row[n] = _pick(t) if n in fks else _fill(t)
+    for n, v in row.items():
+        if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
+    return stmts, row
+
+
 def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, helpers=True, grants_map=None, conn=None):
     """Native Supabase FLAT pgTAP form: begin; plan(N); inline AAA; finish(); rollback.
 
@@ -884,10 +928,13 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
             out.append(("anon", "", "anon", None))
             return out
         udfs = _policy_bool_udfs(conn, schema, table)   # opaque boolean fns the policies delegate to (mock fallback)
-        def mock_one(val, assertion, write):
+        def mock_one(val, assertion, write, preseed=None):
             """Replace every policy UDF with a constant `val` (FakeFunction), act, assert, restore, re-seed."""
             n[0] += 1
             body.extend(f"CREATE OR REPLACE FUNCTION {u['q']}({u['args']}) RETURNS boolean LANGUAGE sql AS $$ SELECT {val} $$;" for u in udfs)
+            if preseed:                                   # seed the precondition as the privileged role (RLS bypassed)
+                body.append("RESET ROLE;")
+                body.extend((s.rstrip().rstrip(';') + ";") for s in preseed)
             body.append(f"SELECT set_config('request.jwt.claims', {_qlit(NB)}, true);")   # semicolon-terminated (script context)
             body.append("SET LOCAL ROLE authenticated;")
             body.append(assertion)
@@ -905,16 +952,32 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                 mock_one("true",  f"SELECT is( (SELECT count(*) FROM {q})::int, {total_rows}, {desc('SELECT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", False)
                 mock_one("false", f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", False)
                 return
+            # When every policy on the table delegates to an opaque fn there's no base seed, so build a
+            # valid row (+ FK parents) on the fly so the write actually has something to act on.
+            parents, prow = ([], None)
+            if not nobody_ins:
+                parents, prow = _mock_valid_row(schema, table, fkmap, colsmap, enums)
             if cmd == "INSERT":
-                if not nobody_ins: return
-                action = f"INSERT INTO {q}({', '.join(nobody_ins)}) VALUES ({', '.join(nobody_ins.values())})"
-            elif cmd == "UPDATE":
+                icols = nobody_ins or prow
+                if icols is None: return
+                ins = (f"INSERT INTO {q}({', '.join(icols)}) VALUES ({', '.join(icols.values())})"
+                       if icols else f"INSERT INTO {q} DEFAULT VALUES")
+                # mock TRUE -> WITH CHECK passes -> insert lives; mock FALSE -> WITH CHECK fails -> 42501
+                mock_one("true",  f"SELECT lives_ok( $$ {ins} $$, {desc('INSERT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True, preseed=parents)
+                mock_one("false", f"SELECT throws_ok( $$ {ins} $$, '42501', NULL, {desc('INSERT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True, preseed=parents)
+                return
+            if cmd == "UPDATE":
                 if not upd_col: return
                 action = f"UPDATE {q} SET {upd_col[0]}={fill(upd_col[1])}"
             else:
                 action = f"DELETE FROM {q}"
-            mock_one("true",  f"SELECT isnt_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True)
-            mock_one("false", f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True)
+            # UPDATE/DELETE need a row present to affect; seed one (parents + row) when there's no base seed
+            preseed = []
+            if not nobody_ins and prow is not None:
+                preseed = parents + [(f"INSERT INTO {q}({', '.join(prow)}) VALUES ({', '.join(prow.values())})"
+                                      if prow else f"INSERT INTO {q} DEFAULT VALUES")]
+            mock_one("true",  f"SELECT isnt_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True, preseed=preseed)
+            mock_one("false", f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True, preseed=preseed)
         coltypes = {nn0: tt0 for (nn0, tt0, c0, h0) in cols}
         def _spair(typ):
             t = typ.lower()
