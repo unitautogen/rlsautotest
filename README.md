@@ -4,8 +4,6 @@
 
 > **Status: beta (v0.x).** Actively developed and the CLI may still change - but it's built to **never emit a false-passing test**: anything it can't verify soundly is marked, not faked.
 
-![rlsautotest demo - one command finds an unprotected table](docs/demo-path-a.gif)
-
 Point it at your database. It reads your RLS policies from the catalog and **auto-generates both the tests and the seed data** — a native [pgTAP](https://pgtap.org) suite that *proves*, per table, per command, per identity, who can `SELECT` / `INSERT` / `UPDATE` / `DELETE` which rows, plus a per-identity access-matrix report and a CI gate that fails the build on any leak or unprotected table.
 
 ```bash
@@ -14,6 +12,21 @@ rlsautotest --db-url "$DATABASE_URL" --schema public --emit supabase/
 supabase test db                       # the generated suite runs natively
 rlsautotest --db-url "$DATABASE_URL" --schema public --report
 ```
+
+## Demo
+
+**Path A - quick check (no files saved):** one command points at your database and reports who can touch what; an unprotected table is caught immediately.
+
+![Path A - quick RLS check](docs/demo-path-a.gif)
+
+**Path B - generate a suite to commit + run in CI:** generate native pgTAP and run it with `pg_prove` (video).
+
+<!-- PASTE THE PATH B VIDEO HERE:
+     1. Open this README on github.com and click the pencil (Edit).
+     2. Click on the empty line just below this comment.
+     3. Drag "Path B.mp4" into the editor; wait for it to finish uploading.
+     4. GitHub inserts a https://github.com/user-attachments/assets/... line - leave it as is.
+     5. Delete this comment block (optional), then Commit changes. -->
 
 ## What it does
 
