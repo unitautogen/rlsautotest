@@ -4,6 +4,8 @@
 
 Requires **Python 3.10 or newer** (`python --version`).
 
+> ⚠️ **Run rlsautotest against a disposable copy of your database — never production.** It probes each policy by seeding rows and running real `SELECT`/`INSERT`/`UPDATE`/`DELETE` (every probe is rolled back, nothing is committed, but the statements do run — table locks, triggers, sequences fire). This applies to `--emit`, `--report`, and `--html` alike; only `--describe` and the static checks just read the catalog.
+
 ## Install
 
 ```bash
@@ -17,7 +19,7 @@ pip install rlsautotest
 
 Then `rlsautotest --help` should work.
 
-You'll also need a **connection string** for a database that has your schema and policies — your local Supabase, a branch, or CI (not production for running tests; see [How it works](#how-it-works)). It looks like `postgresql://USER:PASSWORD@HOST:5432/DBNAME`. [Where to find it →](#finding-your-connection-string)
+You'll also need a **connection string** for a database that has your schema and policies — your local Supabase, a branch, or CI (a disposable copy — **never production**; see [How it works](#how-it-works)). It looks like `postgresql://USER:PASSWORD@HOST:5432/DBNAME`. [Where to find it →](#finding-your-connection-string)
 
 ---
 
@@ -49,7 +51,7 @@ That's all of Path A. If a quick check was all you wanted, you're done.
 For RLS tests that live in your repo and run in CI.
 
 ```bash
-# B1 — generate the files (read-only; safe on any DB)
+# B1 — generate the files (probes your policies: seeds + runs queries, rolled back — use a copy)
 rlsautotest --db-url "<your copy>" --schema public --emit rls-tests
 #   -> rls-tests/tests/database/rls/000-setup-tests-hooks.sql
 #   -> rls-tests/tests/database/rls/101-rls-<table>.test.sql
@@ -88,8 +90,8 @@ A failing RLS assertion - or the `010-rls-enabled` guard catching a table with R
 
 rlsautotest **reads your RLS policies** and tests *those exact policies on those exact tables*. Two consequences, and they matter:
 
-1. **Generating files** (`--emit`) only *reads* the catalog. Read-only — safe to point at any database, including production.
-2. **Running the tests** — Path A (`--html`/`--report`) *and* running an emitted suite — *seeds data* to probe each policy (rolled back after every test). Point these at a **throwaway database that holds a copy of the one you want to test** — same tables, same policies — **never production**.
+1. **Every command that connects** — `--emit`, `--report`, and `--html` — **probes your policies by executing statements against the database in `--db-url`**: it seeds rows and runs real `SELECT`/`INSERT`/`UPDATE`/`DELETE`. Each probe is wrapped in a transaction and **rolled back** (nothing is committed), but the statements **do** run — table locks, triggers, sequences fire. (Only `--describe` and the static `lint`/`snapshot`/`diff`/`coverage` checks just read the catalog.)
+2. So point `--db-url` at a **throwaway database that holds a copy of the one you want to test** — same tables, same policies — **never production**. Running an emitted suite later (`pg_prove`/`supabase test db`) seeds data the same way, so it also belongs on a copy.
 
 That copy must **match what you ship** — same tables, same RLS policies — which in practice means a database built from the same migrations:
 

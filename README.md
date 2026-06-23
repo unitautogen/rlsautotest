@@ -16,6 +16,8 @@ rlsautotest --db-url "$DATABASE_URL" --schema public --html rls-report.html
 rlsautotest --db-url "$DATABASE_URL" --schema public --emit supabase/
 ```
 
+> ⚠️ **Point `--db-url` at a disposable copy of your database, never production.** rlsautotest probes each policy by seeding rows and running real `SELECT`/`INSERT`/`UPDATE`/`DELETE` — every probe is wrapped in a transaction and rolled back (nothing is committed), but the statements do run (table locks, triggers, sequences fire). `--emit`, `--report`, and `--html` all connect and probe; only `--describe` and the static checks (`lint`/`snapshot`/`diff`) just read the catalog.
+
 _Running the suite - on a local Supabase (`supabase test db`), `pg_prove`, or in CI - is covered in [INSTALL.md](INSTALL.md)._
 
 ## Demo
@@ -149,7 +151,7 @@ The build goes red the moment a policy leaks or a reachable table is missing RLS
 
 ## What it's tested on
 
-The `examples/` folder is the runnable test corpus, covering the common and the hard RLS patterns: owner (`auth.uid()`), tenant/JWT-claim, membership (`EXISTS`), array claims (`= ANY`), RBAC functions, recursive policies, session-GUC, and permissive + `AS RESTRICTIVE` composition. On every commit, CI loads the owner-scoped and the multi-tenant example schemas, generates the suite, and runs it — so the core validation is reproducible rather than a claim. (The corpus also includes a deliberately broken, self-referential policy to demonstrate that the tool *catches* problems.) It's been exercised against real-world Supabase schemas too, to harden the generator.
+The `examples/` folder is the runnable test corpus, covering the common and the hard RLS patterns: owner (`auth.uid()`), tenant/JWT-claim, membership (`EXISTS`), array claims (`= ANY`), RBAC functions, recursive policies, session-GUC, permissive + `AS RESTRICTIVE` composition, and role-gated status state machines (multi-policy `UPDATE`). On every commit, CI loads the owner-scoped and the multi-tenant example schemas, generates the suite, and runs it — so the core validation is reproducible rather than a claim. The corpus also includes deliberately broken cases — a self-referential policy, and a role-gated state machine with a cross-policy `WITH CHECK` leak (a role can write a status its own policy forbids) — that the tool is required to *catch*. It's been exercised against real-world Supabase schemas too, to harden the generator.
 
 ## Honest limitations
 
@@ -159,7 +161,7 @@ The `examples/` folder is the runnable test corpus, covering the common and the 
 
 - Python 3.10+
 - A Postgres database. **pgTAP is handled for you** — rlsautotest uses your database's pgTAP if present (Supabase ships it) and otherwise loads a small built-in copy, so there's nothing to install on the server.
-- For generation: read access to the catalog. For running: a throwaway/local DB (the suite seeds data) — never production.
+- A throwaway/local database holding a copy of your schema + policies. Every command that connects (`--emit`, `--report`, `--html`) probes by seeding rows and running real `SELECT`/`INSERT`/`UPDATE`/`DELETE` — each rolled back, nothing committed, but the statements do run. Point it at a disposable copy, **never production**. (`--describe` and the static `lint`/`snapshot`/`diff` checks only read the catalog.)
 
 ## Part of the UnitAutogen family
 

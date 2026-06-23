@@ -208,12 +208,81 @@ def _folder_owner(ind, uid):
     return None
 
 
+def _array_consts(node):
+    """ARRAY[const, const, ...] (possibly ::type-cast, or the whole array cast to type[]) -> [values] or None."""
+    arr = _unwrap(node)
+    if _t(arr) != "A_ArrayExpr":
+        return None
+    vals = []
+    for el in _v(arr).get("elements", []):
+        c = _const(el)
+        if c is None:
+            return None
+        vals.append(c)
+    return vals or None
+
+
+def _list_consts(node):
+    """IN-list (a, b, c) -> [values] or None."""
+    if _t(node) != "List":
+        return None
+    vals = []
+    for el in _v(node).get("items", []):
+        c = _const(el)
+        if c is None:
+            return None
+        vals.append(c)
+    return vals or None
+
+
+def _scalar_lookup(side, other):
+    """(SELECT col FROM t WHERE key = auth.uid()) = const  ->  seed t(key:=uid, col:=const).
+    The classic Supabase 'read my role/flag from a profile table' shape. Must inspect the RAW node
+    (before _unwrap, which would collapse the EXPR_SUBLINK to its projected column). Returns atom or None."""
+    if _t(side) != "SubLink":
+        return None
+    sv = _v(side)
+    if sv.get("subLinkType") != "EXPR_SUBLINK":
+        return None
+    val = _const(other)
+    if val is None:
+        return None
+    ss = (sv.get("subselect") or {}).get("SelectStmt", {})
+    frm = ss.get("fromClause", [])
+    if not frm or "RangeVar" not in frm[0]:
+        return None
+    rv = frm[0]["RangeVar"]
+    ltable = (rv.get("schemaname") + "." if rv.get("schemaname") else "") + rv.get("relname", "")
+    tl = ss.get("targetList", [])
+    lcol = _colname(tl[0].get("ResTarget", {}).get("val")) if tl else None
+    lkey = None
+    for (l, r) in _eq_pairs(ss.get("whereClause")):
+        if _is_func(l, "auth.uid") or _is_func(r, "auth.uid"):
+            _, lkey = _colqual(r if _is_func(l, "auth.uid") else l)
+    if ltable and lcol and lkey:
+        return {"kind": "scalar_lookup", "ltable": ltable, "lcol": lcol, "lkey": lkey, "value": val}
+    return None
+
+
 def _classify_aexpr(a, cur):
     kind = a.get("kind"); op = _names(a.get("name")); L = a.get("lexpr"); R = a.get("rexpr")
     if kind == "AEXPR_OP_ANY" and op == "=":
         if _is_func(L, "auth.uid") and _colname(R): return {"kind": "array_col", "col": _colname(R)}
         if _is_func(R, "auth.uid") and _colname(L): return {"kind": "array_col", "col": _colname(L)}
+        col = _colname(L) or _colname(R)
+        vals = _array_consts(R) if _colname(L) else _array_consts(L)
+        if col and vals: return {"kind": "col_in_set", "col": col, "values": vals}   # col = ANY(array[consts])  ==  col IN (...)
         return {"kind": "unknown", "text": "= ANY(...)"}
+    if kind == "AEXPR_OP_ALL" and op in ("<>", "!="):
+        col = _colname(L) or _colname(R)
+        vals = _array_consts(R) if _colname(L) else _array_consts(L)
+        if col and vals: return {"kind": "col_not_in_set", "col": col, "values": vals}   # col <> ALL(array[consts])  ==  col NOT IN (...)
+        return {"kind": "unknown", "text": "<> ALL(...)"}
+    if kind == "AEXPR_IN":
+        col = _colname(L); vals = _list_consts(R)
+        if col and vals:
+            return {"kind": "col_in_set" if op == "=" else "col_not_in_set", "col": col, "values": vals}
+        return {"kind": "unknown", "text": "IN(...)"}
     if kind != "AEXPR_OP": return {"kind": "unknown", "text": kind or "expr"}
     if op in (">", "<", ">=", "<="):
         if _is_func(R, "now") and _colname(L): return {"kind": "temporal", "col": _colname(L), "op": op}
@@ -237,6 +306,8 @@ def _classify_aexpr(a, cur):
         if _colname(other): return {"kind": "tenant", "col": _colname(other), "keys": keys}
         if _const(other) is not None: return {"kind": "claim_const", "keys": keys, "value": _const(other)}
         return {"kind": "unknown", "text": "jwt eq"}
+    sl = _scalar_lookup(L, R) or _scalar_lookup(R, L)   # (SELECT col FROM t WHERE key=auth.uid()) = const
+    if sl: return sl
     if _colname(L) and _const(R) is not None: return {"kind": "row_const", "col": _colname(L), "value": _const(R)}
     if _colname(R) and _const(L) is not None: return {"kind": "row_const", "col": _colname(R), "value": _const(L)}
     return {"kind": "unknown", "text": "eq"}
@@ -266,6 +337,20 @@ def classify_node(n, cur=None):
     if t == "A_Expr":
         return _classify_aexpr(_v(n), cur)
     return {"kind": "unknown", "text": t or "node"}
+
+
+def _check_value_set(check_sql):
+    """Parse a WITH CHECK predicate of the simple value-constraint shape -> (col, frozenset(values)) or None.
+    Covers `col = const` and `col = ANY(array[consts])` / `col IN (...)` — the column-value space a policy permits."""
+    w = _where(check_sql or "")
+    if w is None:
+        return None
+    at = classify_node(w, None)
+    if at.get("kind") == "row_const":
+        return (at["col"], frozenset([at["value"]]))
+    if at.get("kind") == "col_in_set":
+        return (at["col"], frozenset(at["values"]))
+    return None
 
 
 def _dnf_ast(n):
@@ -395,7 +480,7 @@ def _set_claim(c, keys, v):
     d[keys[-1]] = v
 
 
-def build_class(min_term, idx):
+def build_class(min_term, idx, col_dom=None):
     claims = {"sub": CV[idx % len(CV)], "role": "authenticated"}
     rowseed, aux, scalar_link, fk_val, handled, reason, has_temporal = {}, [], None, None, True, None, False
     tenant_keys = []   # JWT claim path(s) this class scopes on (for building a rival-tenant negative control)
@@ -429,6 +514,19 @@ def build_class(min_term, idx):
             uid = CV[idx % len(CV)]; claims["sub"] = uid; rowseed[at["col"]] = f"'{uid}/x'"; scalar_link = at["col"]
         elif k == "auth_role":
             pass
+        elif k == "col_in_set":
+            rowseed[at["col"]] = f"'{at['values'][0]}'"   # seed a value that satisfies the membership; no scalar_link (value constraint, not identity link)
+        elif k == "col_not_in_set":
+            dom = (col_dom or {}).get(at["col"])
+            outside = next((x for x in (dom or []) if x not in at["values"]), None)
+            if outside is None:
+                handled, reason = False, f"unhandled atom: no value outside {at['values']} for {at['col']}"
+            else:
+                rowseed[at["col"]] = f"'{outside}'"
+        elif k == "scalar_lookup":
+            uid = f"a5000000-0000-4000-8000-{idx:012x}"; claims["sub"] = uid   # unique per class (avoid PK collisions in the lookup table when >len(MV) classes)
+            aux.append({"table": at["ltable"], "cols": {at["lkey"]: uid, at["lcol"]: at["value"]},
+                        "kind": "scalar_lookup", "role_value": at["value"]})
         else:
             handled, reason = False, f"unhandled atom: {at.get('text')}"
     return {"idx": idx, "claims": claims, "rowseed": rowseed, "aux": aux, "scalar_link": scalar_link,
@@ -451,20 +549,21 @@ def _cmd_dnf(pols, cmd, clause, cur):
             return p[5] if p[5] is not None else p[4]
         return p[clause]
 
-    dnf, seen, is_open = [], set(), False
+    dnf, srcs, seen, is_open = [], [], set(), False
     for p in perm:
         pe = eff(p)
+        chk = p[5] if p[5] is not None else p[4]   # the policy's own WITH CHECK (USING fallback) — carried for the transition audit
         w = _where(pe) if pe else None
         if w is None:
-            if pe: dnf.append([{"kind": "unknown", "text": "parse-fail"}])
+            if pe: dnf.append([{"kind": "unknown", "text": "parse-fail"}]); srcs.append({"policy": p[0], "check": chk})
             continue
         for mt in _dnf_ast(w):
             atoms = [a for a in (classify_node(n, cur) for n in mt) if a.get("kind") != "_true_"]
             for a in atoms:
                 if a.get("kind") == "auth_role" and a.get("value") == "authenticated": is_open = True
             if not atoms: is_open = True
-            key = tuple(sorted(f"{a.get('kind')}|{a.get('col')}|{a.get('value')}|{a.get('mtable')}" for a in atoms))
-            if key not in seen: seen.add(key); dnf.append(atoms)
+            key = tuple(sorted(f"{a.get('kind')}|{a.get('col')}|{a.get('value')}|{a.get('mtable')}|{','.join(map(str, a.get('values', [])))}" for a in atoms))
+            if key not in seen: seen.add(key); dnf.append(atoms); srcs.append({"policy": p[0], "check": chk})
     rest = []
     for p in restr:
         pe = eff(p)
@@ -472,20 +571,31 @@ def _cmd_dnf(pols, cmd, clause, cur):
         if w:
             for mt in _dnf_ast(w): rest += [classify_node(n, cur) for n in mt]
     dnf = [mt + rest for mt in dnf]
-    return dnf, bool(perm), is_open
+    return dnf, bool(perm), is_open, srcs
 
 
 def analyze(cur, schema, table):
     cur.execute("SELECT policyname, permissive, cmd, roles, qual, with_check FROM pg_policies WHERE schemaname=%s AND tablename=%s", (schema, table))
     pols = cur.fetchall()
+    cur.execute("""SELECT a.attname, array_agg(e.enumlabel ORDER BY e.enumsortorder)
+        FROM pg_attribute a JOIN pg_type t ON t.oid=a.atttypid JOIN pg_enum e ON e.enumtypid=t.oid
+        JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname=%s AND c.relname=%s AND a.attnum>0 AND NOT a.attisdropped GROUP BY a.attname""", (schema, table))
+    col_dom = {r[0]: r[1] for r in cur.fetchall()}   # column -> enum label domain (for col_not_in_set seeding)
     cmds = set()
     for p in pols:
         cmds |= ({"SELECT", "INSERT", "UPDATE", "DELETE"} if p[2].upper() == "ALL" else {p[2].upper()})
     per = {}
     for cmd in cmds:
         clause = 5 if cmd == "INSERT" else 4
-        dnf, has_pol, is_open = _cmd_dnf(pols, cmd, clause, cur)
-        per[cmd] = {"classes": [build_class(t, i) for i, t in enumerate(dnf)], "open": is_open, "has_pol": has_pol}
+        dnf, has_pol, is_open, srcs = _cmd_dnf(pols, cmd, clause, cur)
+        classes = []
+        for i, t in enumerate(dnf):
+            cc = build_class(t, i, col_dom)
+            cc["src_policy"] = srcs[i].get("policy") if i < len(srcs) else None
+            cc["src_check"] = srcs[i].get("check") if i < len(srcs) else None
+            classes.append(cc)
+        per[cmd] = {"classes": classes, "open": is_open, "has_pol": has_pol}
         if cmd == "SELECT":
             per[cmd]["anon_open"] = any(("public" in (p[3] or []) or "anon" in (p[3] or [])) and _is_true_clause(p[4])
                                         for p in pols if p[2].upper() in ("SELECT", "ALL") and p[1] == "PERMISSIVE")
@@ -542,6 +652,7 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
     def _distinct(t, salt):
         tl = t.lower(); base = t.split("(")[0].strip()
         if base in enums: return f"'{enums[base][0]}'::{base}"
+        if "uuid" in tl: return f"'{salt:08x}-0000-0000-0000-000000000000'"   # distinct per salt (no-default uuid PKs need unique values)
         if "char" in tl or "text" in tl: return f"'usr{salt}'"
         if any(k in tl for k in ("int", "serial", "numeric", "real", "double")): return str(1000 + salt)
         return fill(t)
@@ -909,8 +1020,9 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
         arrange_stmts = [s for s in _split_statements(f"DELETE FROM {q};\n{seed}") if s.strip()]
         _fk_cols = set(fkmap.get(f"{schema}.{table}", {}))   # avoid FK cols: SET fk=fk triggers an RI check (parent access), not the table's own UPDATE perm
         _rowseed = {x for cc in rowlinked for x in cc['rowseed']}
-        upd_col = (next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0 and nn0 not in _fk_cols), None)
-                   or next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0), None))
+        upd_col = (next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0 and nn0 not in _fk_cols and nn0 not in unique_cols), None)
+                   or next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0 and nn0 not in unique_cols), None)
+                   or next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0 and nn0 not in _fk_cols), None))
         def pident(cjson, role):
             if role == "anon" or cjson == "":
                 return ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"]
@@ -1121,6 +1233,25 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                     mut_test(cjson, role, f"SELECT isnt_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affected ' + str(o[1]) + ' row(s)')} );")
                 else:
                     mut_test(cjson, role, f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affects 0 rows')} );")
+                # TRANSITION AUDIT (cross-policy WITH CHECK leak): an authorized identity that CAN update
+                # should only be able to write the column-values ITS OWN policy's WITH CHECK permits. Postgres
+                # OR-combines every permissive policy's WITH CHECK independently of which USING matched, so an
+                # identity can often write a value only a DIFFERENT policy intended. Enumerate the (enum) domain,
+                # observe which forbidden values are actually accepted, and bake a failing assertion for each.
+                if cmd == "UPDATE" and c is not None and c.get("src_check"):   # run the value-space audit regardless of the neutral-column probe (which can fail when the combined WITH CHECK excludes the seeded status)
+                    _vc = _check_value_set(c["src_check"])
+                    if _vc:
+                        _vcol, _allowed = _vc
+                        _ctype = coltypes.get(_vcol)
+                        _dom = (enums.get(_ctype) or enums.get((_ctype or "").split(".")[-1])) if _ctype else None
+                        if _dom and _vcol != (upd_col[0] if upd_col else None):
+                            for _V in _dom:
+                                if _V in _allowed:
+                                    continue
+                                _tact = f"UPDATE {q} SET {_vcol}='{_V}'::{_ctype}"
+                                _ov = _probe(conn, arrange_stmts, pident(cjson, role), "write", _tact)
+                                if _ov[0] == "rows" and _ov[1] >= 1:   # accepted a value its own policy forbids -> leak
+                                    mut_test(cjson, role, f"SELECT throws_ok( $$ {_tact} $$, '42501', NULL, {desc('UPDATE: ' + who + ' can set ' + _vcol + '=' + _V + ', but policy [' + str(c.get('src_policy')) + '] WITH CHECK permits only {' + ', '.join(sorted(_allowed)) + '} -- cross-policy WITH CHECK leak [transition-leak]')} );")
 
     body_text = "\n".join(body)
     if helpers:
@@ -1441,8 +1572,10 @@ def _load_ctx(cur, schema, table):
     for cmd in cmds:
         for c in per[cmd]["classes"]:
             for au in c["aux"]: load(au["table"])
-    cur.execute("SELECT t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_type t JOIN pg_enum e ON e.enumtypid=t.oid GROUP BY 1")
-    enums = {r[0]: r[1] for r in cur.fetchall()}
+    cur.execute("SELECT n.nspname, t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_type t JOIN pg_enum e ON e.enumtypid=t.oid JOIN pg_namespace n ON n.oid=t.typnamespace GROUP BY 1, 2")
+    enums = {}
+    for nsp, tn, labels in cur.fetchall():
+        enums[tn] = labels; enums[f"{nsp}.{tn}"] = labels   # key by both bare and schema-qualified name (format_type may qualify)
     cur.execute("""SELECT a.attname FROM pg_index i JOIN pg_class c ON c.oid=i.indrelid JOIN pg_namespace n ON n.oid=c.relnamespace
         JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=ANY(i.indkey)
         WHERE n.nspname=%s AND c.relname=%s AND i.indisunique AND array_length(i.indkey,1)=1""", (schema, table))
@@ -1527,10 +1660,15 @@ def _table_report(cur, conn, schema, table, helpers):
         conn.rollback()
     cells = {}
     idgrid = {}   # cmd -> { identity -> {"exp": <should-be-able>, "pass": <test passed>} }
+    leak_msgs = []   # cross-policy WITH CHECK transition leaks (baked as failing throws_ok lines)
     for ln in taplines:
-        m = re.match(r"(ok|not ok)\b.*?-\s*(.*)$", ln.strip())
+        first = ln.strip().split("\n", 1)[0]   # a FAILING pgTAP test returns 'not ok' + '#'-diagnostic lines; parse the 'not ok' line only
+        m = re.match(r"(ok|not ok)\b.*?-\s*(.*)$", first)
         if not m: continue
         passed = m.group(1) == "ok"; label = m.group(2)
+        if "[transition-leak]" in label:                       # value-space leak; tracked separately, not a per-command cell
+            if not passed: leak_msgs.append(label.replace(" [transition-leak]", ""))
+            continue
         cmd = next((c for c in _CMDS4 if label.upper().startswith(c)), None)
         if not cmd: continue
         low = label.lower()
@@ -1566,8 +1704,11 @@ def _table_report(cur, conn, schema, table, helpers):
         notes.append("opaque policy function(s) were MOCKED to prove the policy delegates correctly (wiring) — the function's own logic is NOT verified here; test it separately")
     if any("42P17" in ln or "infinite recursion" in ln.lower() for ln in taplines):
         notes.append("BROKEN POLICY: a policy queries its own table (self-referential) -> Postgres raises 'infinite recursion detected in policy' -> the table is UNREADABLE by everyone. Use a SECURITY DEFINER helper function instead.")
+    if leak_msgs:
+        notes.append("SECURITY HOLE - cross-policy WITH CHECK leak (Postgres OR-combines every permissive policy's WITH CHECK, so an authorized identity can write a value only a DIFFERENT policy intended): " + "; ".join(sorted(set(leak_msgs))))
     return {"table": table, "rls_enabled": rls_on, "policied": sorted(pol),
-            "cells": cells, "idgrid": idgrid, "footguns": notes, "coverage": [ctx["cov"], ctx["tot"]]}
+            "cells": cells, "idgrid": idgrid, "footguns": notes, "coverage": [ctx["cov"], ctx["tot"]],
+            "transition_leaks": leak_msgs}
 
 
 def emit_rls_guard(cur, schema):
@@ -2292,6 +2433,14 @@ def main():
     try: sys.stdout.reconfigure(encoding="utf-8")   # render matrix glyphs on Windows too
     except Exception: pass
     helpers = not a.no_helpers
+    if a.report or a.html or a.emit:
+        sys.stderr.write(
+            "\nWARNING: rlsautotest runs statements against the database in --db-url to probe\n"
+            "each policy -- it seeds rows and executes SELECT/INSERT/UPDATE/DELETE. Each probe is\n"
+            "wrapped in a transaction and rolled back (nothing is committed), but the statements DO\n"
+            "run (table locks, triggers, sequences fire). Point --db-url at a DISPOSABLE COPY of\n"
+            "your database, NEVER production.\n\n"
+        )
     report_gate = 0   # exit code for the report/emit paths (1 if CI-gating problems found)
     with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
         if a.report or a.html:
@@ -2358,11 +2507,13 @@ def main():
             holes_any = [r["table"] for r in reps
                          if any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _ID_ROWS for c in _CMDS4)]
             broken_any = [r["table"] for r in reps if any("BROKEN POLICY" in f for f in r.get("footguns", []))]
-            if exposed_any or holes_any or broken_any:
+            leak_any = [r["table"] for r in reps if r.get("transition_leaks")]
+            if exposed_any or holes_any or broken_any or leak_any:
                 bits = []
                 if exposed_any: bits.append(f"{len(exposed_any)} exposed table(s): {', '.join(exposed_any)}")
                 if holes_any:   bits.append(f"{len(holes_any)} table(s) with policy holes/failures: {', '.join(holes_any)}")
                 if broken_any:  bits.append(f"{len(broken_any)} broken/unreadable table(s): {', '.join(broken_any)}")
+                if leak_any:    bits.append(f"{len(leak_any)} table(s) with cross-policy WITH CHECK leaks: {', '.join(leak_any)}")
                 print("\nFAIL: " + "; ".join(bits) + ("" if a.no_fail else "  (exit 1 — CI gate; pass --no-fail to suppress)"))
                 report_gate = 0 if a.no_fail else 1
             # ── --as-user: probe from a real auth.users identity ──────────────

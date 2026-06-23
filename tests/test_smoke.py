@@ -1,5 +1,6 @@
 """No-DB unit tests for the pure helpers (CI 'unit' job)."""
-from rlsautotest.cli import _split_statements, _is_uuid, setup_hook_sql, render_report_text, _SHIM, _mock_valid_row
+from rlsautotest.cli import (_split_statements, _is_uuid, setup_hook_sql, render_report_text, _SHIM,
+                             _mock_valid_row, classify_node, _where, _check_value_set)
 
 
 def test_split_respects_dollar_quotes():
@@ -40,6 +41,31 @@ def test_mock_valid_row_synthesizes_fk_parent_and_required_cols():
     # the FK parent is seeded (with its own required 'name'), so the creditors row is insertable
     assert any("rbac.teams" in s for s in parents)
     assert any("name" in s for s in parents)
+
+
+def test_classify_value_set_and_scalar_lookup():
+    # Generality regression (examples/transitions.sql): the recognizer must understand the shapes a
+    # role-gated state machine uses, instead of dead-ending at NOT_TESTABLE.
+    # `col = ANY(array[consts])` is value-set membership (distinct from the auth.uid()=ANY(col) shape).
+    a = classify_node(_where("status = ANY (array['Queued','In Cutting'])"), None)
+    assert a["kind"] == "col_in_set" and a["col"] == "status"
+    assert set(a["values"]) == {"Queued", "In Cutting"}
+    # `col <> ALL(array[consts])` -> the complement
+    b = classify_node(_where("status <> ALL (array['In Cutting','Completed'])"), None)
+    assert b["kind"] == "col_not_in_set" and set(b["values"]) == {"In Cutting", "Completed"}
+    # the Supabase "read my role from a profile table" scalar subquery must classify as scalar_lookup,
+    # NOT a phantom row_const on the base table (regression: _unwrap collapses the EXPR_SUBLINK to 'role').
+    c = classify_node(_where("(select role from profile where id = (select auth.uid())) = 'cutter'"), None)
+    assert c["kind"] == "scalar_lookup"
+    assert c["lcol"] == "role" and c["lkey"] == "id" and c["value"] == "cutter"
+
+
+def test_check_value_set_parses_the_with_check_value_space():
+    # gap 2: the per-policy WITH CHECK value-set the transition audit compares against.
+    assert _check_value_set("status = 'In Cutting'") == ("status", frozenset(["In Cutting"]))
+    col, vals = _check_value_set("status = ANY (array['a','b'])")
+    assert col == "status" and vals == frozenset(["a", "b"])
+    assert _check_value_set("owner = (select auth.uid())") is None   # identity link, not a value constraint
 
 
 def test_report_render():

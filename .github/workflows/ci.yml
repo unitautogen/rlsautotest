@@ -50,3 +50,17 @@ jobs:
             rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --report --no-fail
           done
           exit $rc
+      - name: Catch the cross-policy WITH CHECK leak (examples/transitions.sql)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/app
+        run: |
+          # transitions.sql is a DELIBERATE leak (like exotic.sql): a role-gated status state machine
+          # whose permissive UPDATE policies' WITH CHECK clauses OR-combine so a role can write a status
+          # its own policy forbids. The gate MUST flag it (exit non-zero) — failing to is a regression
+          # in either identity derivation (gap 1) or the transition audit (gap 2).
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/transitions.sql
+          if rlsautotest --db-url "$DATABASE_URL" --schema transitions --report; then
+            echo "FAIL: did NOT catch the known cross-policy WITH CHECK leak in transitions.work_items"
+            exit 1
+          fi
+          echo "OK: cross-policy WITH CHECK leak detected (gate exited non-zero) as expected"
