@@ -11,6 +11,11 @@ out/
 !examples/**/*.json
 # internal project brain / handoff — NEVER publish (contains strategy, competitor notes, launch plan)
 CLAUDE.md
+# internal design docs / backlog — not for the public repo (like CLAUDE.md)
+PARSING_IMPROVEMENTS.md
+PARSING_BACKLOG.md
+# private working set of real-world test schemas (uncomment to keep out of the public repo)
+# test-schemas/
 # scratch / generated report + emitted-suite artifacts
 *.html
 .pytest_cache/

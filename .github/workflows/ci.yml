@@ -38,8 +38,11 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/schema.sql
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/tenancy.sql
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/rbac.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/clearance.sql   # numeric-threshold; only the general solver can test it
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/synth.sql       # opaque-fn gate + composite FK + CHECK-UDF; only the probe-and-repair synthesizer can seed it
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/adversarial.sql # novel atoms OR'd with a classifiable branch; the per-min-term solver (BL-1) must DB-verify the novel branch
           rc=0
-          for schema in public tenancy rbac; do
+          for schema in public tenancy rbac clearance synth adversarial; do
             echo "===== schema: $schema ====="
             rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --emit "out_$schema"
             for f in "out_$schema"/tests/database/rls/*.sql; do
@@ -47,8 +50,17 @@ jobs:
               psql "$DATABASE_URL" -v ON_ERROR_STOP=0 -f "$f" | tee /tmp/tap.txt
               grep -q '^ *not ok' /tmp/tap.txt && rc=1 || true
             done
-            rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --report --no-fail
+            # Enforce the gate on the green set: a NEW hole, a cross-policy leak, or an UNRELIABLE cell
+            # (a test whose seed/precondition silently stopped working) must fail CI here. This is the
+            # coverage-regression guard -- the pg_prove loop above only catches 'not ok', not a cell that
+            # silently dropped to "– not tested".
+            rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --report || rc=1
           done
+          # BL-1 guard: the per-min-term solver must DB-verify the novel OR-branches in adversarial.sql
+          # (e.g. `status <> 'deleted'`, `deleted_at IS NULL`). If the solver gets re-gated/regressed, these
+          # [solver] tests vanish and the novel branch is silently dropped — fail CI if they're missing.
+          grep -rq '\[solver\]' out_adversarial/tests/database/rls/ || { echo "FAIL: BL-1 produced no [solver] tests for adversarial — the novel branches were dropped"; rc=1; }
+          rlsautotest --db-url "$DATABASE_URL" --schema adversarial --debug-unhandled   # show the classifier gaps for the record
           exit $rc
       - name: Catch the cross-policy WITH CHECK leak (examples/transitions.sql)
         env:
@@ -64,3 +76,34 @@ jobs:
             exit 1
           fi
           echo "OK: cross-policy WITH CHECK leak detected (gate exited non-zero) as expected"
+      - name: Flag an un-seedable table as UNRELIABLE, never a silent pass (examples/seedfail.sql)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/app
+        run: |
+          # seedfail.sql is DELIBERATELY un-seedable (a 10-digit CHECK the generic filler can't satisfy).
+          # The engine must mark those cells UNRELIABLE and FAIL the gate (exit non-zero) rather than print
+          # "– not tested" or bake the seed error as a policy denial. Failing to is a regression in the
+          # probe's arrange/act split or the post-arrange invariant.
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/seedfail.sql
+          if rlsautotest --db-url "$DATABASE_URL" --schema seedfail --report | tee /tmp/sf.txt; then
+            echo "FAIL: an un-seedable table did NOT fail the gate"
+            exit 1
+          fi
+          grep -q "UNRELIABLE" /tmp/sf.txt || { echo "FAIL: expected an UNRELIABLE call-out"; exit 1; }
+          echo "OK: un-seedable table flagged UNRELIABLE and gated as expected"
+      - name: UPDATE probe correctness — neutral col / valid value / explained dash (examples/updcheck.sql)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/app
+        run: |
+          # The UPDATE probe must SET a policy-NEUTRAL column to a CONSTRAINT-VALID value. updcheck.sql
+          # stresses the three failure modes: t1 (value-set CHECK -> valid value -> tested), t2 (CHECK the
+          # filler can't satisfy -> UNRELIABLE, never a false "denied"), t3 (no neutral column -> explained
+          # "–"). The gate must flag it (t2 UNRELIABLE), and the no-neutral-column note must appear (t3).
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/updcheck.sql
+          if rlsautotest --db-url "$DATABASE_URL" --schema updcheck --report | tee /tmp/uc.txt; then
+            echo "FAIL: updcheck did not fail the gate (expected t2 UNRELIABLE)"
+            exit 1
+          fi
+          grep -q "UNRELIABLE" /tmp/uc.txt || { echo "FAIL: expected UNRELIABLE for the CHECK-violating UPDATE (t2)"; exit 1; }
+          grep -q "no policy-neutral column" /tmp/uc.txt || { echo "FAIL: expected the explained '–' note (t3)"; exit 1; }
+          echo "OK: UPDATE probe correctness guards held (neutral column, valid value, UNRELIABLE, explained dash)"

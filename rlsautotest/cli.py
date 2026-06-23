@@ -49,6 +49,38 @@ def _fk_of(cur, schema, table, col):
     return cur.fetchone()
 
 
+def _constraint_meta(cur, schema, table):
+    """Per-table constraint metadata for seeding:
+      checks    {col: 'literal'}            -- value-set CHECK (role/status) -> a CHECK-satisfying value
+      cuniques  [[cols], ...]               -- composite UNIQUE/PK col-sets -> keep seeded rows distinct
+      relchecks [(colA, op, colB), ...]     -- cross-column CHECK (lo < hi) -> fill an ordered pair
+      compfks   [{cols, parent, pcols}, ...]-- composite FK -> seed the composite parent tuple"""
+    cur.execute("""
+        SELECT c.contype, pg_get_constraintdef(c.oid),
+               (SELECT array_agg(a.attname ORDER BY k.ord) FROM unnest(c.conkey)  WITH ORDINALITY k(attnum, ord) JOIN pg_attribute a ON a.attrelid = c.conrelid  AND a.attnum = k.attnum),
+               (SELECT array_agg(a.attname ORDER BY k.ord) FROM unnest(c.confkey) WITH ORDINALITY k(attnum, ord) JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum),
+               (SELECT n2.nspname || '.' || r2.relname FROM pg_class r2 JOIN pg_namespace n2 ON n2.oid = r2.relnamespace WHERE r2.oid = c.confrelid)
+        FROM pg_constraint c
+        JOIN pg_class r ON r.oid = c.conrelid
+        JOIN pg_namespace n ON n.oid = r.relnamespace
+        WHERE n.nspname = %s AND r.relname = %s AND c.contype IN ('c', 'u', 'p', 'f')""", (schema, table))
+    checks, cuniques, relchecks, compfks = {}, [], [], []
+    for (contype, cdef, cols, fcols, parent) in cur.fetchall():
+        if contype == 'c':
+            m = re.search(r"\b(\w+)\s*=\s*ANY\s*\(\s*ARRAY\[\s*'([^']*)'", cdef) or re.search(r"\b(\w+)\s*=\s*'([^']*)'", cdef)
+            if m:
+                checks[m.group(1)] = "'" + m.group(2).replace("'", "''") + "'"
+            else:
+                rm = re.search(r"\(\s*(\w+)\s*(<=|>=|<|>)\s*(\w+)\s*\)", cdef)   # cross-column comparison (both sides resolved to columns at fill time)
+                if rm:
+                    relchecks.append((rm.group(1), rm.group(2), rm.group(3)))
+        elif contype in ('u', 'p') and cols and len(cols) > 1:
+            cuniques.append(list(cols))
+        elif contype == 'f' and cols and len(cols) > 1 and parent and fcols:
+            compfks.append({"cols": list(cols), "parent": parent, "pcols": list(fcols)})
+    return checks, cuniques, relchecks, compfks
+
+
 def _lit(typ):
     t = typ.lower()
     if "char" in t or "text" in t: return "'x'"
@@ -353,6 +385,256 @@ def _check_value_set(check_sql):
     return None
 
 
+# ---------- general witness solver (solve, don't classify) ----------
+# When the named-shape catalog can't classify a predicate, derive inputs that make it TRUE and FALSE by
+# reading only the OPERAND ROLES of each comparison (column / const / auth.uid / jwt-claim / GUC / subquery /
+# function) and composing across AND/OR/NOT. The witness is VERIFIED against the live DB before any test is
+# baked (see solve_emit), so an incomplete guess degrades to NOT_TESTABLE — never a false pass.
+_WV_UID = "5ce1a000-0000-4000-8000-000000000001"
+
+def _wv_some(typ, enums):
+    """A canonical value of `typ` (for a matching pair)."""
+    base = (typ or "text").split("(")[0].strip(); t = (typ or "").lower()
+    if base in enums and enums[base]: return enums[base][0]
+    if "uuid" in t: return "5ce1a000-0000-4000-8000-0000000000aa"
+    if any(k in t for k in ("int", "serial", "numeric", "real", "double", "decimal", "money")): return "100"
+    if "bool" in t: return "true"
+    if "timestamp" in t: return "2020-01-01 00:00:00+00"
+    if "date" in t: return "2020-01-01"
+    if "time" in t: return "00:00:00"
+    return "rls_a"
+
+def _wv_other(typ, enums, avoid=None):
+    """A value of `typ` distinct from `avoid` (for falsifiers / not-in-set)."""
+    base = (typ or "text").split("(")[0].strip(); t = (typ or "").lower()
+    if base in enums and enums[base]: return next((l for l in enums[base] if l != avoid), enums[base][0])
+    if "uuid" in t:
+        a = "5ce1a000-0000-4000-8000-0000000000bb"
+        return a if avoid != a else "5ce1a000-0000-4000-8000-0000000000cc"
+    if any(k in t for k in ("int", "serial", "numeric", "real", "double", "decimal", "money")):
+        return "0" if str(avoid) != "0" else "7"
+    if "bool" in t: return "false" if str(avoid).lower() == "true" else "true"
+    if "timestamp" in t: a = "2021-06-15 12:00:00+00"; return a if str(avoid) != a else "2019-03-03 03:03:03+00"
+    if "date" in t: a = "2021-06-15"; return a if str(avoid) != a else "2019-03-03"
+    if "time" in t: a = "12:34:56"; return a if str(avoid) != a else "06:06:06"
+    return "rls_x" if avoid != "rls_x" else "rls_y"
+
+def _wv_lit(typ, raw):
+    if raw is None: return "NULL"
+    t = (typ or "").lower()
+    if any(k in t for k in ("int", "serial", "numeric", "real", "double", "decimal", "money")) and re.fullmatch(r"-?\d+(\.\d+)?", str(raw)): return str(raw)
+    if "bool" in t and str(raw).lower() in ("true", "false"): return str(raw).lower()
+    if any(k in t for k in ("timestamp", "date", "time", "interval")):   # cast date/time literals to the column type
+        return "'" + str(raw).replace("'", "''") + "'::" + typ
+    return "'" + str(raw).replace("'", "''") + "'"
+
+def _wv_ctx(): return {"sub": None, "claims": [], "guc": {}, "row": {}, "aux": [], "role": "authenticated"}
+
+def _wv_merge(a, b):
+    """Combine two witness contexts; None on a contradiction (e.g. a column needs two different values)."""
+    if a is None or b is None: return None
+    if a["sub"] is not None and b["sub"] is not None and a["sub"] != b["sub"]: return None
+    out = {"sub": a["sub"] if a["sub"] is not None else b["sub"], "claims": a["claims"] + b["claims"],
+           "guc": dict(a["guc"]), "row": dict(a["row"]), "aux": a["aux"] + b["aux"], "role": a["role"]}
+    for c, val in b["row"].items():
+        if c in out["row"] and out["row"][c] != val: return None
+        out["row"][c] = val
+    for k, val in b["guc"].items():
+        if k in out["guc"] and out["guc"][k] != val: return None
+        out["guc"][k] = val
+    seen = {}
+    for keys, val in out["claims"]:
+        kk = tuple(keys)
+        if kk in seen and seen[kk] != val: return None
+        seen[kk] = val
+    return out
+
+def _side_role(node):
+    """Operand role of one side of a comparison: ('col',name)/('const',v)/('uid',)/('claim',keys)/('guc',name)/(None,)."""
+    if _is_func(node, "auth.uid"): return ("uid", None)
+    k = _jwt_keys(node)
+    if k: return ("claim", k)
+    u = _unwrap(node)
+    if _t(u) == "FuncCall" and _names(_v(u).get("funcname")).split(".")[-1] == "current_setting":
+        a = _v(u).get("args", []); nm = _const(a[0]) if a else None
+        if nm: return ("guc", nm)
+    c = _colname(node)
+    if c: return ("col", c)
+    cv = _const(node)
+    if cv is not None: return ("const", cv)
+    return (None, None)
+
+def _solve_eq(L, R, coltypes, enums):
+    lr, rr = _side_role(L), _side_role(R)
+    for x, y in ((lr, rr), (rr, lr)):                       # claim/GUC compared to a const (no column): e.g. an OR admin escape hatch
+        if x[0] == "claim" and y[0] == "const":
+            sat, fal = _wv_ctx(), _wv_ctx()
+            sat["claims"].append((x[1], y[1])); fal["claims"].append((x[1], _wv_other("text", enums, y[1]))); return (sat, fal)
+        if x[0] == "guc" and y[0] == "const":
+            sat, fal = _wv_ctx(), _wv_ctx()
+            sat["guc"][x[1]] = y[1]; fal["guc"][x[1]] = _wv_other("text", enums, y[1]); return (sat, fal)
+    if rr[0] == "col" and lr[0] in ("col", "const", "uid", "claim", "guc"): lr, rr = rr, lr   # put the column on the left
+    if lr[0] != "col": return None
+    col = lr[1]; ct = coltypes.get(col, "text"); sat, fal = _wv_ctx(), _wv_ctx()
+    if rr[0] == "const":
+        sat["row"][col] = rr[1]; fal["row"][col] = _wv_other(ct, enums, rr[1]); return (sat, fal)
+    if rr[0] == "uid":
+        sat["sub"] = _WV_UID; sat["row"][col] = _WV_UID; fal["sub"] = _WV_UID; fal["row"][col] = _wv_other("uuid", enums, _WV_UID); return (sat, fal)
+    if rr[0] == "claim":
+        V = _wv_some(ct, enums); sat["claims"].append((rr[1], V)); sat["row"][col] = V
+        fal["claims"].append((rr[1], V)); fal["row"][col] = _wv_other(ct, enums, V); return (sat, fal)
+    if rr[0] == "guc":
+        V = _wv_some(ct, enums); sat["guc"][rr[1]] = V; sat["row"][col] = V
+        fal["guc"][rr[1]] = V; fal["row"][col] = _wv_other(ct, enums, V); return (sat, fal)
+    if rr[0] == "col":
+        V = _wv_some(ct, enums); sat["row"][col] = V; sat["row"][rr[1]] = V
+        fal["row"][col] = V; fal["row"][rr[1]] = _wv_other(coltypes.get(rr[1], "text"), enums, V); return (sat, fal)
+    return None
+
+def _solve_ineq(op, L, R, coltypes, enums):
+    lr, rr = _side_role(L), _side_role(R)
+    if lr[0] == "col" and rr[0] in ("claim", "guc", "const"): col, inp, col_left = lr[1], rr, True
+    elif rr[0] == "col" and lr[0] in ("claim", "guc", "const"): col, inp, col_left = rr[1], lr, False
+    else: return None
+    if not any(k in (coltypes.get(col, "") or "").lower() for k in ("int", "numeric", "real", "double", "decimal", "serial", "money")): return None
+    eff = op if col_left else {">": "<", "<": ">", ">=": "<=", "<=": ">="}[op]
+    hi_col = eff in (">", ">=")
+    sat, fal = _wv_ctx(), _wv_ctx()
+    def put(ctx, cv, iv):
+        ctx["row"][col] = cv
+        if inp[0] == "claim" and iv is not None: ctx["claims"].append((inp[1], iv))
+        elif inp[0] == "guc" and iv is not None: ctx["guc"][inp[1]] = iv
+    if inp[0] == "const":
+        try: c = int(float(inp[1]))
+        except Exception: return None
+        pairs = {">=": (c, c - 1), ">": (c + 1, c), "<=": (c, c + 1), "<": (c - 1, c)}[eff]
+        put(sat, str(pairs[0]), None); put(fal, str(pairs[1]), None); return (sat, fal)
+    if hi_col: put(sat, "1000000", "1"); put(fal, "1", "1000000")
+    else:      put(sat, "1", "1000000"); put(fal, "1000000", "1")
+    return (sat, fal)
+
+def _solve_leaf(node, coltypes, enums):
+    t = _t(node)
+    if t == "A_Const": return (_wv_ctx(), None) if _const(node) == "true" else None
+    if t == "NullTest":
+        v = _v(node); col = _colname(v.get("arg"))
+        if not col: return None
+        other = _wv_other(coltypes.get(col, "text"), enums); sat, fal = _wv_ctx(), _wv_ctx()
+        if v.get("nulltesttype") == "IS_NULL": sat["row"][col] = None; fal["row"][col] = other
+        else: sat["row"][col] = other; fal["row"][col] = None
+        return (sat, fal)
+    if t == "SubLink":
+        sv = _v(node); st = sv.get("subLinkType")
+        if st in ("EXISTS_SUBLINK", "ANY_SUBLINK"):
+            m = _membership(sv.get("subselect"), sv.get("testexpr") if st == "ANY_SUBLINK" else None)
+            if m.get("kind") == "membership":
+                sat, fal = _wv_ctx(), _wv_ctx(); sat["sub"] = _WV_UID; fal["sub"] = _WV_UID
+                sc = "5c09e000-0000-4000-8000-000000000001"
+                sat["row"][m["row_scope_col"]] = sc
+                sat["aux"].append({"table": m["mtable"], "cols": {m["muser_col"]: _WV_UID, m["mscope_col"]: sc}})
+                fal["row"][m["row_scope_col"]] = "5c09e000-0000-4000-8000-0000000000ff"
+                return (sat, fal)
+        return None
+    if t != "A_Expr": return None
+    v = _v(node); kind = v.get("kind"); op = _names(v.get("name")); L = v.get("lexpr"); R = v.get("rexpr")
+    sl = _scalar_lookup(L, R) or _scalar_lookup(R, L)
+    if sl:
+        sat, fal = _wv_ctx(), _wv_ctx(); sat["sub"] = _WV_UID; fal["sub"] = _WV_UID
+        sat["aux"].append({"table": sl["ltable"], "cols": {sl["lkey"]: _WV_UID, sl["lcol"]: sl["value"]}})
+        fal["aux"].append({"table": sl["ltable"], "cols": {sl["lkey"]: _WV_UID, sl["lcol"]: _wv_other("text", enums, sl["value"])}})
+        return (sat, fal)
+    if kind == "AEXPR_OP_ANY" and op == "=":
+        col = _colname(L) or _colname(R); vals = _array_consts(R) if _colname(L) else _array_consts(L)
+        if col and vals:
+            base = (coltypes.get(col, "") or "").split("(")[0].strip()
+            outside = next((l for l in enums.get(base, []) if l not in vals), None)
+            sat, fal = _wv_ctx(), _wv_ctx(); sat["row"][col] = vals[0]
+            if outside is None: return (sat, None)
+            fal["row"][col] = outside; return (sat, fal)
+        return None
+    if kind == "AEXPR_OP_ALL" and op in ("<>", "!="):
+        col = _colname(L) or _colname(R); vals = _array_consts(R) if _colname(L) else _array_consts(L)
+        if col and vals:
+            base = (coltypes.get(col, "") or "").split("(")[0].strip()
+            outside = next((l for l in enums.get(base, []) if l not in vals), None)
+            if outside is None: return None
+            sat, fal = _wv_ctx(), _wv_ctx(); sat["row"][col] = outside; fal["row"][col] = vals[0]; return (sat, fal)
+        return None
+    if kind == "AEXPR_OP" and op == "=": return _solve_eq(L, R, coltypes, enums)
+    if kind == "AEXPR_OP" and op in (">", "<", ">=", "<="): return _solve_ineq(op, L, R, coltypes, enums)
+    if kind == "AEXPR_OP" and op in ("<>", "!="):
+        lr, rr = _side_role(L), _side_role(R)
+        if rr[0] == "col" and lr[0] == "const": lr, rr = rr, lr
+        if lr[0] == "col" and rr[0] == "const":
+            sat, fal = _wv_ctx(), _wv_ctx()
+            sat["row"][lr[1]] = _wv_other(coltypes.get(lr[1], "text"), enums, rr[1]); fal["row"][lr[1]] = rr[1]; return (sat, fal)
+        return None
+    return None
+
+def _solve_node(node, coltypes, enums):
+    if _t(node) == "BoolExpr":
+        bo = _v(node).get("boolop"); kids = [_solve_node(a, coltypes, enums) for a in _v(node).get("args", [])]
+        if bo == "NOT_EXPR":
+            k = kids[0]; return (k[1], k[0]) if (k and k[1] is not None) else None
+        if bo == "AND_EXPR":
+            sat = _wv_ctx()
+            for k in kids:
+                if not k: return None
+                sat = _wv_merge(sat, k[0])
+                if sat is None: return None
+            fal = None
+            for i, k in enumerate(kids):
+                if not k or k[1] is None: continue
+                cand = k[1]; ok = True
+                for j, k2 in enumerate(kids):
+                    if j == i: continue
+                    cand = _wv_merge(cand, k2[0]) if k2 else None
+                    if cand is None: ok = False; break
+                if ok and cand is not None: fal = cand; break
+            return (sat, fal)
+        if bo == "OR_EXPR":
+            sat = next((k[0] for k in kids if k), None)
+            if sat is None: return None
+            fal = _wv_ctx()
+            for k in kids:
+                if not k or k[1] is None: fal = None; break
+                fal = _wv_merge(fal, k[1])
+                if fal is None: break
+            return (sat, fal)
+        return None
+    return _solve_leaf(node, coltypes, enums)
+
+def _solve_predicate(node, coltypes, enums):
+    """Entry point: a parsed predicate -> (sat_ctx, fal_ctx) or None. sat makes it true, fal makes it false."""
+    if node is None: return None
+    return _solve_node(node, coltypes, enums)
+
+def _seed_one(table_fqn, fixed, fkmap, colsmap, enums):
+    """INSERT stmts (FK parents first, ON CONFLICT DO NOTHING) for one row of table_fqn: `fixed` {col: literal}
+    plus required NOT-NULL/no-default columns filled with type-valid values."""
+    stmts = []
+    def fill(t):
+        base = t.split("(")[0].strip()
+        return f"'{enums[base][0]}'::{base}" if (base in enums and enums[base]) else _lit(t)
+    def pick(t):
+        base = t.split("(")[0].strip(); tl = t.lower()
+        if base in enums and enums[base]: return f"'{enums[base][0]}'::{base}"
+        if "uuid" in tl: return "'000000c1-0000-0000-0000-0000000000c1'"
+        if any(k in tl for k in ("int", "numeric", "real", "double", "serial", "decimal")): return "1"
+        if "bool" in tl: return "false"
+        return "'x'"
+    def ensure(tbl, vals):
+        fks = fkmap.get(tbl, {}); full = dict(vals)
+        for (n, t, nn, hd) in colsmap.get(tbl, []):
+            if n in full or not nn or hd: continue
+            full[n] = pick(t) if n in fks else fill(t)
+        for n, vv in full.items():
+            if n in fks: pt, pc = fks[n]; ensure(pt, {pc: vv})
+        stmts.append(f"INSERT INTO {tbl}({', '.join(full)}) VALUES ({', '.join(full.values())}) ON CONFLICT DO NOTHING")
+    ensure(table_fqn, fixed)
+    return stmts
+
+
 def _dnf_ast(n):
     """Boolean AST -> DNF: list of min-terms, each a list of leaf nodes."""
     t = _t(n)
@@ -563,7 +845,7 @@ def _cmd_dnf(pols, cmd, clause, cur):
                 if a.get("kind") == "auth_role" and a.get("value") == "authenticated": is_open = True
             if not atoms: is_open = True
             key = tuple(sorted(f"{a.get('kind')}|{a.get('col')}|{a.get('value')}|{a.get('mtable')}|{','.join(map(str, a.get('values', [])))}" for a in atoms))
-            if key not in seen: seen.add(key); dnf.append(atoms); srcs.append({"policy": p[0], "check": chk})
+            if key not in seen: seen.add(key); dnf.append(atoms); srcs.append({"policy": p[0], "check": chk, "raw": list(mt)})
     rest = []
     for p in restr:
         pe = eff(p)
@@ -594,6 +876,7 @@ def analyze(cur, schema, table):
             cc = build_class(t, i, col_dom)
             cc["src_policy"] = srcs[i].get("policy") if i < len(srcs) else None
             cc["src_check"] = srcs[i].get("check") if i < len(srcs) else None
+            cc["raw_atoms"] = srcs[i].get("raw") if i < len(srcs) else None   # raw AST conjunct nodes -> per-min-term solver fallback (BL-1)
             classes.append(cc)
         per[cmd] = {"classes": classes, "open": is_open, "has_pol": has_pol}
         if cmd == "SELECT":
@@ -612,9 +895,24 @@ def _unq(v):
     return v[1:-1] if isinstance(v, str) and v.startswith("'") and v.endswith("'") else v
 
 
-def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols):
+def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks=None, cuniques=None, relchecks=None, compfks=None):
     """Shared seeding + per-command plan computation used by BOTH the nested and flat emitters."""
     q = f"{schema}.{table}"
+    checks = checks or {}; cuniques = cuniques or {}; relchecks = relchecks or {}; compfks = compfks or {}
+    def chkval(tbl, col): return (checks.get(tbl) or {}).get(col)   # CHECK-satisfying literal for this column, if any
+    def coltype(tbl, col): return next((t for (n, t, nn, hd) in colsmap.get(tbl, []) if n == col), None)
+    def relfill(tbl, vals, fixed):   # cross-column CHECK (a op b): fill an ordered numeric/temporal pair
+        for (a, op, b) in relchecks.get(tbl, []):
+            ta, tb = coltype(tbl, a), coltype(tbl, b)
+            if ta is None or tb is None or a in fixed or b in fixed: continue
+            tl = (ta or "").lower()
+            if any(k in tl for k in ("int", "numeric", "real", "double", "decimal", "serial")):
+                lo, hi = "1", "2"
+            elif "timestamp" in tl or "date" in tl:
+                lo, hi = "now() - interval '1 day'", "now() + interval '1 day'"
+            else:
+                continue
+            vals[a], vals[b] = (lo, hi) if op in ("<", "<=") else (hi, lo)
     all_h = [c for cmd in cmds for c in per[cmd]["classes"] if c["handled"]]
     seen_k, rowlinked = set(), []
     for c in all_h:
@@ -638,6 +936,16 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
         return "'x'"
 
     stmts, seen = [], set()
+    def ensure_comp(tbl, pvals):   # seed a composite-FK parent tuple (its key cols fixed to pvals)
+        ck = (tbl, tuple(sorted(pvals.items())))
+        if ck in seen: return
+        seen.add(ck)
+        full = dict(pvals); fks = fkmap.get(tbl, {})
+        for (n, t, nn, hd) in colsmap.get(tbl, []):
+            if n in full or not nn or hd: continue
+            full[n] = pick(t) if n in fks else (chkval(tbl, n) or fill(t))
+        relfill(tbl, full, set(pvals)); anc(full, tbl)
+        stmts.append(f"  INSERT INTO {tbl}({', '.join(full)}) VALUES ({', '.join(full.values())}) ON CONFLICT DO NOTHING;")
     def ensure(tbl, col, val):
         k = (tbl, col, val)
         if k in seen: return
@@ -645,9 +953,12 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
         fks = fkmap.get(tbl, {}); vals = {col: val}
         for (n, t, nn, hd) in colsmap.get(tbl, []):
             if n == col or not nn or hd: continue
-            vals[n] = pick(t) if n in fks else fill(t)
+            vals[n] = pick(t) if n in fks else (chkval(tbl, n) or fill(t))
+        relfill(tbl, vals, {col})
         for n, v in vals.items():
             if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
+        for cf in compfks.get(tbl, []):
+            if all(c in vals for c in cf["cols"]): ensure_comp(cf["parent"], {pc: vals[lc] for lc, pc in zip(cf["cols"], cf["pcols"])})
         stmts.append(f"  INSERT INTO {tbl}({', '.join(vals)}) VALUES ({', '.join(vals.values())}) ON CONFLICT DO NOTHING;")
     def _distinct(t, salt):
         tl = t.lower(); base = t.split("(")[0].strip()
@@ -662,12 +973,20 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
             if n in vals or not nn or hd: continue
             if n in fks: vals[n] = pick(t)
             elif tbl == q and n in unique_cols: vals[n] = _distinct(t, salt)
-            else: vals[n] = fill(t)
+            else: vals[n] = chkval(tbl, n) or fill(t)
+        for cu in cuniques.get(tbl, []):   # composite UNIQUE: vary one free col per salt so the combination stays distinct across seeded rows
+            tgt = next((cc for cc in cu if cc not in fks and cc not in fixed), None)
+            if tgt:
+                tt = next((tt0 for (n0, tt0, nn0, hd0) in colsmap.get(tbl, []) if n0 == tgt), None)
+                if tt: vals[tgt] = _distinct(tt, salt)
+        relfill(tbl, vals, set(fixed))   # cross-column CHECK: fill an ordered pair
         return vals
     def anc(vals, tbl):
         fks = fkmap.get(tbl, {})
         for n, v in vals.items():
             if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
+        for cf in compfks.get(tbl, []):   # composite FK -> seed the parent tuple
+            if all(c in vals for c in cf["cols"]): ensure_comp(cf["parent"], {pc: vals[lc] for lc, pc in zip(cf["cols"], cf["pcols"])})
     def insert(tbl, vals, conflict=False):
         return f"  INSERT INTO {tbl}({', '.join(vals)}) VALUES ({', '.join(vals.values())})" + (" ON CONFLICT DO NOTHING" if conflict else "") + ";"
     def foreign_val(kind):
@@ -678,8 +997,36 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
 
     for at in {a["table"] for c in all_h for a in c["aux"]}:
         stmts.append(f"  DELETE FROM {at};")
+    # Seed aux/scope rows BEFORE the main rows. When the scope table is ALSO an FK parent of the table
+    # under test (e.g. a `data_rooms` that is both the membership table and room_documents.room_id's
+    # parent), the membership-linking column (owner_id = the test user) must be written first; the later
+    # FK-parent fill of that same row then no-ops via ON CONFLICT DO NOTHING. Otherwise the generic fill
+    # wins, the "authorized" identity isn't actually authorized, and every grant test bakes a wrong "0 rows".
+    aux_seen = set()
+    for c in all_h:
+        for a in c["aux"]:
+            ak = (a["table"], tuple(sorted(a["cols"].items())))
+            if ak in aux_seen: continue
+            aux_seen.add(ak)
+            av = {k: f"'{val}'" for k, val in a["cols"].items()}
+            v = row_values(a["table"], av); anc(v, a["table"]); stmts.append(insert(a["table"], v, conflict=True))
+    def _anc_tables(t0):                                 # t0 + its transitive FK-parent tables
+        seen, st = set(), [t0]
+        while st:
+            t = st.pop()
+            if t in seen: continue
+            seen.add(t)
+            for (pt, _pc) in fkmap.get(t, {}).values(): st.append(pt)
+        return seen
+    # If the table under test IS the scope parent that an aux row FK-references (e.g. orgs, with
+    # memberships.org_id -> orgs.id; also rbac role tables / scalar-lookup tables that point back at q),
+    # then the aux's anc() already seeded the main row's PK while satisfying that FK; the main insert
+    # here would re-insert the same key and self-collide (23505), which the probe would mis-bake as a
+    # denial. Make it idempotent in that case. Covers ALL aux kinds, not just membership.
+    q_scope_parent = any(a.get("table") and a["table"] != q and q in _anc_tables(a["table"])
+                         for c in all_h for a in c["aux"])
     for c in rowlinked:
-        v = row_values(q, c["rowseed"], salt=c["idx"]); anc(v, q); stmts.append(insert(q, v))
+        v = row_values(q, c["rowseed"], salt=c["idx"]); anc(v, q); stmts.append(insert(q, v, conflict=q_scope_parent))
         if c["has_temporal"]:
             tcol = [k for k in c["rowseed"] if "now()" in c["rowseed"][k]][0]
             v2 = row_values(q, {**c["rowseed"], tcol: "now() - interval '1 day'"}, salt=c["idx"] + 50); anc(v2, q); stmts.append(insert(q, v2) + "  -- expired")
@@ -693,14 +1040,6 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
     elif any_grant:
         for i in range(2):
             v = row_values(q, {}, salt=i); anc(v, q); stmts.append(insert(q, v))
-    aux_seen = set()
-    for c in all_h:
-        for a in c["aux"]:
-            ak = (a["table"], tuple(sorted(a["cols"].items())))
-            if ak in aux_seen: continue
-            aux_seen.add(ak)
-            av = {k: f"'{val}'" for k, val in a["cols"].items()}
-            v = row_values(a["table"], av); anc(v, a["table"]); stmts.append(insert(a["table"], v, conflict=True))
 
     # ── rival tenant: the "authenticated, not authorized" negative control is a LEGITIMATE user of a
     #    DIFFERENT tenant (org B), not a no-tenant outsider — so a green block proves cross-tenant isolation
@@ -753,8 +1092,8 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
             "rival": {"on": rival_on, "claims": json.dumps(rival_claims)}}
 
 
-def emit(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols):
-    S = _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols)
+def emit(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks=None, cuniques=None, relchecks=None, compfks=None):
+    S = _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks, cuniques, relchecks, compfks)
     q = S["q"]; cls = f"test_{table}"
     seed = S["seed"]; total_rows = S["total_rows"]; insert_plan = S["insert_plan"]
     nobody_ins = S["nobody_ins"]; primary = S["primary"]; pkind = S["pkind"]
@@ -836,7 +1175,7 @@ def _qlit(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
-def _mock_valid_row(schema, table, fkmap, colsmap, enums):
+def _mock_valid_row(schema, table, fkmap, colsmap, enums, checks=None, relchecks=None, compfks=None):
     """Build (fk_parent_insert_stmts, {col: literal}) for ONE valid row of schema.table.
     Used to seed the precondition for opaque-function-gated write tests (the mock path): when a
     table's only policies delegate to an opaque boolean fn, there's no 'handled' class and thus
@@ -844,6 +1183,8 @@ def _mock_valid_row(schema, table, fkmap, colsmap, enums):
     parents seeded recursively (ON CONFLICT DO NOTHING), required (NOT NULL, no-default,
     non-identity) columns filled with type-valid literals."""
     q = f"{schema}.{table}"
+    checks = checks or {}
+    def _ck(tbl, col): return (checks.get(tbl) or {}).get(col)   # CHECK-satisfying literal, if any
 
     def _fill(t):
         base = t.split("(")[0].strip()
@@ -866,7 +1207,7 @@ def _mock_valid_row(schema, table, fkmap, colsmap, enums):
         fks = fkmap.get(tbl, {}); vals = {col: val}
         for (n, t, nn, hd) in colsmap.get(tbl, []):
             if n == col or not nn or hd: continue
-            vals[n] = _pick(t) if n in fks else _fill(t)
+            vals[n] = _pick(t) if n in fks else (_ck(tbl, n) or _fill(t))
         for n, v in vals.items():
             if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
         stmts.append(f"INSERT INTO {tbl}({', '.join(vals)}) VALUES ({', '.join(vals.values())}) ON CONFLICT DO NOTHING")
@@ -874,13 +1215,138 @@ def _mock_valid_row(schema, table, fkmap, colsmap, enums):
     fks = fkmap.get(q, {}); row = {}
     for (n, t, nn, hd) in colsmap.get(q, []):
         if not nn or hd: continue
-        row[n] = _pick(t) if n in fks else _fill(t)
+        row[n] = _pick(t) if n in fks else (_ck(q, n) or _fill(t))
     for n, v in row.items():
         if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
     return stmts, row
 
 
-def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, helpers=True, grants_map=None, conn=None):
+def _bump_lit(typ, salt):
+    t = (typ or "").lower()
+    if "uuid" in t: return f"'{salt:08x}-0000-0000-0000-000000000000'"
+    if any(k in t for k in ("int", "numeric", "real", "double", "serial", "decimal")): return str(1000 + salt)
+    if "char" in t or "text" in t: return f"'syn{salt}'"
+    return _lit(typ)
+
+
+def _fk_by_name(cur, cname):
+    """Resolve a FK constraint (by name) -> {parent: 'schema.table', cols: [...], pcols: [...]}. Composite-aware."""
+    cur.execute("""SELECT (SELECT n.nspname||'.'||r.relname FROM pg_class r JOIN pg_namespace n ON n.oid=r.relnamespace WHERE r.oid=c.confrelid),
+                          (SELECT array_agg(a.attname ORDER BY k.ord) FROM unnest(c.conkey)  WITH ORDINALITY k(an,ord) JOIN pg_attribute a ON a.attrelid=c.conrelid  AND a.attnum=k.an),
+                          (SELECT array_agg(a.attname ORDER BY k.ord) FROM unnest(c.confkey) WITH ORDINALITY k(an,ord) JOIN pg_attribute a ON a.attrelid=c.confrelid AND a.attnum=k.an)
+                   FROM pg_constraint c WHERE c.conname=%s AND c.contype='f' LIMIT 1""", (cname,))
+    r = cur.fetchone()
+    return {"parent": r[0], "cols": list(r[1]), "pcols": list(r[2])} if r and r[0] else None
+
+
+def _check_bool_udfs(cur, cname):
+    """Boolean UDFs the named CHECK constraint actually calls -> [(qualified_signature, original_functiondef)].
+    Resolved EXACTLY via pg_depend (the constraint's recorded dependency on the function) so a same-named
+    function in a different schema is never picked by mistake; falls back to schema-aware parsing of the def.
+    These can be neutralized (replaced with SELECT true) to seed past a function-delegated CHECK, then restored."""
+    cur.execute("""SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid), pg_get_functiondef(p.oid)
+                   FROM pg_constraint c
+                   JOIN pg_depend d ON d.classid='pg_constraint'::regclass AND d.objid=c.oid AND d.refclassid='pg_proc'::regclass
+                   JOIN pg_proc p ON p.oid=d.refobjid
+                   JOIN pg_namespace n ON n.oid=p.pronamespace
+                   JOIN pg_type t ON t.oid=p.prorettype
+                   WHERE c.conname=%s AND c.contype='c' AND t.typname='bool' AND n.nspname NOT IN ('pg_catalog','information_schema')""", (cname,))
+    out = [(f"{nsp}.{pname}({args})", fdef) for (nsp, pname, args, fdef) in cur.fetchall()]
+    if out: return out
+    cur.execute("SELECT pg_get_constraintdef(oid), connamespace::regnamespace::text FROM pg_constraint WHERE conname=%s AND contype='c' LIMIT 1", (cname,))
+    r = cur.fetchone()
+    if not r or not r[0]: return []
+    cdef, conschema = r[0], r[1]
+    for sch, fn in set(re.findall(r"(?:([a-zA-Z_]\w*)\.)?([a-zA-Z_]\w*)\s*\(", cdef)):
+        if sch:
+            cur.execute("SELECT n.nspname,p.proname,pg_get_function_identity_arguments(p.oid),pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_type t ON t.oid=p.prorettype WHERE n.nspname=%s AND p.proname=%s AND t.typname='bool' LIMIT 1", (sch, fn))
+        else:
+            cur.execute("SELECT n.nspname,p.proname,pg_get_function_identity_arguments(p.oid),pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_type t ON t.oid=p.prorettype WHERE p.proname=%s AND t.typname='bool' AND n.nspname=%s LIMIT 1", (fn, conschema))
+        fr = cur.fetchone()
+        if fr:
+            nsp, pname, args, fdef = fr
+            out.append((f"{nsp}.{pname}({args})", fdef))
+    return out
+
+
+def _synthesize_row(conn, schema, table, fixed=None, _depth=0, budget=24):
+    """PROBE-AND-REPAIR row synthesis (DB as oracle): build the recipe (ordered SQL) that makes ONE valid row
+    of schema.table EXIST. Try the INSERT, read the real failure, repair, retry within a budget:
+      23502 NOT NULL  -> fill the named column
+      23503 FK        -> seed the parent tuple (recursively synthesize it; composite-aware)
+      23514 CHECK     -> if it delegates to a boolean UDF, neutralize the fn for the insert then restore it
+      23505 UNIQUE    -> vary a column
+    Returns (recipe_stmts, row_values) or (None, None). Discovery runs in savepoints (rolled back); the
+    returned recipe is meant to be run for real as the seeding (RLS-bypassing) role. Sound: if it can't
+    build a row it returns None -> caller stays NOT_TESTABLE, never a fabricated pass."""
+    if _depth > 6:
+        return None, None, None
+    q = f"{schema}.{table}"
+    cur = conn.cursor()
+    cur.execute("""SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,
+                          (a.atthasdef OR a.attidentity <> '' OR a.attgenerated <> '')
+                   FROM pg_attribute a WHERE a.attrelid = format('%%I.%%I', %s::text, %s::text)::regclass
+                     AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum""", (schema, table))
+    coltypes, row = {}, {}
+    for (n, t, nn, hd) in cur.fetchall():
+        coltypes[n] = t
+        if nn and not hd: row[n] = _lit(t)
+    for k, v in (fixed or {}).items():
+        row[k] = v
+    parents, mocks, salt = [], [], [0]
+    def mock_create(sig): return f"CREATE OR REPLACE FUNCTION {sig} RETURNS boolean LANGUAGE sql AS $$ SELECT true $$;"
+    def ins_sql():
+        base = (f"INSERT INTO {q} ({', '.join(row)}) VALUES ({', '.join(row.values())})" if row else f"INSERT INTO {q} DEFAULT VALUES")
+        # parents (depth>0) are re-seeded on every per-test preseed and never deleted -> make them idempotent;
+        # the top-level target row is DELETEd before each re-seed (or is the action itself), so it stays plain.
+        return base + (" ON CONFLICT DO NOTHING" if _depth > 0 else "")
+    for i in range(budget):
+        sp = f"_syn_{_depth}_{i}"
+        cur.execute(f"SAVEPOINT {sp}")
+        err = None
+        try:
+            for prec in parents:
+                for s in prec: cur.execute(s.rstrip().rstrip(";"))
+            for (sig, _orig) in mocks: cur.execute(mock_create(sig).rstrip(";"))
+            cur.execute(ins_sql())
+        except psycopg.Error as e:
+            err = e
+        try: cur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+        except Exception: pass
+        if err is None:
+            setup = [mock_create(sig) for (sig, _o) in mocks]                                   # neutralize CHECK UDFs
+            for prec in parents: setup += [s if s.rstrip().endswith(";") else s + ";" for s in prec]   # seed FK/composite parents
+            recipe = list(setup) + [ins_sql() + ";"] + [orig.rstrip().rstrip(";") + ";" for (sig, orig) in mocks]  # +row +restore
+            return recipe, dict(row), setup
+        ss = getattr(err, "sqlstate", None); diag = getattr(err, "diag", None)
+        col = getattr(diag, "column_name", None) if diag else None
+        cname = getattr(diag, "constraint_name", None) if diag else None
+        if ss == "23502" and col:                                   # NOT NULL
+            row[col] = _lit(coltypes.get(col, "text"))
+        elif ss == "23503" and cname:                               # FK (single or composite)
+            fk = _fk_by_name(cur, cname)
+            if not fk: return None, None, None
+            for lc in fk["cols"]:
+                if lc not in row or row[lc] == "NULL": row[lc] = _lit(coltypes.get(lc, "text"))
+            ps, t2 = _sq(fk["parent"])
+            prec, _pv, _ps = _synthesize_row(conn, ps, t2, fixed={pc: row[lc] for lc, pc in zip(fk["cols"], fk["pcols"])}, _depth=_depth + 1)
+            if prec is None: return None, None, None
+            parents.append(prec)
+        elif ss == "23514" and cname:                               # CHECK -> neutralize a delegated boolean UDF
+            new = [(s, o) for (s, o) in _check_bool_udfs(cur, cname) if s not in {m for m, _ in mocks}]
+            if not new: return None, None, None                     # non-function CHECK (e.g. cross-column) -> not repairable here
+            mocks += new
+        elif ss == "23505" and cname:                               # UNIQUE -> vary a column
+            cur.execute("SELECT array_agg(a.attname) FROM pg_constraint c JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=ANY(c.conkey) WHERE c.conname=%s", (cname,))
+            ur = cur.fetchone(); tgt = next((u for u in (list(ur[0]) if ur and ur[0] else []) if u in row), None)
+            if not tgt: return None, None, None
+            salt[0] += 1; row[tgt] = _bump_lit(coltypes.get(tgt, "text"), salt[0])
+        else:
+            return None, None, None
+    return None, None, None
+
+
+def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks=None, cuniques=None, relchecks=None, compfks=None, helpers=True, grants_map=None, conn=None):
     """Native Supabase FLAT pgTAP form: begin; plan(N); inline AAA; finish(); rollback.
 
     helpers=True (DEFAULT): tests read natively — tests.create_supabase_user / authenticate_as /
@@ -889,7 +1355,7 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
       Requires the tests.* helpers (basejump, or the rlsautotest offline shim emitted in 000-setup).
     helpers=False (--no-helpers): fully self-contained — inline set_config + SET LOCAL ROLE, ensures
       pgtap, no 000-hook dependency; one file runs standalone."""
-    S = _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols)
+    S = _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks, cuniques, relchecks, compfks)
     q = S["q"]; seed = S["seed"]; total_rows = S["total_rows"]
     insert_plan = S["insert_plan"]; nobody_ins = S["nobody_ins"]; fill = S["fill"]
     rowlinked = S["rowlinked"]
@@ -1018,11 +1484,26 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
 
     if conn is not None:   # PROBE path: observe the REAL outcome of each identity x command on the copy, then bake it
         arrange_stmts = [s for s in _split_statements(f"DELETE FROM {q};\n{seed}") if s.strip()]
-        _fk_cols = set(fkmap.get(f"{schema}.{table}", {}))   # avoid FK cols: SET fk=fk triggers an RI check (parent access), not the table's own UPDATE perm
+        _fk_cols = set(fkmap.get(f"{schema}.{table}", {}))   # avoid FK cols: SET fk=val triggers an RI check (parent access), not the table's own UPDATE perm
         _rowseed = {x for cc in rowlinked for x in cc['rowseed']}
-        upd_col = (next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0 and nn0 not in _fk_cols and nn0 not in unique_cols), None)
-                   or next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0 and nn0 not in unique_cols), None)
-                   or next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in _rowseed and not h0 and nn0 not in _fk_cols), None))
+        # Columns referenced by ANY policy on the table (USING + WITH CHECK). SETting one of these would
+        # test scope-movement or the WITH CHECK value-space, NOT the plain UPDATE grant -> exclude them so we
+        # change a POLICY-NEUTRAL column. No fallback to FK/unique/policy columns (those SETs fail for reasons
+        # unrelated to RLS and would mis-bake as denials); if none is neutral, upd_col stays None and UPDATE is
+        # honestly "not tested - no neutral column" (surfaced as a note by the report).
+        _policy_cols = set()
+        try:
+            _pcur = conn.cursor()
+            _pcur.execute("SELECT coalesce(qual,'') || ' ' || coalesce(with_check,'') FROM pg_policies WHERE schemaname=%s AND tablename=%s", (schema, table))
+            _blob = " ".join((r[0] or "") for r in _pcur.fetchall())
+            _policy_cols = {nn0 for (nn0, _t, _c, _h) in cols if re.search(r'\b' + re.escape(nn0) + r'\b', _blob)}
+        except Exception:
+            _policy_cols = set()
+        upd_col = next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols
+                        if not h0 and nn0 not in _fk_cols and nn0 not in unique_cols
+                        and nn0 not in _rowseed and nn0 not in _policy_cols), None)
+        def _upd_val(col, typ):   # a CHECK-satisfying literal for the SET when known, else a type-based fill
+            return (checks.get(q) or {}).get(col) or fill(typ)
         def pident(cjson, role):
             if role == "anon" or cjson == "":
                 return ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"]
@@ -1060,34 +1541,46 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
             if not udfs:
                 return
             fns = ", ".join(u["name"] + "()" for u in udfs)
-            if cmd == "SELECT":
-                mock_one("true",  f"SELECT is( (SELECT count(*) FROM {q})::int, {total_rows}, {desc('SELECT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", False)
-                mock_one("false", f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", False)
-                return
-            # When every policy on the table delegates to an opaque fn there's no base seed, so build a
-            # valid row (+ FK parents) on the fly so the write actually has something to act on.
-            parents, prow = ([], None)
+            # Need a valid row to act on. Prefer the probe-and-repair synthesizer (handles composite FK,
+            # CHECK-delegated UDFs, etc. by reacting to real INSERT errors); fall back to the static builder,
+            # then to the weak count. `recipe` makes a row exist (mocks restored); `setup` is the pre-insert
+            # part (parent seeds + CHECK-UDF neutralizers, left active) for when we INSERT as the action.
+            recipe, srow, setup = (None, None, None)
             if not nobody_ins:
-                parents, prow = _mock_valid_row(schema, table, fkmap, colsmap, enums)
+                recipe, srow, setup = _synthesize_row(conn, schema, table)
+            parents, prow = ([], None)
+            if recipe is None and not nobody_ins:
+                parents, prow = _mock_valid_row(schema, table, fkmap, colsmap, enums, checks, relchecks, compfks)
+            def _exist_pre():   # statements that leave ONE valid row in q. We keep any CHECK-UDF mocks in `setup`
+                # ACTIVE (not restored) through the action so an UPDATE that touches a CHECK'd column still passes;
+                # the whole battery is wrapped in BEGIN..ROLLBACK so the real function is restored at the end.
+                if recipe: return [f"DELETE FROM {q}"] + setup + [f"INSERT INTO {q}({', '.join(srow)}) VALUES ({', '.join(srow.values())})"]
+                if prow:    return [f"DELETE FROM {q}"] + parents + [f"INSERT INTO {q}({', '.join(prow)}) VALUES ({', '.join(prow.values())})"]
+                return None
+            if cmd == "SELECT":
+                pre = _exist_pre()
+                if pre:    # seed ONE real row, prove read-visibility both ways: mock TRUE -> visible (1), FALSE -> hidden (0)
+                    mock_one("true",  f"SELECT is( (SELECT count(*) FROM {q})::int, 1, {desc('SELECT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True, preseed=pre)
+                    mock_one("false", f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True, preseed=pre)
+                else:      # couldn't synthesize a row -> weaker fallback, still sound
+                    mock_one("true",  f"SELECT is( (SELECT count(*) FROM {q})::int, {total_rows}, {desc('SELECT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", False)
+                    mock_one("false", f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", False)
+                return
             if cmd == "INSERT":
-                icols = nobody_ins or prow
-                if icols is None: return
-                ins = (f"INSERT INTO {q}({', '.join(icols)}) VALUES ({', '.join(icols.values())})"
-                       if icols else f"INSERT INTO {q} DEFAULT VALUES")
+                icols = srow if recipe else (nobody_ins or prow)
+                pre_ins = setup if recipe else parents   # parents + CHECK-UDF neutralizers active during the action insert
+                if not icols: return
+                ins = f"INSERT INTO {q}({', '.join(icols)}) VALUES ({', '.join(icols.values())})"
                 # mock TRUE -> WITH CHECK passes -> insert lives; mock FALSE -> WITH CHECK fails -> 42501
-                mock_one("true",  f"SELECT lives_ok( $$ {ins} $$, {desc('INSERT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True, preseed=parents)
-                mock_one("false", f"SELECT throws_ok( $$ {ins} $$, '42501', NULL, {desc('INSERT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True, preseed=parents)
+                mock_one("true",  f"SELECT lives_ok( $$ {ins} $$, {desc('INSERT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True, preseed=pre_ins)
+                mock_one("false", f"SELECT throws_ok( $$ {ins} $$, '42501', NULL, {desc('INSERT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True, preseed=pre_ins)
                 return
             if cmd == "UPDATE":
                 if not upd_col: return
-                action = f"UPDATE {q} SET {upd_col[0]}={fill(upd_col[1])}"
+                action = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
             else:
                 action = f"DELETE FROM {q}"
-            # UPDATE/DELETE need a row present to affect; seed one (parents + row) when there's no base seed
-            preseed = []
-            if not nobody_ins and prow is not None:
-                preseed = parents + [(f"INSERT INTO {q}({', '.join(prow)}) VALUES ({', '.join(prow.values())})"
-                                      if prow else f"INSERT INTO {q} DEFAULT VALUES")]
+            preseed = _exist_pre() or []   # UPDATE/DELETE need a row present to affect
             mock_one("true",  f"SELECT isnt_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True, preseed=preseed)
             mock_one("false", f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True, preseed=preseed)
         coltypes = {nn0: tt0 for (nn0, tt0, c0, h0) in cols}
@@ -1119,9 +1612,13 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                 if rn != gate["col"]: seedcols[rn] = fill(rt)
             seedrow = f"INSERT INTO {q}({', '.join(seedcols)}) VALUES ({', '.join(seedcols.values())})"
             if cmd == "UPDATE":
-                wc = upd_col
-                if not wc or wc[0] == gate["col"]: return True   # gate owned, but no safe col to UPDATE -> emit nothing (honest), don't fall to the leaky identity loop
-                act = f"UPDATE {q} SET {wc[0]}={fill(wc[1])}"
+                # Update a NEUTRAL column (not the gated/scope column): SET gate_col would test scope-movement,
+                # not the UPDATE grant. Prefer the global upd_col if it isn't the gate col, else pick any plain
+                # non-gate, non-FK, non-unique column (e.g. `body` on a GUC-scoped `items`).
+                wc = upd_col if (upd_col and upd_col[0] != gate["col"]) else next(
+                    ((n0, t0) for (n0, t0, c0, h0) in cols if not h0 and n0 != gate["col"] and n0 not in unique_cols and n0 not in _fk_cols), None)
+                if not wc: return True   # no neutral column to UPDATE without touching the gated column -> honest skip
+                act = f"UPDATE {q} SET {wc[0]}={_upd_val(wc[0], wc[1])}"
             elif cmd == "DELETE": act = f"DELETE FROM {q}"
             elif cmd == "INSERT": act = seedrow
             else: act = None
@@ -1134,11 +1631,14 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                 arrange = [f"DELETE FROM {q}"] + ([] if cmd == "INSERT" else [seedrow])
                 if cmd == "SELECT":
                     o = _probe(conn, arrange, pid, "read", f"SELECT count(*) FROM {q}")
-                    asrt = (f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s)')} );" if o[0] == "count"
-                            else f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );")
+                    if o[2]: asrt = _unrel_fail(desc, "SELECT: " + who, o)
+                    else: asrt = (f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s)')} );" if o[0] == "count"
+                                  else f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );")
                 else:
                     o = _probe(conn, arrange, pid, "write", act)
-                    if o[0] == "err": asrt = f"SELECT throws_ok( $$ {act} $$, '{o[1]}', NULL, {desc(cmd + ': ' + who + ' denied (' + o[1] + ')')} );"
+                    if o[2]: asrt = _unrel_fail(desc, cmd + ": " + who, o)
+                    elif o[0] == "err" and o[1] != "42501": asrt = _unrel_fail(desc, cmd + ": " + who, ("err", o[1], "the test action raised " + o[1] + ", a constraint/validity error (not the RLS denial 42501) — the probe's own value, not a policy result"))
+                    elif o[0] == "err": asrt = f"SELECT throws_ok( $$ {act} $$, '{o[1]}', NULL, {desc(cmd + ': ' + who + ' denied (' + o[1] + ')')} );"
                     elif o[0] == "rows" and o[1] >= 1: asrt = f"SELECT isnt_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affected ' + str(o[1]) + ' row(s)')} );"
                     else: asrt = f"SELECT is_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affects 0 rows')} );"
                 n[0] += 1
@@ -1179,8 +1679,9 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                 pidl = (["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"] if role == "anon"
                         else [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true)", "SET LOCAL ROLE authenticated"])
                 o = _probe(conn, arrange, pidl, "read", f"SELECT count(*) FROM {q}")
-                asrt = (f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s) (recursive hierarchy)')} );" if o[0] == "count"
-                        else f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );")
+                if o[2]: asrt = _unrel_fail(desc, "SELECT: " + who, o)
+                else: asrt = (f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s) (recursive hierarchy)')} );" if o[0] == "count"
+                              else f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );")
                 n[0] += 1
                 body.append("RESET ROLE;")
                 body.extend(a + ";" for a in arrange)
@@ -1190,13 +1691,107 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
             one("authenticated, not authorized", U2, "authenticated")
             one("anon", None, "anon")
             return True
+        def solve_emit(cmd, node=None):
+            """General fallback: derive a witness for an ARBITRARY predicate, VERIFY it against the DB, and
+            bake the observed grant/deny pair. With `node` given, solve THAT one predicate (per-min-term
+            fallback for an unhandled branch, BL-1); otherwise iterate the table's permissive policies (the
+            all-NT case). Skips opaque-fn tables (mock owns those). An unconfirmed witness bakes nothing -> NT."""
+            if udfs:
+                return False
+            if node is not None:
+                _cands = [node]
+            else:
+                _c = conn.cursor()
+                _c.execute("SELECT qual, with_check FROM pg_policies WHERE schemaname=%s AND tablename=%s AND cmd IN (%s,'ALL') AND permissive='PERMISSIVE'", (schema, table, cmd))
+                _cands = [_where(wc if (cmd == "INSERT" and wc) else qual) for (qual, wc) in _c.fetchall()]
+            _req, _bad = _synth_required_cols(conn, schema, table, fkmap)
+            if _bad:
+                return False
+            for expr_node in _cands:
+                if expr_node is None:
+                    continue
+                plan = _solve_predicate(expr_node, coltypes, enums)
+                if not plan or plan[0] is None or plan[1] is None:   # need BOTH a true and a false witness for a grant/deny pair
+                    continue
+                sat, fal = plan
+                def ctx_sql(ctx):
+                    base = {"role": ctx.get("role", "authenticated")}
+                    if ctx.get("sub"): base["sub"] = ctx["sub"]
+                    for keys, val in ctx["claims"]:
+                        _set_claim(base, keys, val)
+                    rowcols = {cc: _wv_lit(coltypes.get(cc, "text"), vv) for cc, vv in ctx["row"].items()}
+                    aux = []
+                    for a in ctx["aux"]:
+                        aux += _seed_one(a["table"], {k: f"'{v}'" for k, v in a["cols"].items()}, fkmap, colsmap, enums)
+                    return json.dumps(base), [f"SELECT set_config('{k}', '{v}', true)" for k, v in ctx["guc"].items()], rowcols, aux
+                s_claims, s_gucs, s_row, s_aux = ctx_sql(sat)
+                f_claims, f_gucs, f_row, f_aux = ctx_sql(fal)
+                parents, base_row = _mock_valid_row(schema, table, fkmap, colsmap, enums, checks, relchecks, compfks)
+                def rowins(over):
+                    rr = dict(base_row); rr.update(over)
+                    return f"INSERT INTO {q}({', '.join(rr)}) VALUES ({', '.join(rr.values())})"
+                def idsql(claims, gucs):
+                    return list(gucs) + [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true)", "SET LOCAL ROLE authenticated"]
+                if cmd == "SELECT":
+                    arr_t = [f"DELETE FROM {q}"] + parents + s_aux + [rowins(s_row)]
+                    arr_f = [f"DELETE FROM {q}"] + parents + f_aux + [rowins(f_row)]
+                    ot = _probe(conn, arr_t, idsql(s_claims, s_gucs), "read", f"SELECT count(*) FROM {q}")
+                    of = _probe(conn, arr_f, idsql(f_claims, f_gucs), "read", f"SELECT count(*) FROM {q}")
+                    if ot[2] or of[2] or not (ot[0] == "count" and ot[1] >= 1 and of[0] == "count" and of[1] == 0):
+                        continue   # DB didn't confirm the witness (or precondition unreliable) -> try the next policy, else stay NT
+                    n[0] += 1
+                    body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_t); body.extend(s + ";" for s in idsql(s_claims, s_gucs))
+                    body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, {ot[1]}, {desc('SELECT: authenticated, authorized sees its row(s) [solver]')} );")
+                    body.append("RESET ROLE;")
+                    n[0] += 1
+                    body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_f); body.extend(s + ";" for s in idsql(f_claims, f_gucs))
+                    body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized sees nothing [solver]')} );")
+                    body.append("RESET ROLE;"); body.append(reseed)
+                    return True
+                if cmd == "INSERT":
+                    act_t, act_f = rowins(s_row), rowins(f_row)
+                    arr_t = [f"DELETE FROM {q}"] + parents + s_aux
+                    arr_f = [f"DELETE FROM {q}"] + parents + f_aux
+                else:
+                    if cmd == "UPDATE":
+                        if not upd_col:
+                            continue
+                        act_t = act_f = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
+                    else:
+                        act_t = act_f = f"DELETE FROM {q}"
+                    arr_t = [f"DELETE FROM {q}"] + parents + s_aux + [rowins(s_row)]
+                    arr_f = [f"DELETE FROM {q}"] + parents + f_aux + [rowins(f_row)]
+                ot = _probe(conn, arr_t, idsql(s_claims, s_gucs), "write", act_t)
+                of = _probe(conn, arr_f, idsql(f_claims, f_gucs), "write", act_f)
+                if ot[2] or of[2] or not ((ot[0] == "rows" and ot[1] >= 1) and (of[0] == "err" or (of[0] == "rows" and of[1] == 0))):
+                    continue
+                n[0] += 1
+                body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_t); body.extend(s + ";" for s in idsql(s_claims, s_gucs))
+                body.append(f"SELECT {'lives_ok' if cmd == 'INSERT' else 'isnt_empty'}( $$ {act_t}{'' if cmd == 'INSERT' else ' RETURNING 1'} $$, {desc(cmd + ': authenticated, authorized may act [solver]')} );")
+                body.append("RESET ROLE;"); body.append(reseed)
+                n[0] += 1
+                body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_f); body.extend(s + ";" for s in idsql(f_claims, f_gucs))
+                if of[0] == "err":
+                    body.append(f"SELECT throws_ok( $$ {act_f} $$, '{of[1]}', NULL, {desc(cmd + ': authenticated, not authorized denied (' + of[1] + ') [solver]')} );")
+                else:
+                    body.append(f"SELECT is_empty( $$ {act_f} RETURNING 1 $$, {desc(cmd + ': authenticated, not authorized affects 0 rows [solver]')} );")
+                body.append("RESET ROLE;"); body.append(reseed)
+                return True
+            return False
+
         _cur = conn.cursor()   # every command that HAS a policy (analyzer's cmds may omit opaque-fn ones)
         _cur.execute("SELECT DISTINCT cmd FROM pg_policies WHERE schemaname=%s AND tablename=%s", (schema, table))
         _pol = set()
         for (_cm,) in _cur.fetchall():
             _pol |= set(_CMDS4) if _cm == "ALL" else ({_cm} if _cm in _CMDS4 else set())
         for cmd in [c for c in _CMDS4 if c in (set(cmds) | _pol)]:
-            classes = [c for c in per.get(cmd, {}).get("classes", []) if c["handled"]]
+            _all_cls = per.get(cmd, {}).get("classes", [])
+            classes = [c for c in _all_cls if c["handled"]]
+            # MIXED case: a classifiable policy AND a SEPARATE opaque-function policy OR'd together (permissive).
+            # The classifiable branch is probed below; without this the function branch would be left shadowed
+            # (NOT_TESTABLE, untested). Mock-wire it too so the function branch is proven to grant/deny, and so
+            # the report flags + highlights the mocking on those cells.
+            _shadowed_fn = bool(classes) and bool(udfs) and any((not cc.get("handled")) and "function" in (cc.get("reason") or "") for cc in _all_cls)
             if not classes:
                 gate = _synth_gate(conn, schema, table, cmd, coltypes)   # GUC / JWT-claim gate -> SET the input + SEED a match
                 if gate and synth_emit(cmd, gate):
@@ -1206,13 +1801,28 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                     continue
                 if udfs:                                                  # opaque function -> MOCK it (wiring)
                     mock_emit(cmd)
+                elif solve_emit(cmd):                                      # general witness solver (DB-verified) -> last resort before NOT_TESTABLE
+                    continue
+            elif _shadowed_fn:                                            # mixed: also wiring-test the shadowed opaque-fn branch
+                mock_emit(cmd)
+            # BL-1: a classifiable branch handled this command, but OTHER min-terms carry a novel (unclassified)
+            # atom (e.g. `owner=auth.uid() OR metadata @> '...'`). Solve each unhandled branch per-min-term and
+            # DB-verify it, so the novel branch is no longer silently dropped to NT. (not udfs: opaque-fn branches
+            # are mock-wired above, not solved.)
+            if classes and not udfs:
+                for _uc in [c for c in _all_cls if not c.get("handled") and c.get("raw_atoms")]:
+                    _ra = _uc["raw_atoms"]
+                    solve_emit(cmd, node=(_ra[0] if len(_ra) == 1 else {"BoolExpr": {"boolop": "AND_EXPR", "args": _ra}}))
             for who, cjson, role, c in identities(classes):
                 if cmd == "SELECT":
                     o = _probe(conn, arrange_stmts, pident(cjson, role), "read", f"SELECT count(*) FROM {q}")
-                    if o[0] == "count":
-                        read_test(cjson, role, f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s)')} );")
+                    if o[2]:
+                        _a = _unrel_fail(desc, "SELECT: " + who, o)
+                    elif o[0] == "count":
+                        _a = f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s)')} );"
                     else:
-                        read_test(cjson, role, f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );")
+                        _a = f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );"
+                    read_test(cjson, role, _a)
                     continue
                 if cmd == "INSERT":
                     icols = insert_plan[c["idx"]][1] if (c is not None and c["idx"] in insert_plan) else nobody_ins
@@ -1223,11 +1833,18 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                     # SET <plain non-FK col> = <literal>: needs ONLY the UPDATE privilege (a literal RHS
                     # avoids the SELECT-on-read requirement of `col=col`), and a non-FK col avoids an RI
                     # false-denial. upd_col already excludes FK/identity/handled cols.
-                    action = f"UPDATE {q} SET {upd_col[0]}={fill(upd_col[1])}"
+                    action = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
                 else:
                     action = f"DELETE FROM {q}"
                 o = _probe(conn, arrange_stmts, pident(cjson, role), "write", action)
-                if o[0] == "err":
+                if o[2]:
+                    mut_test(cjson, role, _unrel_fail(desc, cmd + ": " + who, o))
+                elif o[0] == "err" and o[1] != "42501":
+                    # the action raised a NON-RLS error (RLS denial is always 42501). e.g. a CHECK (23514),
+                    # FK (23503), NOT NULL (23502) or cast (22xxx) from our own SET/INSERT value -> the probe's
+                    # action was malformed, not a policy denial. Mark UNRELIABLE; never bake it as "denied".
+                    mut_test(cjson, role, _unrel_fail(desc, cmd + ": " + who, ("err", o[1], "the test action raised " + o[1] + ", a constraint/validity error (not the RLS denial 42501) — the probe's own value, not a policy result")))
+                elif o[0] == "err":
                     mut_test(cjson, role, f"SELECT throws_ok( $$ {action} $$, '{o[1]}', NULL, {desc(cmd + ': ' + who + ' denied (' + o[1] + ')')} );")
                 elif o[0] == "rows" and o[1] >= 1:
                     mut_test(cjson, role, f"SELECT isnt_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affected ' + str(o[1]) + ' row(s)')} );")
@@ -1250,7 +1867,7 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                                     continue
                                 _tact = f"UPDATE {q} SET {_vcol}='{_V}'::{_ctype}"
                                 _ov = _probe(conn, arrange_stmts, pident(cjson, role), "write", _tact)
-                                if _ov[0] == "rows" and _ov[1] >= 1:   # accepted a value its own policy forbids -> leak
+                                if _ov[0] == "rows" and _ov[1] >= 1 and not _ov[2]:   # accepted a value its own policy forbids -> leak (skip if precondition was unreliable)
                                     mut_test(cjson, role, f"SELECT throws_ok( $$ {_tact} $$, '42501', NULL, {desc('UPDATE: ' + who + ' can set ' + _vcol + '=' + _V + ', but policy [' + str(c.get('src_policy')) + '] WITH CHECK permits only {' + ', '.join(sorted(_allowed)) + '} -- cross-policy WITH CHECK leak [transition-leak]')} );")
 
     body_text = "\n".join(body)
@@ -1373,6 +1990,7 @@ BEGIN
     EXECUTE $b$ CREATE OR REPLACE FUNCTION public.throws_ok(text, text, text, text) RETURNS text LANGUAGE plpgsql AS $q$ BEGIN EXECUTE $1; RETURN public._rlsa_ok(false, $4); EXCEPTION WHEN OTHERS THEN RETURN public._rlsa_ok(SQLSTATE = $2, $4); END $q$ $b$;
     EXECUTE $b$ CREATE OR REPLACE FUNCTION public.is_empty(text, text) RETURNS text LANGUAGE plpgsql AS $q$ DECLARE r record; f boolean := false; BEGIN FOR r IN EXECUTE $1 LOOP f := true; EXIT; END LOOP; RETURN public._rlsa_ok(NOT f, $2); END $q$ $b$;
     EXECUTE $b$ CREATE OR REPLACE FUNCTION public.isnt_empty(text, text) RETURNS text LANGUAGE plpgsql AS $q$ DECLARE r record; f boolean := false; BEGIN FOR r IN EXECUTE $1 LOOP f := true; EXIT; END LOOP; RETURN public._rlsa_ok(f, $2); END $q$ $b$;
+    EXECUTE $b$ CREATE OR REPLACE FUNCTION public.fail(text) RETURNS text LANGUAGE sql AS $q$ SELECT public._rlsa_ok(false, $1) $q$ $b$;
   END IF;
 END
 $rlsa$;"""
@@ -1435,10 +2053,10 @@ def _exposed(cur, schema, table):
 def _effective_grants(cur, schema, table):
     """Real effective table access for the client roles: schema USAGE AND the per-command table privilege.
     Reads the catalog (no mutation). A missing grant => that command is denied regardless of RLS."""
-    cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('authenticated','anon')")
+    cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('authenticated','anon','service_role')")
     present = {r[0] for r in cur.fetchall()}
     g = {}
-    for role in ("authenticated", "anon"):
+    for role in ("authenticated", "anon", "service_role"):
         if role not in present:
             for cmd in _CMDS4: g[(role, cmd)] = False
             continue
@@ -1452,31 +2070,72 @@ def _effective_grants(cur, schema, table):
     return g
 
 
+def _action_table(sql):
+    """Best-effort table the action runs against (FROM/INTO/UPDATE x) — used for the post-arrange invariant."""
+    m = re.search(r"\b(?:from|into|update)\s+([a-zA-Z_][\w$.\"]*)", sql or "", re.I)
+    return m.group(1) if m else None
+
+
+def _unrel_fail(desc_fn, label, o):
+    """A loud, never-passing pgTAP line for a test whose precondition could not be established. We still
+    PROBED (the observation is shown in the message), but a failed precondition must never masquerade as a
+    pass -- so this asserts failure and is tagged UNRELIABLE for the report + CI gate to pick up."""
+    obs = (str(o[0]) + "=" + str(o[1])) if o[0] != "err" else ("error " + str(o[1]))
+    return "SELECT fail( " + desc_fn("UNRELIABLE - " + label + ": " + str(o[2]) + " [probe observed " + obs + "]; precondition not established - investigate seeding") + " );"
+
+
 def _probe(conn, arrange, ident_sqls, kind, action_sql):
-    """Run ONE identity x command at generation time on a COPY and observe the real outcome
-    (arrange -> become identity -> act), then roll everything back. Returns:
-      ('count', n) for a read, ('rows', n) for a write that ran, ('err', sqlstate) for a denial/error.
-    This is how the generator PROVES effective access (grant AND RLS) instead of inferring it."""
+    """Run ONE identity x command at generation time and OBSERVE the real outcome (arrange -> become
+    identity -> act), then roll everything back. Returns a 3-tuple (kind, val, unreliable):
+      kind/val : ('count', n) read · ('rows', n) write · ('err', sqlstate) denial/error AT ACT TIME
+      unreliable: None, or a reason string when the test's PRECONDITION could not be established.
+
+    Two design points that keep probe-and-bake honest:
+      * Each arrange statement runs in its OWN savepoint, so a BENIGN seed error (e.g. a redundant
+        duplicate insert) does not abort the probe -- we still proceed to the action and bake what we
+        actually observe, rather than screaming at the first hiccup.
+      * Post-arrange INVARIANT: if we intended to seed the acted-on table but it ends up empty, the
+        precondition failed -> `unreliable` is set. The caller then bakes a LOUD, failing test that
+        shows the observation but is never a silent pass -- a real seeding failure can no longer be
+        mis-baked as a policy denial."""
     cur = conn.cursor()
     cur.execute("SAVEPOINT _rlsa_probe")
-    result = ("err", "XX000")
+    def _done(kind, val, unreliable):
+        try: cur.execute("ROLLBACK TO SAVEPOINT _rlsa_probe"); cur.execute("RELEASE SAVEPOINT _rlsa_probe")
+        except Exception: pass
+        return (kind, val, unreliable)
+    try: cur.execute("RESET ROLE")
+    except Exception: pass
+    seed_err = None
+    for s in arrange:                                            # per-statement isolation: tolerate benign seed errors
+        if not s.strip(): continue
+        cur.execute("SAVEPOINT _rlsa_seed")
+        try:
+            cur.execute(s); cur.execute("RELEASE SAVEPOINT _rlsa_seed")
+        except Exception as e:
+            seed_err = seed_err or (getattr(e, "sqlstate", None) or "XX000")
+            try: cur.execute("ROLLBACK TO SAVEPOINT _rlsa_seed")
+            except Exception: pass
+    unreliable = None                                            # post-arrange invariant
+    tgt = _action_table(action_sql)
+    if tgt and any(re.search(r"insert\s+into\s+" + re.escape(tgt), s or "", re.I) for s in arrange):
+        try:
+            cur.execute(f"SELECT count(*) FROM {tgt}")
+            if int(cur.fetchone()[0]) == 0:
+                unreliable = "seeded 0 rows in " + tgt + (f" (seed error {seed_err})" if seed_err else "")
+        except Exception as e:
+            unreliable = "precondition check failed (" + (getattr(e, "sqlstate", None) or "XX000") + ")"
     try:
-        cur.execute("RESET ROLE")
-        for s in arrange:
-            if s.strip(): cur.execute(s)
-        for s in ident_sqls:
-            cur.execute(s)
-        if kind == "read":
-            cur.execute(action_sql); result = ("count", int(cur.fetchone()[0]))
-        else:
-            cur.execute(action_sql); result = ("rows", cur.rowcount)
+        for s in ident_sqls: cur.execute(s)
     except Exception as e:
-        result = ("err", getattr(e, "sqlstate", None) or "XX000")
+        ss = getattr(e, "sqlstate", None) or "XX000"
+        return _done("err", ss, unreliable or ("identity setup failed (" + ss + ")"))
     try:
-        cur.execute("ROLLBACK TO SAVEPOINT _rlsa_probe"); cur.execute("RELEASE SAVEPOINT _rlsa_probe")
-    except Exception:
-        pass
-    return result
+        if kind == "read":
+            cur.execute(action_sql); return _done("count", int(cur.fetchone()[0]), unreliable)
+        cur.execute(action_sql); return _done("rows", cur.rowcount, unreliable)
+    except Exception as e:
+        return _done("err", getattr(e, "sqlstate", None) or "XX000", unreliable)
 
 
 def _policy_bool_udfs(conn, schema, table):
@@ -1501,7 +2160,10 @@ def _policy_bool_udfs(conn, schema, table):
 
 def _synth_required_cols(conn, schema, table, fkmap):
     """NOT NULL, no-default, non-identity/generated columns (must be filled to insert a row).
-    Returns (cols list of (name,type), has_unsatisfiable_fk) — bail if a required col is a FK we can't parent."""
+    Returns (cols list of (name,type), False). The second value used to bail when a required col was a FK,
+    but the seeders (_mock_valid_row / _seed_one) now seed FK parents (transitively, ON CONFLICT) and the
+    probe VERIFIES the seed, so a required FK is no longer a reason to skip the solver — if seeding still
+    fails, the probe's arrange-error path leaves it NT (never a false pass). Kept as a 2-tuple for callers."""
     cur = conn.cursor()
     cur.execute("""SELECT a.attname, format_type(a.atttypid,a.atttypmod)
         FROM pg_attribute a
@@ -1509,8 +2171,7 @@ def _synth_required_cols(conn, schema, table, fkmap):
           AND a.attnotnull AND a.attidentity='' AND a.attgenerated=''
           AND NOT EXISTS (SELECT 1 FROM pg_attrdef d WHERE d.adrelid=a.attrelid AND d.adnum=a.attnum)""", (schema, table))
     req = [(r[0], r[1]) for r in cur.fetchall()]
-    fk_cols = set(fkmap.get(f"{schema}.{table}", {}))
-    return req, any(c in fk_cols for c, _ in req)
+    return req, False
 
 
 def _synth_gate(conn, schema, table, cmd, coltypes):
@@ -1580,15 +2241,27 @@ def _load_ctx(cur, schema, table):
         JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=ANY(i.indkey)
         WHERE n.nspname=%s AND c.relname=%s AND i.indisunique AND array_length(i.indkey,1)=1""", (schema, table))
     unique_cols = {r[0] for r in cur.fetchall()}
+    for tbl in list(colsmap):   # load composite-FK parents (single-col parents are already loaded by load())
+        s2, t2 = _sq(tbl)
+        for cf in _constraint_meta(cur, s2, t2)[3]:
+            load(cf["parent"])
+    checks, cuniques, relchecks, compfks = {}, {}, {}, {}   # per-table constraint metadata for seeding
+    for tbl in list(colsmap):
+        s2, t2 = _sq(tbl); ck, cu, rc, cf = _constraint_meta(cur, s2, t2)
+        if ck: checks[tbl] = ck
+        if cu: cuniques[tbl] = cu
+        if rc: relchecks[tbl] = rc
+        if cf: compfks[tbl] = cf
     cov, tot = coverage(per, cmds)
     grants = _effective_grants(cur, schema, table)
     return dict(per=per, cmds=cmds, notes=notes, cols=cols, fkmap=fkmap, colsmap=colsmap,
-                enums=enums, unique_cols=unique_cols, cov=cov, tot=tot, grants=grants)
+                enums=enums, unique_cols=unique_cols, cov=cov, tot=tot, grants=grants,
+                checks=checks, cuniques=cuniques, relchecks=relchecks, compfks=compfks)
 
 
 def _emit_both(schema, table, ctx, helpers, conn=None):
     nt = "".join(f"-- FOOTGUN NOTE: {x}\n" for x in ctx["notes"])
-    args = (schema, table, ctx["per"], ctx["cmds"], ctx["cols"], ctx["fkmap"], ctx["colsmap"], ctx["enums"], ctx["unique_cols"])
+    args = (schema, table, ctx["per"], ctx["cmds"], ctx["cols"], ctx["fkmap"], ctx["colsmap"], ctx["enums"], ctx["unique_cols"], ctx["checks"], ctx["cuniques"], ctx["relchecks"], ctx["compfks"])
     return nt + emit_flat(*args, helpers=helpers, grants_map=ctx.get("grants"), conn=conn), nt + emit(*args)
 
 
@@ -1645,15 +2318,18 @@ def _table_report(cur, conn, schema, table, helpers):
         for st in _split_statements(flat):
             if not st.strip() or _REPORT_SKIP.match(st):
                 continue
-            cur.execute(st)
-            if cur.description:
-                try:
+            cur.execute("SAVEPOINT _rlsa_rep")   # per-statement isolation: a failing SEED must not abort the
+            try:                                  # whole battery -> the UNRELIABLE fail() assertions still run
+                cur.execute(st)
+                if cur.description:
                     for r in cur.fetchall():
                         v = r[0]
                         if isinstance(v, str) and (v.startswith("ok") or v.startswith("not ok")):
                             taplines.append(v)
-                except Exception:
-                    pass
+                cur.execute("RELEASE SAVEPOINT _rlsa_rep")
+            except Exception:
+                try: cur.execute("ROLLBACK TO SAVEPOINT _rlsa_rep")
+                except Exception: pass
     except Exception:
         pass
     finally:
@@ -1661,11 +2337,20 @@ def _table_report(cur, conn, schema, table, helpers):
     cells = {}
     idgrid = {}   # cmd -> { identity -> {"exp": <should-be-able>, "pass": <test passed>} }
     leak_msgs = []   # cross-policy WITH CHECK transition leaks (baked as failing throws_ok lines)
+    unreliable_msgs = []   # tests whose precondition (seed) could not be established -> not trustworthy
+    unreliable_cells = set()
     for ln in taplines:
         first = ln.strip().split("\n", 1)[0]   # a FAILING pgTAP test returns 'not ok' + '#'-diagnostic lines; parse the 'not ok' line only
         m = re.match(r"(ok|not ok)\b.*?-\s*(.*)$", first)
         if not m: continue
         passed = m.group(1) == "ok"; label = m.group(2)
+        if "UNRELIABLE" in label:                              # precondition (seed) failed -> not a grant/deny cell; flag it
+            unreliable_msgs.append(label)
+            _lowu = label.lower()
+            _cmdu = next((c for c in _CMDS4 if c in label.upper()), None)
+            _idu = ("anon" if "anon" in _lowu else "other" if any(k in _lowu for k in ("not authoriz", "other user", "non-owner", "unauthorized")) else "authorized")
+            if _cmdu: unreliable_cells.add((_cmdu, _idu))
+            continue
         if "[transition-leak]" in label:                       # value-space leak; tracked separately, not a per-command cell
             if not passed: leak_msgs.append(label.replace(" [transition-leak]", ""))
             continue
@@ -1685,7 +2370,7 @@ def _table_report(cur, conn, schema, table, helpers):
         else:
             ident = "authorized"
         # can/blocked from the observed outcome (probe labels) or the derived wording (fallback)
-        if any(k in low for k in ("denied", " 0 row", "sees nothing", "blocks", "cannot")):
+        if any(k in low for k in ("denied", " 0 row", "sees nothing", "blocks", "blocked", "cannot")):
             exp = False
         elif any(k in low for k in ("sees all", "public", "permits", "row(s)", "may ", " can ")):
             exp = True
@@ -1706,9 +2391,13 @@ def _table_report(cur, conn, schema, table, helpers):
         notes.append("BROKEN POLICY: a policy queries its own table (self-referential) -> Postgres raises 'infinite recursion detected in policy' -> the table is UNREADABLE by everyone. Use a SECURITY DEFINER helper function instead.")
     if leak_msgs:
         notes.append("SECURITY HOLE - cross-policy WITH CHECK leak (Postgres OR-combines every permissive policy's WITH CHECK, so an authorized identity can write a value only a DIFFERENT policy intended): " + "; ".join(sorted(set(leak_msgs))))
+    if unreliable_msgs:
+        notes.append("UNRELIABLE TEST(S) - the test precondition (seed) could not be established for some identity/command, so the result is NOT trustworthy and the suite fails loudly rather than asserting a possibly-wrong outcome (investigate seeding): " + "; ".join(sorted(set(s.replace("UNRELIABLE - ", "") for s in unreliable_msgs))))
+    if "UPDATE" in pol and not idgrid.get("UPDATE", {}).get("authorized") and ("UPDATE", "authorized") not in unreliable_cells:
+        notes.append("UPDATE not fully tested - no policy-neutral column to modify (every column is PK / FK / unique or referenced by a policy), so the plain UPDATE grant could not be probed by SETting a harmless column. The '-' for UPDATE is a coverage gap, not a pass; review manually.")
     return {"table": table, "rls_enabled": rls_on, "policied": sorted(pol),
             "cells": cells, "idgrid": idgrid, "footguns": notes, "coverage": [ctx["cov"], ctx["tot"]],
-            "transition_leaks": leak_msgs}
+            "transition_leaks": leak_msgs, "unreliable": sorted(set(unreliable_msgs)), "unreliable_cells": unreliable_cells}
 
 
 def emit_rls_guard(cur, schema):
@@ -1744,18 +2433,30 @@ def _id_cell(rep, ident, cmd):
     glyph: ✓ can · blocked ✗ should-be-allowed-but-blocked.  class 'danger' = can-but-shouldn't (hole)."""
     rls_on = rep["rls_enabled"]; policied = rep.get("policied", []); exposed = rep.get("exposed")
     if ident == "service_role":
+        # service_role bypasses RLS, but BYPASSRLS does NOT grant table privileges — it still needs the GRANT.
+        # Show ✓ only when it actually holds the grant; otherwise even the service key is denied.
+        g = rep.get("grants")
+        if g is not None and not g.get(("service_role", cmd), True):
+            return ("·", "none", f"service_role has no {cmd} grant on this table — even the service key is denied (grant it if your backend needs it)")
         return ("✓", "svc", "service_role bypasses RLS — full, unfiltered access")
     if not rls_on:
+        # RLS off -> access is governed PURELY by GRANTs. A command is an unfiltered hole ONLY if the role
+        # actually holds that command's privilege; a missing grant blocks it. Use the per-command grant map
+        # (both authenticated identities are the SAME `authenticated` role) rather than a blanket flag.
+        role = "anon" if ident == "anon" else "authenticated"
+        g = rep.get("grants")
+        if g is not None:
+            if g.get((role, cmd)):
+                return ("✓", "danger", f"RLS off and {role} holds the {cmd} grant — every row is {('readable' if cmd=='SELECT' else 'writable')} unfiltered (no policy constrains it)")
+            return ("·", "none", f"RLS off, but {role} has no {cmd} grant — blocked for this command")
+        # fallback (no grant map): the old table-level heuristic
         if ident == "anon":
-            if cmd == "SELECT":
-                return ("✓", "danger", "RLS off — anon can read every row") if exposed else ("·", "none", "anon has no table grant")
-            return ("·", "none", "anon has no write grant")
-        # authorized / other == authenticated identities; RLS off = unfiltered
-        if exposed:
-            return ("✓", "danger", "RLS off — any authenticated user has unfiltered access")
-        return ("·", "none", "RLS off, but no client grant — unreachable via the API")
+            return ("✓", "danger", "RLS off — anon can read every row") if (exposed and cmd == "SELECT") else ("·", "none", "anon has no grant for this command")
+        return ("✓", "danger", "RLS off — any authenticated user has unfiltered access") if exposed else ("·", "none", "RLS off, but no client grant — unreachable via the API")
     if cmd not in policied:
         return ("·", "none", "no policy for this command (implicit deny)")
+    if (cmd, ident) in rep.get("unreliable_cells", set()):
+        return ("‼", "unrel", "UNRELIABLE — the test precondition (seed) could not be established, so this result is NOT trustworthy (the suite fails loudly here; see notes)")
     g = rep.get("idgrid", {}).get(cmd, {}).get(ident)
     if not g:
         if ident == "anon" and cmd != "SELECT":
@@ -1796,7 +2497,7 @@ def render_report_text(reps):
         for fn in r["footguns"]:
             out.append(f"    ! footgun: {fn}")
         out.append("")
-    out.append("legend: ✓ can · blocked/none ✗ should-be-allowed-but-blocked  ✓! = should be blocked but CAN (security hole)  – not tested")
+    out.append("legend: ✓ can · blocked/none ✗ should-be-allowed-but-blocked  ✓! = should be blocked but CAN (security hole)  ‼ UNRELIABLE (seed/precondition failed — not trustworthy)  – not tested")
     out.append("service_role bypasses RLS by design (always full access).")
     out.append("note: 'authenticated, authorized' and 'authenticated, not authorized' are the SAME Postgres role (authenticated) under different JWT identities/claims — NOT separate DB roles. Only service_role, authenticated and anon are real Postgres roles; 'authorized' vs 'not authorized' is the policy outcome for that identity.")
     out.append("")
@@ -1810,7 +2511,7 @@ def render_report_html(reps, schema):
     exposed = [r["table"] for r in reps if not r["rls_enabled"] and r.get("exposed")]
     offsafe = [r["table"] for r in reps if not r["rls_enabled"] and not r.get("exposed")]
     def has_hole(r):
-        return any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _ID_ROWS for c in _CMDS4)
+        return any(_id_cell(r, k, c)[1] in ("danger", "fail", "unrel") for k, _ in _ID_ROWS for c in _CMDS4)
     holes = [r["table"] for r in reps if has_hole(r)]
     ok_tables = [r for r in reps if r["rls_enabled"] and not has_hole(r)]
     # order: tables with holes/exposure first, then the rest
@@ -1861,6 +2562,7 @@ def render_report_html(reps, schema):
  .pass{{background:#dcfce7;color:#15803d}} .none{{color:#94a3b8}} .na{{color:#94a3b8}}
  .svc{{background:#f1f5f9;color:#475569}}
  .danger{{background:#dc2626;color:#fff;font-weight:700}} .fail{{background:#fee2e2;color:#b91c1c;font-weight:700}}
+ .unrel{{background:#fde68a;color:#92400e;font-weight:700}}
  ul.flags{{margin:.4rem 0 0;padding-left:1.1rem;color:#92400e;font-size:.85rem}}
  .legend{{color:#666;font-size:.85rem;margin-top:1.5rem;max-width:48rem}}
  .footer{{color:#888;font-size:.8rem;margin-top:1.2rem;border-top:1px solid #eee;padding-top:.6rem}}
@@ -1873,7 +2575,8 @@ def render_report_html(reps, schema):
 <p class="legend"><b>Each row is an identity, each column a command.</b>
  <span class="c pass">✓</span> can &middot; <span class="c none">·</span> blocked &middot;
  <span class="c danger">✓</span> can but <b>should be blocked</b> (security hole) &middot;
- <span class="c fail">✗</span> should be allowed but is blocked &middot; – not tested.
+ <span class="c fail">✗</span> should be allowed but is blocked &middot;
+ <span class="c unrel">‼</span> UNRELIABLE — seed/precondition failed, result not trustworthy &middot; – not tested.
  <b>service_role</b> bypasses RLS by design. “Enforced as declared” means the database behaves the way your
  policies say — not that the policies are what you intended.</p>
 <p class="legend"><b>About the identities:</b> <code>authenticated, authorized</code> and
@@ -2418,6 +3121,7 @@ def main():
     ap.add_argument("--flat", help="single-table: write native flat pgTAP here")
     ap.add_argument("--setup", help="single-table: write 000-setup-tests-hooks.sql here")
     ap.add_argument("--describe", action="store_true")
+    ap.add_argument("--debug-unhandled", action="store_true", help="read-only: list every policy branch the CLASSIFIER couldn't recognize (table, command, policy, shape) across the schema — to triage parsing gaps")
     ap.add_argument("--no-helpers", action="store_true", help="emit fully self-contained tests (no tests.* helpers / no 000-hook)")
     ap.add_argument("--db-url", help="Postgres connection string (else uses PG* env)")
     ap.add_argument("--report", action="store_true", help="run the suite and print the grant/deny coverage matrix")
@@ -2443,6 +3147,27 @@ def main():
         )
     report_gate = 0   # exit code for the report/emit paths (1 if CI-gating problems found)
     with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
+        if a.debug_unhandled:   # read-only triage: which policy branches does the classifier drop to NOT_TESTABLE?
+            tabs2 = [a.table] if a.table else rls_tables(cur, a.schema)
+            rows_out = []
+            for t in sorted(tabs2):
+                try:
+                    _pols, _per, _cmds2, _notes = analyze(cur, a.schema, t)
+                except Exception as e:
+                    print(f"  {a.schema}.{t}: analyze error: {e}"); continue
+                for cmd in _cmds2:
+                    for c in _per[cmd]["classes"]:
+                        if not c.get("handled"):
+                            rows_out.append((t, cmd, c.get("src_policy") or "?", c.get("reason") or "?"))
+            if not rows_out:
+                print(f"No unclassified policy branches in schema {a.schema} — every branch is handled by the classifier.")
+            else:
+                print(f"Unclassified policy branches in schema {a.schema} ({len(rows_out)}):\n")
+                for (t, cmd, pol, reason) in rows_out:
+                    print(f"  {a.schema}.{t}  {cmd:<6}  policy [{pol}]  ->  {reason}")
+                print("\nNote: these are the CLASSIFIER's gaps. The per-min-term solver (BL-1) may still emit a")
+                print("DB-verified grant/deny for them at --report/--emit time; run --report to see which stay '-'.")
+            return
         if a.report or a.html:
             if a.table:
                 cur.execute("""SELECT c.relrowsecurity, EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid=c.oid)
@@ -2464,6 +3189,7 @@ def main():
                     rep = {"table": t, "rls_enabled": rls_on, "policied": [], "cells": {}, "footguns": fg, "coverage": [0, 0]}
                 rep["has_policy"] = has_pol
                 rep["exposed"] = (not rls_on) and _exposed(cur, a.schema, t)
+                rep["grants"] = _effective_grants(cur, a.schema, t)   # per-command grants for ALL roles (incl service_role) — every cell is grant-gated
                 return rep
 
             n_parallel = max(1, getattr(a, "parallel", 1))
@@ -2508,12 +3234,14 @@ def main():
                          if any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _ID_ROWS for c in _CMDS4)]
             broken_any = [r["table"] for r in reps if any("BROKEN POLICY" in f for f in r.get("footguns", []))]
             leak_any = [r["table"] for r in reps if r.get("transition_leaks")]
-            if exposed_any or holes_any or broken_any or leak_any:
+            unreliable_any = [r["table"] for r in reps if r.get("unreliable")]
+            if exposed_any or holes_any or broken_any or leak_any or unreliable_any:
                 bits = []
                 if exposed_any: bits.append(f"{len(exposed_any)} exposed table(s): {', '.join(exposed_any)}")
                 if holes_any:   bits.append(f"{len(holes_any)} table(s) with policy holes/failures: {', '.join(holes_any)}")
                 if broken_any:  bits.append(f"{len(broken_any)} broken/unreadable table(s): {', '.join(broken_any)}")
                 if leak_any:    bits.append(f"{len(leak_any)} table(s) with cross-policy WITH CHECK leaks: {', '.join(leak_any)}")
+                if unreliable_any: bits.append(f"{len(unreliable_any)} table(s) with UNRELIABLE tests (seed/precondition failed): {', '.join(unreliable_any)}")
                 print("\nFAIL: " + "; ".join(bits) + ("" if a.no_fail else "  (exit 1 — CI gate; pass --no-fail to suppress)"))
                 report_gate = 0 if a.no_fail else 1
             # ── --as-user: probe from a real auth.users identity ──────────────
