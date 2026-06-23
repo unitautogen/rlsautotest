@@ -85,7 +85,12 @@ jobs:
           # "– not tested" or bake the seed error as a policy denial. Failing to is a regression in the
           # probe's arrange/act split or the post-arrange invariant.
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/seedfail.sql
-          if rlsautotest --db-url "$DATABASE_URL" --schema seedfail --report | tee /tmp/sf.txt; then
+          # Capture the gate's REAL exit code. `rlsautotest ... | tee file` would report tee's exit (0)
+          # as the pipeline status and MASK rlsautotest's non-zero gate exit, so redirect to a file and
+          # read $? directly instead of piping.
+          rlsautotest --db-url "$DATABASE_URL" --schema seedfail --report > /tmp/sf.txt 2>&1; rc=$?
+          cat /tmp/sf.txt
+          if [ "$rc" -eq 0 ]; then
             echo "FAIL: an un-seedable table did NOT fail the gate"
             exit 1
           fi
@@ -100,7 +105,10 @@ jobs:
           # filler can't satisfy -> UNRELIABLE, never a false "denied"), t3 (no neutral column -> explained
           # "–"). The gate must flag it (t2 UNRELIABLE), and the no-neutral-column note must appear (t3).
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/updcheck.sql
-          if rlsautotest --db-url "$DATABASE_URL" --schema updcheck --report | tee /tmp/uc.txt; then
+          # Redirect (don't pipe to tee) so $? is rlsautotest's gate exit, not tee's 0.
+          rlsautotest --db-url "$DATABASE_URL" --schema updcheck --report > /tmp/uc.txt 2>&1; rc=$?
+          cat /tmp/uc.txt
+          if [ "$rc" -eq 0 ]; then
             echo "FAIL: updcheck did not fail the gate (expected t2 UNRELIABLE)"
             exit 1
           fi

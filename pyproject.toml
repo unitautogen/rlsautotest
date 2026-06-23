@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rlsautotest"
-version = "0.1.4"
+version = "0.1.5"
 description = "Deterministic pgTAP test generation for Postgres/Supabase Row-Level Security (RLS) policies."
 readme = "README.md"
 license = { text = "Apache-2.0" }
