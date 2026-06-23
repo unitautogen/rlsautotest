@@ -6,14 +6,8 @@ roughly follow semantic versioning.
 
 ## [0.1.5] — 2026-06-24
 
-### Fixed
-- **CI integration workflow.** The negative-gate test steps (`seedfail`, `updcheck`) piped the gate's
-  output through `tee`, so the pipeline reported `tee`'s exit code (always 0) and masked the tool's real
-  non-zero gate exit — turning a correctly-failing gate into a red "did NOT fail the gate" step. They now
-  capture the exit code via redirect instead of a pipe. No change to the tool itself; `0.1.4`'s behaviour
-  was correct (the gate did exit non-zero) — only the workflow's exit-code check was wrong.
-
-## [0.1.4] — 2026-06-23
+First release since 0.1.2. (An interim 0.1.4 was committed but never published — its CI was red — so all of
+its changes are folded into this entry.)
 
 ### Added
 - **Probe-and-repair seed synthesizer.** Builds a valid row to test against even when a table's
@@ -53,6 +47,10 @@ roughly follow semantic versioning.
   overwritten by a generic foreign-key fill.
 - The general solver no longer skips tables that have a required foreign-key column, and emits
   type-valid witness values for `timestamp`/`date` columns.
+- **CI integration workflow.** The negative-gate test steps (`seedfail`, `updcheck`) now capture the
+  gate's exit code with `|| rc=$?` — no masking `tee` pipe, and exempt from `set -e` (a bare `cmd; rc=$?`
+  aborts the step on the gate's expected non-zero before the code is read). Tooling behaviour was already
+  correct; only the workflow's exit-code check was wrong.
 
 ### Changed
 - Removed all "read-only" / "safe to run on production" claims. The tool seeds rows and runs
