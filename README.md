@@ -28,12 +28,7 @@ _Running the suite - on a local Supabase (`supabase test db`), `pg_prove`, or in
 
 **Path B - generate a suite to commit + run in CI:** generate native pgTAP and run it with `pg_prove` (video).
 
-<!-- PASTE THE PATH B VIDEO HERE:
-     1. Open this README on github.com and click the pencil (Edit).
-     2. Click on the empty line just below this comment.
-     3. Drag "Path B.mp4" into the editor; wait for it to finish uploading.
-     4. GitHub inserts a https://github.com/user-attachments/assets/... line - leave it as is.
-     5. Delete this comment block (optional), then Commit changes. -->
+https://github.com/user-attachments/assets/37103556-d097-4b71-8b8d-2f160b80bbba
 
 ## What it does
 
