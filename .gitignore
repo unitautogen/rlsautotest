@@ -14,11 +14,18 @@ CLAUDE.md
 # internal design docs / backlog — not for the public repo (like CLAUDE.md)
 PARSING_IMPROVEMENTS.md
 PARSING_BACKLOG.md
-# private working set of real-world test schemas (uncomment to keep out of the public repo)
-# test-schemas/
+WITNESS_BACKLOG.md
+PROJECT_BACKLOG.md
+witness_survey.md
+# internal showcase / candidate analysis (references the private schemas + competitive/launch framing)
+RLSAutotest_schema_showcase.md
+RLSAutotest_showcase_candidates.md
+# private working set of real-world test schemas — kept OUT of the public repo
+test-schemas/
 # scratch / generated report + emitted-suite artifacts
 *.html
 .pytest_cache/
 rls-tests/
+*-rls-tests/
 rls_suite/
 rls_helper/

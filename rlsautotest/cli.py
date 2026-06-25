@@ -201,29 +201,88 @@ def _eq_pairs(n):
     return out
 
 
+def _and_conjuncts(n):
+    """Flatten an AND-tree of WHERE conjuncts to a list of leaves. OR anywhere -> None (can't soundly falsify a
+    disjunction in a subquery). A NOT node is kept as a single leaf (classified downstream by `_bool_extra`)."""
+    if not isinstance(n, dict):
+        return []
+    if _t(n) == "BoolExpr":
+        op = _v(n).get("boolop")
+        if op == "AND_EXPR":
+            out = []
+            for a in _v(n).get("args", []):
+                sub = _and_conjuncts(a)
+                if sub is None:
+                    return None
+                out += sub
+            return out
+        if op == "OR_EXPR":
+            return None
+        return [n]   # NOT_EXPR -> a single leaf
+    return [n]
+
+
+def _bool_extra(c, alias):
+    """A boolean subquery-WHERE conjunct on a single subquery column -> (col, 'true'|'false'); else None.
+    Covers a bare boolean column (`can_read`), `NOT col`, and `col IS TRUE|FALSE`."""
+    if _t(c) == "ColumnRef":
+        q, col = _colqual(c)
+        if col and q in (alias, None):
+            return (col, "true")
+    if _t(c) == "BoolExpr" and _v(c).get("boolop") == "NOT_EXPR":
+        a = _v(c).get("args", [])
+        if a and _t(a[0]) == "ColumnRef":
+            q, col = _colqual(a[0])
+            if col and q in (alias, None):
+                return (col, "false")
+    if _t(c) == "BooleanTest":
+        v = _v(c); col = _colname(v.get("arg")); bt = v.get("booltesttype")
+        if col and bt in ("IS_TRUE", "IS_FALSE"):
+            return (col, "true" if bt == "IS_TRUE" else "false")
+    return None
+
+
 def _membership(subselect, testexpr):
+    """Recognize the CANONICAL membership subquery only: a single base table, an `auth.uid()` identity, exactly
+    ONE correlation (subq col = outer col), optional opaque-fn conjuncts to mock, and NOTHING else. Anything
+    richer (an extra `role='admin'`/`can_read` condition, a second correlation, OR in the WHERE) returns
+    'unknown' so the branch falls to the general `_solve_subquery` witness builder, which seeds those too."""
     ss = (subselect or {}).get("SelectStmt", {})
     frm = ss.get("fromClause", [])
-    if not frm or "RangeVar" not in frm[0]:
+    if not frm or len(frm) != 1 or "RangeVar" not in frm[0]:
         return {"kind": "unknown", "text": "membership-subquery"}
     rv = frm[0]["RangeVar"]
     mtable = (rv.get("schemaname") + "." if rv.get("schemaname") else "") + rv.get("relname", "")
     alias = (rv.get("alias") or {}).get("aliasname") or rv.get("relname")
     muser = mscope = rowscope = None
-    for (l, r) in _eq_pairs(ss.get("whereClause")):
-        if _is_func(l, "auth.uid") or _is_func(r, "auth.uid"):
-            _, muser = _colqual(r if _is_func(l, "auth.uid") else l)
-        else:
+    mock_fns = []   # `m.col = <opaque fn()>` conjuncts inside the EXISTS -> mock the fn to the seeded scope value
+    correlations = 0
+    extra = False   # any conjunct the canonical atom can't model -> not canonical (let the solver handle it)
+    conj = _and_conjuncts(ss.get("whereClause")) if ss.get("whereClause") is not None else []
+    if conj is None:
+        return {"kind": "unknown", "text": "membership-subquery"}
+    for c in conj:
+        if _t(c) == "A_Expr" and _names(_v(c).get("name")) == "=":
+            l, r = _v(c).get("lexpr"), _v(c).get("rexpr")
+            if _is_func(l, "auth.uid") or _is_func(r, "auth.uid"):
+                _, muser = _colqual(r if _is_func(l, "auth.uid") else l); continue
             lq, lc = _colqual(l); rq, rc = _colqual(r)
             if lc and rc:
-                if lq == alias: mscope, rowscope = lc, rc
-                elif rq == alias: mscope, rowscope = rc, lc
+                if lq == alias and rq != alias: mscope, rowscope, correlations = lc, rc, correlations + 1; continue
+                if rq == alias and lq != alias: mscope, rowscope, correlations = rc, lc, correlations + 1; continue
+                extra = True; continue
+            if lq == alias and lc and _t(r) in ("FuncCall", "SubLink"): mock_fns.append({"mcol": lc, "node": r}); continue
+            if rq == alias and rc and _t(l) in ("FuncCall", "SubLink"): mock_fns.append({"mcol": rc, "node": l}); continue
+            extra = True; continue
+        extra = True   # a non-equality conjunct (bare boolean, NOT, range, …) -> not the canonical atom
     if testexpr is not None:
         _, rowscope = _colqual(testexpr)
         tl = ss.get("targetList", [])
         if tl: mscope = _colname(tl[0].get("ResTarget", {}).get("val"))
-    if muser and mscope and rowscope:
-        return {"kind": "membership", "mtable": mtable, "muser_col": muser, "mscope_col": mscope, "row_scope_col": rowscope}
+        correlations += 1
+    if muser and mscope and rowscope and correlations == 1 and not extra:
+        return {"kind": "membership", "mtable": mtable, "muser_col": muser, "mscope_col": mscope,
+                "row_scope_col": rowscope, "mock_fns": mock_fns}
     return {"kind": "unknown", "text": "membership-subquery"}
 
 
@@ -430,6 +489,129 @@ def _wv_lit(typ, raw):
 
 def _wv_ctx(): return {"sub": None, "claims": [], "guc": {}, "row": {}, "aux": [], "role": "authenticated"}
 
+# ---- BL-5/BL-6: input-space discovery + construct-first DB-oracle floor ----
+# Instead of interpreting a (possibly novel) operator, collect the predicate's INPUT operands (BL-5) and let
+# Postgres evaluate it over candidate column values (BL-6): a brand-new operator/function becomes solvable with
+# ZERO operator-specific code. Pure AST collectors here; the DB-oracle search lives in emit_flat (needs a conn).
+def _expr_cols(node, coltypes):
+    """Every ColumnRef in `node` that is a real column of the table (present in coltypes), in encounter order."""
+    out = []
+    def walk(n):
+        if isinstance(n, dict):
+            if _t(n) == "ColumnRef":
+                c = _colname(n)
+                if c and c in coltypes and c not in out: out.append(c)
+            for v in n.values(): walk(v)
+        elif isinstance(n, list):
+            for x in n: walk(x)
+    walk(node); return out
+
+def _expr_consts(node):
+    """Every literal constant in `node` (its value strings), in encounter order — candidate column values for
+    pattern/prefix/containment operators (e.g. the `'Admin'` in `starts_with(name,'Admin')`)."""
+    out = []
+    def walk(n):
+        if isinstance(n, dict):
+            if _t(n) == "A_Const":
+                c = _const(n)
+                if c is not None and c not in out: out.append(c)
+            for v in n.values(): walk(v)
+        elif isinstance(n, list):
+            for x in n: walk(x)
+    walk(node); return out
+
+def _candidate_values(ct, enums):
+    """A small, type-appropriate set of candidate values to drive a free column true/false for the DB oracle."""
+    base = (ct or "text").split("(")[0].strip(); t = (ct or "").lower()
+    if base in enums and enums[base]: return list(enums[base]) + [None]
+    if any(k in t for k in ("int", "serial", "numeric", "real", "double", "decimal", "money")):
+        return ["0", "1", "2", "42", "100", None]
+    if "bool" in t: return ["true", "false", None]
+    if "uuid" in t: return [_WV_UID, "5ce1a000-0000-4000-8000-0000000000bb", None]
+    if "timestamp" in t or "date" in t: return ["2020-01-01", "2099-12-31", None]
+    return ["", "A", "Admin", "rls_a", "rls_x", None]   # text: empty / prefix-y / generic
+
+def _claim_paths(node):
+    """Every distinct `auth.jwt() -> … ->> 'k'` claim key-path referenced in `node` (for the joint search to vary
+    the session, not just the row). A matched claim ref is a leaf — don't recurse into it."""
+    out = []
+    def walk(n):
+        if isinstance(n, dict):
+            k = _jwt_keys(n)
+            if k:
+                if k not in out: out.append(k)
+                return
+            for v in n.values(): walk(v)
+        elif isinstance(n, list):
+            for x in n: walk(x)
+    walk(node); return out
+
+def _candidate_sessions(cpaths):
+    """Bounded candidate SESSIONS for the joint search: always the plain authenticated identity (no extra
+    claims), plus — when the predicate reads JWT claims — that identity with every referenced claim path set to
+    each of a few candidate values. Returns list of (sub, [(keys,val),…])."""
+    base = (_WV_UID, [])
+    if not cpaths:
+        return [base]
+    out = [base]
+    for v in ("Admin", "A", "rls_a", "rls_x", "0", "1"):     # a few text-ish claim candidates
+        out.append((_WV_UID, [(p, v) for p in cpaths]))
+    return out
+
+def _subquery_tables(node):
+    """BL-12 demand extraction: every subquery in `node` that reads a SINGLE base table -> a spec for how to
+    seed ONE row the subquery would count (identity col `= auth.uid()`, correlation cols `= outer col`, extra
+    equality/boolean conditions, and the aggregated column if the subquery is sum/avg/min/max). The relational-
+    state floor then VARIES HOW MANY such rows it seeds and lets Postgres evaluate the real aggregate. Returns
+    a list of specs, or [] (and bails on multi-table joins / OR / unmappable conjuncts -> stays NT)."""
+    out = []
+    def walk(n):
+        if isinstance(n, list):
+            for x in n: walk(x)
+            return
+        if not isinstance(n, dict):
+            return
+        if _t(n) == "SubLink":
+            sv = _v(n); ss = (sv.get("subselect") or {}).get("SelectStmt", {})
+            frm = ss.get("fromClause", [])
+            if len(frm) == 1 and "RangeVar" in frm[0]:
+                rv = frm[0]["RangeVar"]
+                mtable = (rv.get("schemaname") + "." if rv.get("schemaname") else "") + rv.get("relname", "")
+                alias = (rv.get("alias") or {}).get("aliasname") or rv.get("relname")
+                conj = _and_conjuncts(ss.get("whereClause")) if ss.get("whereClause") is not None else []
+                spec = {"mtable": mtable, "uid": None, "corr": [], "extras": {}, "num": [],
+                        "scope": "5c0d0000-0000-4000-8000-000000000001"}
+                ok = conj is not None
+                for c in (conj or []):
+                    if _t(c) == "A_Expr" and _names(_v(c).get("name")) == "=":
+                        l, r = _v(c).get("lexpr"), _v(c).get("rexpr")
+                        if _is_func(l, "auth.uid") or _is_func(r, "auth.uid"):
+                            _, spec["uid"] = _colqual(r if _is_func(l, "auth.uid") else l); continue
+                        lq, lc = _colqual(l); rq, rc = _colqual(r)
+                        if lc and rc:
+                            if lq == alias and rq != alias: spec["corr"].append((lc, rc)); continue
+                            if rq == alias and lq != alias: spec["corr"].append((rc, lc)); continue
+                            ok = False; break
+                        sc = lc if (lq in (alias, None) and lc) else (rc if (rq in (alias, None) and rc) else None)
+                        cv = _const(r) if sc == lc else _const(l)
+                        if sc and cv is not None: spec["extras"][sc] = cv; continue
+                        ok = False; break
+                    bx = _bool_extra(c, alias)
+                    if bx: spec["extras"][bx[0]] = bx[1]; continue
+                    ok = False; break
+                tl = ss.get("targetList", [])              # sum/avg/min/max -> note the aggregated column (set it large)
+                if tl and _t(tl[0].get("ResTarget", {}).get("val")) == "FuncCall":
+                    fv = tl[0]["ResTarget"]["val"]; fn = _names(_v(fv).get("funcname")).split(".")[-1].lower()
+                    if fn in ("sum", "avg", "min", "max"):
+                        fa = _v(fv).get("args", []); ac = _colname(fa[0]) if fa else None
+                        if ac: spec["num"].append(ac)
+                if ok and mtable:
+                    out.append(spec)
+            return                                          # don't recurse into the subquery's own subqueries
+        for v in n.values(): walk(v)
+    walk(node); return out
+
+
 def _wv_merge(a, b):
     """Combine two witness contexts; None on a contradiction (e.g. a column needs two different values)."""
     if a is None or b is None: return None
@@ -493,10 +675,19 @@ def _solve_eq(L, R, coltypes, enums):
 
 def _solve_ineq(op, L, R, coltypes, enums):
     lr, rr = _side_role(L), _side_role(R)
+    _num = lambda c: any(k in (coltypes.get(c, "") or "").lower() for k in ("int", "numeric", "real", "double", "decimal", "serial", "money"))
+    if lr[0] == "col" and rr[0] == "col":                   # cross-column inequality (a < b): seed both to satisfy / violate
+        a, b = lr[1], rr[1]
+        if not (_num(a) and _num(b)): return None
+        hi = op in (">", ">=")
+        sat, fal = _wv_ctx(), _wv_ctx()
+        sat["row"][a], sat["row"][b] = ("9", "1") if hi else ("1", "9")
+        fal["row"][a], fal["row"][b] = ("1", "9") if hi else ("9", "1")
+        return (sat, fal)
     if lr[0] == "col" and rr[0] in ("claim", "guc", "const"): col, inp, col_left = lr[1], rr, True
     elif rr[0] == "col" and lr[0] in ("claim", "guc", "const"): col, inp, col_left = rr[1], lr, False
     else: return None
-    if not any(k in (coltypes.get(col, "") or "").lower() for k in ("int", "numeric", "real", "double", "decimal", "serial", "money")): return None
+    if not _num(col): return None
     eff = op if col_left else {">": "<", "<": ">", ">=": "<=", "<=": ">="}[op]
     hi_col = eff in (">", ">=")
     sat, fal = _wv_ctx(), _wv_ctx()
@@ -513,6 +704,297 @@ def _solve_ineq(op, L, R, coltypes, enums):
     else:      put(sat, "1", "1000000"); put(fal, "1000000", "1")
     return (sat, fal)
 
+def _class_pick(cls):
+    """A single char satisfying a regex character-class body `cls` (the text between [ ])."""
+    if not cls: return None
+    if cls[0] == '^':                                   # negated class -> a char unlikely to be excluded
+        return next((ch for ch in ('z', 'q', 'x', '0', 'a') if ch not in cls[1:]), None)
+    if len(cls) >= 3 and cls[1] == '-': return cls[0]   # range a-z / 0-9 -> low end
+    return cls[0]
+
+def _regex_match(pat):
+    """A string that MATCHES POSIX regex `pat` (heuristic; common constructs only), or None if unsure.
+    DB-verified downstream, so a wrong guess degrades to NOT_TESTABLE — never a false pass."""
+    p = pat
+    if p.startswith('^'): p = p[1:]
+    if p.endswith('$') and not p.endswith('\\$'): p = p[:-1]
+    out, i, n = [], 0, len(p)
+    while i < n:
+        c = p[i]; q = p[i + 1] if i + 1 < n else ''
+        if c == '\\' and i + 1 < n:
+            out.append({'d': '0', 'w': 'a', 's': ' '}.get(p[i + 1], p[i + 1])); i += 2; continue
+        if c == '.':
+            if q in ('*', '?'): i += 2; continue
+            out.append('x'); i += 2 if q == '+' else 1; continue
+        if c == '[':
+            j = p.find(']', i + 1)
+            if j == -1: return None
+            ch = _class_pick(p[i + 1:j])
+            if ch is None: return None
+            q2 = p[j + 1] if j + 1 < n else ''
+            if q2 in ('*', '?'): i = j + 2; continue
+            out.append(ch); i = j + (2 if q2 == '+' else 1); continue
+        if c in ('(', ')'): i += 1; continue
+        if c == '|': break                              # take the first alternative
+        if c in ('*', '?', '+'): i += 1; continue       # quantifier on prior literal: one copy already emitted
+        if c in ('{', '}'): return None                 # bounded repetition -> bail (rare)
+        out.append(c); i += 1
+    s = "".join(out)
+    return s if s else "x"
+
+def _like_match(pat):
+    """A string that MATCHES a LIKE/ILIKE pattern `pat`  (% -> empty, _ -> one char, \\x -> literal x)."""
+    out, i, n = [], 0, len(pat)
+    while i < n:
+        c = pat[i]
+        if c == '\\' and i + 1 < n: out.append(pat[i + 1]); i += 2; continue
+        if c == '%': i += 1; continue
+        if c == '_': out.append('a'); i += 1; continue
+        out.append(c); i += 1
+    s = "".join(out)
+    return s if s else "a"
+
+def _solve_pattern(op, L, R, coltypes, enums):
+    """`col ~ / ~* / !~ / LIKE / ILIKE pattern` -> seed a text value that matches / one that doesn't.
+    DB-verified by solve_emit, so an imperfect generator just falls back to NOT_TESTABLE."""
+    lr, rr = _side_role(L), _side_role(R)
+    if lr[0] == "col" and rr[0] == "const": col, pat = lr[1], rr[1]
+    elif rr[0] == "col" and lr[0] == "const": col, pat = rr[1], lr[1]
+    else: return None
+    ct = (coltypes.get(col, "text") or "").lower()
+    if not any(k in ct for k in ("text", "char", "citext")): return None   # patterns apply to text-ish cols
+    m = _like_match(pat) if "~~" in op else _regex_match(pat)
+    if m is None: return None
+    nm = _wv_other(coltypes.get(col, "text"), enums)                       # generic value: ~never matches
+    sat, fal = _wv_ctx(), _wv_ctx()
+    if op.startswith("!"): sat["row"][col] = nm; fal["row"][col] = m       # negated: true when NOT matching
+    else:                  sat["row"][col] = m;  fal["row"][col] = nm
+    return (sat, fal)
+
+def _solve_between(kind, L, R, coltypes, enums):
+    """`col BETWEEN lo AND hi` -> a value in range (sat) / below lo (fal). Numeric exact; dates best-effort + DB-verify."""
+    col = _colname(L)
+    if not col: return None
+    items = R if isinstance(R, list) else (_v(R).get("items", []) if _t(R) == "List" else [])
+    if len(items) < 2: return None
+    lo, hi = _const(items[0]), _const(items[1])
+    if lo is None or hi is None: return None
+    ct = (coltypes.get(col, "") or "").lower(); sat, fal = _wv_ctx(), _wv_ctx()
+    if any(k in ct for k in ("int", "numeric", "real", "double", "decimal", "serial", "money")):
+        try: loi = int(float(lo))
+        except Exception: return None
+        sat["row"][col] = str(loi); fal["row"][col] = str(loi - 1)
+    else:
+        sat["row"][col] = lo; fal["row"][col] = _wv_other(coltypes.get(col, "text"), enums, lo)
+    return (sat, fal) if kind == "AEXPR_BETWEEN" else (fal, sat)
+
+def _solve_jsonb(op, L, R, coltypes, enums):
+    """`jsoncol @> const` / `jsoncol ? key` / `?|` / `?&` -> seed a JSONB value that satisfies it (else '{}')."""
+    lr, rr = _side_role(L), _side_role(R)
+    if not (lr[0] == "col" and rr[0] == "const"): return None
+    col = lr[1]
+    if "json" not in (coltypes.get(col, "") or "").lower(): return None
+    sat, fal = _wv_ctx(), _wv_ctx(); fal["row"][col] = "{}"
+    if op == "@>":   sat["row"][col] = rr[1]                                   # a @> a is true
+    elif op == "?":  sat["row"][col] = json.dumps({rr[1]: True})
+    elif op in ("?|", "?&"):
+        keys = _array_consts(R)
+        if not keys: return None
+        sat["row"][col] = json.dumps({k: True for k in keys})
+    else: return None
+    return (sat, fal)
+
+def _col_textfn(node):
+    """An idempotent-on-output text fn/cast over a column -> the column name (seeding col := const makes f(col)=const)."""
+    if _t(node) == "TypeCast": return _colname(_v(node).get("arg"))
+    if _t(node) == "FuncCall":
+        fn = _names(_v(node).get("funcname")).split(".")[-1]
+        if fn in ("lower", "upper", "trim", "btrim", "ltrim", "rtrim"):
+            a = _v(node).get("args", []); return _colname(a[0]) if a else None
+    return None
+
+def _solve_fncol_eq(L, R, coltypes, enums):
+    """`lower(col)|upper(col)|trim(col)|col::text = const` -> seed col := const (DB-verified; unsatisfiable -> NT)."""
+    for x, y in ((L, R), (R, L)):
+        col = _col_textfn(x); c = _const(y)
+        if col and c is not None:
+            sat, fal = _wv_ctx(), _wv_ctx()
+            sat["row"][col] = c; fal["row"][col] = _wv_other(coltypes.get(col, "text"), enums, c)
+            return (sat, fal)
+    return None
+
+def _flip_first(s):
+    return ("Z" if s[:1] != "Z" else "Y") + (s[1:] if len(s) > 1 else "")
+
+def _flip_last(s):
+    return (s[:-1] if len(s) > 1 else "") + ("Z" if s[-1:] != "Z" else "Y")
+
+def _fn_preimage(fn, args, T):
+    """For a many-to-one `fn(col, …) = <const T>`, return `(col, sat_colval, fal_colval)` — a column value whose
+    image equals T (sat) and one whose image differs (fal) — else None. The values are seeded into `ctx["row"]`
+    and pass through `_wv_lit` (text quoted; date/time cast to the column type). DB-verified by solve_emit, so a
+    wrong construction degrades to NT — never a false pass. Registry kept to cleanly-constructible fns."""
+    T = str(T)
+    col0 = _colname(args[0]) if args else None
+    if fn in ("substring", "substr"):                       # prefix only: substring(col, 1[, n])
+        if not col0 or (len(args) >= 2 and _const(args[1]) not in ("1", None)): return None
+        return (col0, T + "zzz", _flip_first(T) + "zzz")
+    if fn == "left":                                        # left(col, n) -> prefix
+        if not col0: return None
+        return (col0, T + "zzz", _flip_first(T) + "zzz")
+    if fn == "right":                                       # right(col, n) -> suffix
+        if not col0: return None
+        return (col0, "zzz" + T, "zzz" + _flip_last(T))
+    if fn == "split_part" and len(args) >= 3:               # split_part(col, delim, 1) -> first field
+        delim = _const(args[1]); field = _const(args[2])
+        if not col0 or field != "1" or not delim: return None
+        return (col0, T + delim + "x", _flip_first(T) + delim + "x")
+    if fn == "date_trunc" and len(args) >= 2:               # date_trunc(unit, col): col is the SECOND arg
+        col = _colname(args[1])
+        if not col: return None
+        fal = "1971-02-03 04:05:06+00" if not T.startswith("1971") else "2087-08-09 10:11:12+00"
+        return (col, T, fal)                                # re-truncating an aligned value is idempotent -> sat = T
+    if fn == "to_char" and len(args) >= 2:                  # to_char(col, fmt) for common date formats
+        fmt = _const(args[1]) or ""
+        if not col0: return None
+        if   fmt == "YYYY-MM-DD": sat = T
+        elif fmt == "YYYY-MM":    sat = T + "-15"
+        elif fmt == "YYYY":       sat = T + "-06-15"
+        else: return None
+        return (col0, sat, "1971-02-03" if not str(sat).startswith("1971") else "2087-08-09")
+    return None
+
+def _solve_fncol_preimage(L, R, coltypes, enums):
+    """`fn(col, …) = const` for a many-to-one fn (`date_trunc`/`substring`/`left`/`right`/`to_char`/`split_part`)
+    -> seed a column value whose image is the target (sat) and one whose image differs (fal). DB-verified -> NT
+    on a miss. The idempotent text fns (`lower`/`upper`/`trim`/cast) are handled earlier by `_solve_fncol_eq`."""
+    for x, y in ((L, R), (R, L)):
+        if _t(x) != "FuncCall": continue
+        c = _const(y)
+        if c is None: continue
+        fn = _names(_v(x).get("funcname")).split(".")[-1].lower()
+        plan = _fn_preimage(fn, _v(x).get("args", []) or [], c)
+        if plan:
+            col, sat_v, fal_v = plan
+            sat, fal = _wv_ctx(), _wv_ctx()
+            sat["row"][col] = sat_v; fal["row"][col] = fal_v
+            return (sat, fal)
+    return None
+
+def _solve_subquery(node, coltypes, enums):
+    """WB-3: general EXISTS/IN subquery witness. Single base table, AND-only WHERE. Captures ALL correlations
+    (subq col = outer col), an optional `auth.uid()` identity, and extra equality/boolean conditions on subquery
+    columns (`role='admin'`, `can_read`). SAT seeds the outer row's correlation column(s) + one matching aux row
+    (identity + every correlation + every extra); FAL points the outer row's correlation column(s) at a value
+    with no matching aux row, so EXISTS is false. Bails (None -> NT) on joins, OR in the WHERE, a non-equality
+    correlation, or a column=column it can't map to (subq, outer). DB-verified by solve_emit -> NT on a miss."""
+    if _t(node) != "SubLink":
+        return None
+    sv = _v(node); st = sv.get("subLinkType")
+    if st not in ("EXISTS_SUBLINK", "ANY_SUBLINK"):
+        return None
+    ss = (sv.get("subselect") or {}).get("SelectStmt", {})
+    frm = ss.get("fromClause", [])
+    if len(frm) != 1 or "RangeVar" not in frm[0]:
+        return None
+    rv = frm[0]["RangeVar"]
+    mtable = (rv.get("schemaname") + "." if rv.get("schemaname") else "") + rv.get("relname", "")
+    alias = (rv.get("alias") or {}).get("aliasname") or rv.get("relname")
+    conj = _and_conjuncts(ss.get("whereClause")) if ss.get("whereClause") is not None else []
+    if conj is None:
+        return None
+    correlations = []   # (subq_scope_col, outer_row_col)
+    muser = None
+    extras = {}         # subq col -> literal value to seed
+    if st == "ANY_SUBLINK":                                 # outer IN (SELECT target FROM …)
+        _, rowc = _colqual(sv.get("testexpr"))
+        tl = ss.get("targetList", [])
+        tcol = _colname(tl[0].get("ResTarget", {}).get("val")) if tl else None
+        if not (rowc and tcol):
+            return None
+        correlations.append((tcol, rowc))
+    for c in conj:
+        if _t(c) == "A_Expr" and _names(_v(c).get("name")) == "=":
+            l, r = _v(c).get("lexpr"), _v(c).get("rexpr")
+            if _is_func(l, "auth.uid") or _is_func(r, "auth.uid"):
+                _, muser = _colqual(r if _is_func(l, "auth.uid") else l); continue
+            lq, lc = _colqual(l); rq, rc = _colqual(r)
+            if lc and rc:                                   # column = column -> correlation (one side is the subq alias)
+                if lq == alias and rq != alias: correlations.append((lc, rc)); continue
+                if rq == alias and lq != alias: correlations.append((rc, lc)); continue
+                return None
+            sc = lc if (lq in (alias, None) and lc) else (rc if (rq in (alias, None) and rc) else None)
+            cv = _const(r) if (sc == lc) else _const(l)
+            if sc and cv is not None:                       # subq col = const -> extra condition
+                extras[sc] = cv; continue
+            return None
+        bx = _bool_extra(c, alias)                          # bare bool / NOT col / IS TRUE|FALSE
+        if bx:
+            extras[bx[0]] = bx[1]; continue
+        return None                                         # an unmodeled conjunct -> NT
+    if not correlations:
+        return None
+    sat, fal = _wv_ctx(), _wv_ctx()
+    auxcols = {}
+    for i, (mcol, rcol) in enumerate(correlations):
+        sc = "5c09e000-0000-4000-8000-%012x" % (i + 1)
+        sat["row"][rcol] = sc; auxcols[mcol] = sc
+        fal["row"][rcol] = "5c09e000-0000-4000-8000-0000000000ff"   # no matching aux row -> EXISTS false
+    if muser:
+        sat["sub"] = fal["sub"] = _WV_UID
+        auxcols[muser] = _WV_UID
+    auxcols.update(extras)
+    sat["aux"].append({"table": mtable, "cols": auxcols})
+    return (sat, fal)
+
+
+def _array_elem_type(coltype):
+    """`text[]` -> `text`, `uuid[]` -> `uuid`, `integer[]` -> `integer`. None if the column isn't an array type."""
+    t = (coltype or "").strip()
+    return t[:-2].strip() or None if t.endswith("[]") else None
+
+def _pg_array_literal(elems):
+    """Postgres array INPUT text, e.g. `{vip,beta}` (double-quoting an element only when it has a special char);
+    empty -> `{}`. This goes through `_wv_lit`, which single-quotes the whole thing, so the column's array type
+    casts it on INSERT (the same trick the jsonb witness uses for a `{...}` literal)."""
+    out = []
+    for e in elems:
+        s = str(e)
+        if s == "" or re.search(r'[,{}"\\\s]', s):
+            s = '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        out.append(s)
+    return "{" + ",".join(out) + "}"
+
+def _solve_array(op, L, R, coltypes, enums):
+    """`col && ARRAY[…]` (overlap) / `col @> ARRAY[…]` (col contains all) / `col <@ ARRAY[…]` (col contained in),
+    in either operand order -> seed an array-valued row that satisfies the predicate and one that doesn't.
+    DB-verified by solve_emit (a wrong guess -> NT, never a false pass); unsatisfiable (e.g. <@ over the whole
+    enum) -> the falsifier won't verify -> NT."""
+    lcol, rcol = _colname(L), _colname(R)
+    lvals, rvals = _array_consts(L), _array_consts(R)
+    if lcol and rvals is not None and _array_elem_type(coltypes.get(lcol)):
+        col, vals, colleft = lcol, rvals, True
+    elif rcol and lvals is not None and _array_elem_type(coltypes.get(rcol)):
+        col, vals, colleft = rcol, lvals, False
+    else:
+        return None
+    if not vals:
+        return None
+    elem = _array_elem_type(coltypes.get(col))
+    eff = op
+    if not colleft and op in ("@>", "<@"):                  # column on the right: `ARRAY @> col` <=> `col <@ ARRAY`
+        eff = "<@" if op == "@>" else "@>"
+    sat, fal = _wv_ctx(), _wv_ctx()
+    if eff == "&&":                                         # overlap: share one element vs an empty array
+        sat["row"][col] = _pg_array_literal([vals[0]]); fal["row"][col] = "{}"
+    elif eff == "@>":                                      # col contains all of `vals` vs an empty array
+        sat["row"][col] = _pg_array_literal(vals); fal["row"][col] = "{}"
+    elif eff == "<@":                                      # col is a subset of `vals` vs a set with an outside element
+        sat["row"][col] = _pg_array_literal([vals[0]]); fal["row"][col] = _pg_array_literal(vals + [_wv_other(elem, enums)])
+    else:
+        return None
+    return (sat, fal)
+
 def _solve_leaf(node, coltypes, enums):
     t = _t(node)
     if t == "A_Const": return (_wv_ctx(), None) if _const(node) == "true" else None
@@ -523,9 +1005,21 @@ def _solve_leaf(node, coltypes, enums):
         if v.get("nulltesttype") == "IS_NULL": sat["row"][col] = None; fal["row"][col] = other
         else: sat["row"][col] = other; fal["row"][col] = None
         return (sat, fal)
+    if t == "ColumnRef":                                    # bare boolean column as the predicate: USING (is_active)
+        col = _colname(node)
+        if not col: return None
+        sat, fal = _wv_ctx(), _wv_ctx(); sat["row"][col] = "true"; fal["row"][col] = "false"; return (sat, fal)
+    if t == "BooleanTest":                                  # col IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE
+        v = _v(node); col = _colname(v.get("arg")); bt = v.get("booltesttype")
+        if not col or bt not in ("IS_TRUE", "IS_FALSE", "IS_NOT_TRUE", "IS_NOT_FALSE"): return None
+        sat, fal = _wv_ctx(), _wv_ctx(); want = bt in ("IS_TRUE", "IS_NOT_FALSE")
+        sat["row"][col] = "true" if want else "false"; fal["row"][col] = "false" if want else "true"
+        return (sat, fal)
     if t == "SubLink":
         sv = _v(node); st = sv.get("subLinkType")
         if st in ("EXISTS_SUBLINK", "ANY_SUBLINK"):
+            g = _solve_subquery(node, coltypes, enums)   # WB-3: general (multi-correlation / extra conditions / IN-subquery)
+            if g: return g
             m = _membership(sv.get("subselect"), sv.get("testexpr") if st == "ANY_SUBLINK" else None)
             if m.get("kind") == "membership":
                 sat, fal = _wv_ctx(), _wv_ctx(); sat["sub"] = _WV_UID; fal["sub"] = _WV_UID
@@ -560,7 +1054,16 @@ def _solve_leaf(node, coltypes, enums):
             if outside is None: return None
             sat, fal = _wv_ctx(), _wv_ctx(); sat["row"][col] = outside; fal["row"][col] = vals[0]; return (sat, fal)
         return None
-    if kind == "AEXPR_OP" and op == "=": return _solve_eq(L, R, coltypes, enums)
+    if kind in ("AEXPR_BETWEEN", "AEXPR_NOT_BETWEEN"): return _solve_between(kind, L, R, coltypes, enums)
+    if kind == "AEXPR_OP" and op in ("@>", "?", "?|", "?&"):
+        return _solve_jsonb(op, L, R, coltypes, enums) or (_solve_array(op, L, R, coltypes, enums) if op == "@>" else None)
+    if kind == "AEXPR_OP" and op in ("&&", "<@"): return _solve_array(op, L, R, coltypes, enums)
+    if kind == "AEXPR_OP" and op == "=": return _solve_eq(L, R, coltypes, enums) or _solve_fncol_eq(L, R, coltypes, enums) or _solve_fncol_preimage(L, R, coltypes, enums)
+    if kind == "AEXPR_NOT_DISTINCT":   # `IS NOT DISTINCT FROM` = null-safe `=` -> equality witness (BL-8)
+        return _solve_eq(L, R, coltypes, enums) or _solve_fncol_eq(L, R, coltypes, enums) or _solve_fncol_preimage(L, R, coltypes, enums)
+    if kind == "AEXPR_DISTINCT":       # `IS DISTINCT FROM` = null-safe `<>` -> the negation of equality (swap sat/fal)
+        eqp = _solve_eq(L, R, coltypes, enums)
+        return (eqp[1], eqp[0]) if eqp else None
     if kind == "AEXPR_OP" and op in (">", "<", ">=", "<="): return _solve_ineq(op, L, R, coltypes, enums)
     if kind == "AEXPR_OP" and op in ("<>", "!="):
         lr, rr = _side_role(L), _side_role(R)
@@ -569,7 +1072,40 @@ def _solve_leaf(node, coltypes, enums):
             sat, fal = _wv_ctx(), _wv_ctx()
             sat["row"][lr[1]] = _wv_other(coltypes.get(lr[1], "text"), enums, rr[1]); fal["row"][lr[1]] = rr[1]; return (sat, fal)
         return None
+    if op in ("~", "~*", "!~", "!~*", "~~", "~~*", "!~~", "!~~*"):   # regex / LIKE / ILIKE (BL-6)
+        return _solve_pattern(op, L, R, coltypes, enums)
     return None
+
+def _range_witness(args, coltypes, enums):
+    """An AND that's purely numeric const-bounded comparisons on ONE column (the deparsed form of
+    `col BETWEEN lo AND hi`, or `lo <= col AND col <= hi`) -> one in-range value (sat) / one out (fal).
+    The generic AND merge can't co-satisfy `>=lo` and `<=hi` (each leaf picks its own boundary) — this does."""
+    col = lo = hi = None; lo_inc = hi_inc = True
+    for a in args:
+        if _t(a) != "A_Expr": return None
+        v = _v(a); op = _names(v.get("name"))
+        if v.get("kind") != "AEXPR_OP" or op not in (">", ">=", "<", "<="): return None
+        lr, rr = _side_role(v.get("lexpr")), _side_role(v.get("rexpr"))
+        if lr[0] == "col" and rr[0] == "const": c, val, o = lr[1], rr[1], op
+        elif rr[0] == "col" and lr[0] == "const": c, val, o = rr[1], lr[1], {">": "<", "<": ">", ">=": "<=", "<=": ">="}[op]
+        else: return None
+        if col is None: col = c
+        elif c != col: return None
+        if not any(k in (coltypes.get(c, "") or "").lower() for k in ("int", "numeric", "real", "double", "decimal", "serial", "money")): return None
+        try: nv = int(float(val))
+        except Exception: return None
+        if o in (">", ">="): lo = nv if lo is None else max(lo, nv); lo_inc = (o == ">=")
+        else: hi = nv if hi is None else min(hi, nv); hi_inc = (o == "<=")
+    if col is None: return None
+    elo = lo if (lo is None or lo_inc) else lo + 1
+    ehi = hi if (hi is None or hi_inc) else hi - 1
+    if elo is not None and ehi is not None:
+        if elo > ehi: return None
+        sat_v, fal_v = (elo + ehi) // 2, elo - 1
+    elif elo is not None: sat_v, fal_v = elo, elo - 1
+    else: sat_v, fal_v = ehi, ehi + 1
+    sat, fal = _wv_ctx(), _wv_ctx(); sat["row"][col] = str(sat_v); fal["row"][col] = str(fal_v)
+    return (sat, fal)
 
 def _solve_node(node, coltypes, enums):
     if _t(node) == "BoolExpr":
@@ -577,6 +1113,8 @@ def _solve_node(node, coltypes, enums):
         if bo == "NOT_EXPR":
             k = kids[0]; return (k[1], k[0]) if (k and k[1] is not None) else None
         if bo == "AND_EXPR":
+            _rw = _range_witness(_v(node).get("args", []), coltypes, enums)   # single-col numeric range (deparsed BETWEEN)
+            if _rw: return _rw
             sat = _wv_ctx()
             for k in kids:
                 if not k: return None
@@ -635,18 +1173,40 @@ def _seed_one(table_fqn, fixed, fkmap, colsmap, enums):
     return stmts
 
 
+def _not(a):
+    """Wrap a node in a synthetic `NOT (...)` BoolExpr (for De Morgan pushdown)."""
+    return {"BoolExpr": {"boolop": "NOT_EXPR", "args": [a]}}
+
 def _dnf_ast(n):
-    """Boolean AST -> DNF: list of min-terms, each a list of leaf nodes."""
+    """Boolean AST -> DNF: list of min-terms, each a list of leaf nodes. NOT is pushed inward (De Morgan, BL-3)
+    so `NOT(A AND B)` -> `(NOT A) OR (NOT B)` and `NOT(A OR B)` -> `(NOT A) AND (NOT B)` become separate
+    min-terms the per-branch solver can witness; `NOT NOT A` -> `A`; `NOT <leaf>` is kept as a negated-leaf
+    min-term (the solver negates it). Plain OR/AND are unchanged."""
     t = _t(n)
     if t == "BoolExpr":
-        bo = _v(n).get("boolop")
+        bo = _v(n).get("boolop"); args = _v(n).get("args", [])
+        if bo == "NOT_EXPR" and args:
+            inner = args[0]
+            if _t(inner) == "BoolExpr":
+                ibo = _v(inner).get("boolop"); iargs = _v(inner).get("args", [])
+                if ibo == "NOT_EXPR" and iargs:                       # NOT NOT A -> A
+                    return _dnf_ast(iargs[0])
+                if ibo == "AND_EXPR":                                 # NOT(A AND B) -> (NOT A) OR (NOT B)
+                    out = []
+                    for a in iargs: out += _dnf_ast(_not(a))
+                    return out
+                if ibo == "OR_EXPR":                                  # NOT(A OR B) -> (NOT A) AND (NOT B)
+                    partial = [[]]
+                    for a in iargs: partial = [m + s for m in partial for s in _dnf_ast(_not(a))]
+                    return partial
+            return [[n]]                                              # NOT <leaf>: keep (solver negates)
         if bo == "OR_EXPR":
             out = []
-            for a in _v(n).get("args", []): out += _dnf_ast(a)
+            for a in args: out += _dnf_ast(a)
             return out
         if bo == "AND_EXPR":
             partial = [[]]
-            for a in _v(n).get("args", []):
+            for a in args:
                 partial = [m + s for m in partial for s in _dnf_ast(a)]
             return partial
     return [[n]]
@@ -766,6 +1326,7 @@ def build_class(min_term, idx, col_dom=None):
     claims = {"sub": CV[idx % len(CV)], "role": "authenticated"}
     rowseed, aux, scalar_link, fk_val, handled, reason, has_temporal = {}, [], None, None, True, None, False
     tenant_keys = []   # JWT claim path(s) this class scopes on (for building a rival-tenant negative control)
+    fn_mocks = []      # opaque fns inside a membership EXISTS to mock to the seeded scope value (wiring proof)
     for at in min_term:
         k = at["kind"]
         if k == "owner":
@@ -784,6 +1345,9 @@ def build_class(min_term, idx, col_dom=None):
             rowseed[at["row_scope_col"]] = f"'{sc}'"; scalar_link = at["row_scope_col"]; fk_val = sc
             aux.append({"table": at["mtable"], "cols": {at["muser_col"]: uid, at["mscope_col"]: sc},
                         "kind": "membership", "muser_col": at["muser_col"], "mscope_col": at["mscope_col"]})
+            for _mk in at.get("mock_fns", []):   # mock the in-EXISTS fn to the seeded scope value (when it gates that same col)
+                if _mk["mcol"] == at["mscope_col"]:
+                    fn_mocks.append({"node": _mk["node"], "value": sc})
         elif k == "array_col":
             uid = CV[idx % len(CV)]; claims["sub"] = uid; rowseed[at["col"]] = f"ARRAY['{uid}']::uuid[]"
         elif k == "temporal":
@@ -802,7 +1366,7 @@ def build_class(min_term, idx, col_dom=None):
             dom = (col_dom or {}).get(at["col"])
             outside = next((x for x in (dom or []) if x not in at["values"]), None)
             if outside is None:
-                handled, reason = False, f"unhandled atom: no value outside {at['values']} for {at['col']}"
+                handled, reason = False, f"unsatisfiable branch: {at['col']} can never be outside {at['values']} (the enum/domain has no other value), so this NOT-IN/<> ALL predicate never grants — a dead or over-restrictive policy; left untested because no satisfying row exists"
             else:
                 rowseed[at["col"]] = f"'{outside}'"
         elif k == "scalar_lookup":
@@ -813,7 +1377,8 @@ def build_class(min_term, idx, col_dom=None):
             handled, reason = False, f"unhandled atom: {at.get('text')}"
     return {"idx": idx, "claims": claims, "rowseed": rowseed, "aux": aux, "scalar_link": scalar_link,
             "fk_val": fk_val, "rowlinked": bool(rowseed), "handled": handled, "reason": reason,
-            "has_temporal": has_temporal, "kinds": [a["kind"] for a in min_term], "tenant_keys": tenant_keys}
+            "has_temporal": has_temporal, "kinds": [a["kind"] for a in min_term], "tenant_keys": tenant_keys,
+            "fn_mocks": fn_mocks}
 
 
 def _cmd_dnf(pols, cmd, clause, cur):
@@ -893,6 +1458,21 @@ def analyze(cur, schema, table):
 
 def _unq(v):
     return v[1:-1] if isinstance(v, str) and v.startswith("'") and v.endswith("'") else v
+
+
+def _wrap_seed(block):
+    """P2b: wrap each statement of an ARRANGE/seed block in public._rlsa_try(...) so a failing seed (a genuinely
+    un-seedable table) is swallowed in its own subtransaction rather than aborting the whole emitted pgTAP file
+    under pg_prove / `supabase test db`. The table then stays empty and the baked UNRELIABLE assertion runs and
+    prints a clean `not ok … UNRELIABLE` line. Dollar-quote-aware split (keeps CREATE FUNCTION $$…$$ bodies
+    intact); the tag is space-padded so an inner `$$` can't run into the outer tag. NOTE: only the EMITTED
+    artifact is wrapped — the engine's own live probe uses the raw, unwrapped seed (run before _rlsa_try exists)."""
+    out = []
+    for s in _split_statements(block):
+        st = s.strip().rstrip(";").strip()
+        if st:
+            out.append(f"SELECT public._rlsa_try($rlsa_seed$ {st} $rlsa_seed$);")
+    return "\n".join(out)
 
 
 def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks=None, cuniques=None, relchecks=None, compfks=None):
@@ -995,51 +1575,58 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
         if kind == "folder_owner": return f"'{FOREIGN}/x'"
         return f"'{FOREIGN}'"
 
-    for at in {a["table"] for c in all_h for a in c["aux"]}:
-        stmts.append(f"  DELETE FROM {at};")
-    # Seed aux/scope rows BEFORE the main rows. When the scope table is ALSO an FK parent of the table
-    # under test (e.g. a `data_rooms` that is both the membership table and room_documents.room_id's
-    # parent), the membership-linking column (owner_id = the test user) must be written first; the later
-    # FK-parent fill of that same row then no-ops via ON CONFLICT DO NOTHING. Otherwise the generic fill
-    # wins, the "authorized" identity isn't actually authorized, and every grant test bakes a wrong "0 rows".
-    aux_seen = set()
-    for c in all_h:
-        for a in c["aux"]:
-            ak = (a["table"], tuple(sorted(a["cols"].items())))
-            if ak in aux_seen: continue
-            aux_seen.add(ak)
-            av = {k: f"'{val}'" for k, val in a["cols"].items()}
-            v = row_values(a["table"], av); anc(v, a["table"]); stmts.append(insert(a["table"], v, conflict=True))
     def _anc_tables(t0):                                 # t0 + its transitive FK-parent tables
-        seen, st = set(), [t0]
+        seen2, st = set(), [t0]
         while st:
             t = st.pop()
-            if t in seen: continue
-            seen.add(t)
+            if t in seen2: continue
+            seen2.add(t)
             for (pt, _pc) in fkmap.get(t, {}).values(): st.append(pt)
-        return seen
-    # If the table under test IS the scope parent that an aux row FK-references (e.g. orgs, with
-    # memberships.org_id -> orgs.id; also rbac role tables / scalar-lookup tables that point back at q),
-    # then the aux's anc() already seeded the main row's PK while satisfying that FK; the main insert
-    # here would re-insert the same key and self-collide (23505), which the probe would mis-bake as a
-    # denial. Make it idempotent in that case. Covers ALL aux kinds, not just membership.
+        return seen2
+    # SEEDING ORDER is topological, not a fixed "aux always first" heuristic. Decide it by the FK dependency
+    # between the table under test (q) and its aux/scope tables (deeper FK parents are seeded inline by
+    # anc()/ensure() with ON CONFLICT, so this 2-block order is the full topological order for the shapes that
+    # occur):
+    #   - q_scope_parent (q is an FK-ANCESTOR of an aux table, e.g. orgs with memberships.org_id -> orgs.id,
+    #     or an rbac/scalar-lookup table that points back at q): seed q's MAIN rows FIRST so the aux FK resolves
+    #     against the real row, THEN the aux rows. (Previously this was patched with an idempotency hack on the
+    #     main insert; ordering removes the self-collision at the source. ON CONFLICT is kept as a belt-and-
+    #     suspenders no-op.)
+    #   - otherwise: seed AUX first (q may FK-reference the aux/scope table — e.g. the membership-linking
+    #     column must exist before the main row's generic FK fill would overwrite it), then the main rows.
     q_scope_parent = any(a.get("table") and a["table"] != q and q in _anc_tables(a["table"])
                          for c in all_h for a in c["aux"])
-    for c in rowlinked:
-        v = row_values(q, c["rowseed"], salt=c["idx"]); anc(v, q); stmts.append(insert(q, v, conflict=q_scope_parent))
-        if c["has_temporal"]:
-            tcol = [k for k in c["rowseed"] if "now()" in c["rowseed"][k]][0]
-            v2 = row_values(q, {**c["rowseed"], tcol: "now() - interval '1 day'"}, salt=c["idx"] + 50); anc(v2, q); stmts.append(insert(q, v2) + "  -- expired")
-    if primary:
-        ov = {}
-        if primary["scalar_link"]: ov[primary["scalar_link"]] = foreign_val(pkind)
-        for col in primary["rowseed"]:
-            if "ARRAY[" in primary["rowseed"][col]: ov[col] = foreign_val("array_col")
-            elif "now()" in primary["rowseed"][col]: ov[col] = "now() + interval '1 day'"
-        v = row_values(q, {**primary["rowseed"], **ov}, salt=99); anc(v, q); stmts.append(insert(q, v) + "  -- foreign")
-    elif any_grant:
-        for i in range(2):
-            v = row_values(q, {}, salt=i); anc(v, q); stmts.append(insert(q, v))
+    for at in {a["table"] for c in all_h for a in c["aux"]}:
+        stmts.append(f"  DELETE FROM {at};")
+    def seed_aux():
+        aux_seen = set()
+        for c in all_h:
+            for a in c["aux"]:
+                ak = (a["table"], tuple(sorted(a["cols"].items())))
+                if ak in aux_seen: continue
+                aux_seen.add(ak)
+                av = {k: f"'{val}'" for k, val in a["cols"].items()}
+                v = row_values(a["table"], av); anc(v, a["table"]); stmts.append(insert(a["table"], v, conflict=True))
+    def seed_main():
+        for c in rowlinked:
+            v = row_values(q, c["rowseed"], salt=c["idx"]); anc(v, q); stmts.append(insert(q, v, conflict=q_scope_parent))
+            if c["has_temporal"]:
+                tcol = [k for k in c["rowseed"] if "now()" in c["rowseed"][k]][0]
+                v2 = row_values(q, {**c["rowseed"], tcol: "now() - interval '1 day'"}, salt=c["idx"] + 50); anc(v2, q); stmts.append(insert(q, v2) + "  -- expired")
+        if primary:
+            ov = {}
+            if primary["scalar_link"]: ov[primary["scalar_link"]] = foreign_val(pkind)
+            for col in primary["rowseed"]:
+                if "ARRAY[" in primary["rowseed"][col]: ov[col] = foreign_val("array_col")
+                elif "now()" in primary["rowseed"][col]: ov[col] = "now() + interval '1 day'"
+            v = row_values(q, {**primary["rowseed"], **ov}, salt=99); anc(v, q); stmts.append(insert(q, v) + "  -- foreign")
+        elif any_grant:
+            for i in range(2):
+                v = row_values(q, {}, salt=i); anc(v, q); stmts.append(insert(q, v))
+    if q_scope_parent:
+        seed_main(); seed_aux()
+    else:
+        seed_aux(); seed_main()
 
     # ── rival tenant: the "authenticated, not authorized" negative control is a LEGITIMATE user of a
     #    DIFFERENT tenant (org B), not a no-tenant outsider — so a green block proves cross-tenant isolation
@@ -1346,7 +1933,7 @@ def _synthesize_row(conn, schema, table, fixed=None, _depth=0, budget=24):
     return None, None, None
 
 
-def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks=None, cuniques=None, relchecks=None, compfks=None, helpers=True, grants_map=None, conn=None):
+def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks=None, cuniques=None, relchecks=None, compfks=None, helpers=True, grants_map=None, conn=None, implicit_deny=False):
     """Native Supabase FLAT pgTAP form: begin; plan(N); inline AAA; finish(); rollback.
 
     helpers=True (DEFAULT): tests read natively — tests.create_supabase_user / authenticate_as /
@@ -1359,6 +1946,25 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
     q = S["q"]; seed = S["seed"]; total_rows = S["total_rows"]
     insert_plan = S["insert_plan"]; nobody_ins = S["nobody_ins"]; fill = S["fill"]
     rowlinked = S["rowlinked"]
+    # Membership EXISTS with an internal opaque-fn conjunct (e.g. `m.room_topic = realtime.topic()`): mock the
+    # fn to the seeded membership-scope value so the member row satisfies it. Prepend to `seed` so every
+    # (re)seed installs it as the privileged role (wiring proof — the fn's own logic stays unverified -> footgun).
+    _seed_fn_mock = False
+    if conn is not None:
+        _fm, _seen = [], set()
+        for _cmd0 in per:
+            for _c0 in per[_cmd0]["classes"]:
+                for _mk0 in _c0.get("fn_mocks", []):
+                    _sig0 = _opaque_fn_sig(conn, _mk0["node"])
+                    if not _sig0:
+                        continue
+                    _st0 = (f"CREATE OR REPLACE FUNCTION {_sig0['q']}({_sig0['args']}) RETURNS {_sig0['rettype']} "
+                            f"LANGUAGE sql AS $$ SELECT '{_mk0['value']}'::{_sig0['rettype']} $$")
+                    if _st0 not in _seen:
+                        _seen.add(_st0); _fm.append(_st0)
+        if _fm:
+            seed = ";\n".join(_fm) + ";\n" + seed
+            _seed_fn_mock = True
     cj = lambda c: json.dumps(c["claims"])
     NB = json.dumps({"sub": NOBODY, "role": "authenticated"})
 
@@ -1382,7 +1988,8 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
     # real pgTAP keeps its test counter in txn-local state, and ROLLBACK TO SAVEPOINT would unwind it
     # (-> "planned N ran M" under pg_prove). Re-seeding isolates without touching the counter; the outer
     # ROLLBACK still discards everything at the end.
-    reseed = f"RESET ROLE;\nDELETE FROM {q};\n{seed}"
+    seed_emit = _wrap_seed(seed)   # P2b: fault-tolerant arrange for the EMITTED file (raw `seed` still used for the live probe)
+    reseed = f"RESET ROLE;\nDELETE FROM {q};\n{seed_emit}"
     def read_test(cjson, role, assertion):
         n[0] += 1; body.extend(ident(cjson, role)); body.append(assertion); body.append("RESET ROLE;")
     def mut_test(cjson, role, assertion):
@@ -1594,7 +2201,7 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
             return s if any(k in t for k in ("int", "numeric", "double", "real", "decimal")) else "'" + s + "'"
         def _claims_for(gate, V):
             base = {"sub": NOBODY, "role": "authenticated"}
-            if gate["kind"] != "guc":
+            if gate["kind"] not in ("guc", "mockfn"):   # mockfn drives the predicate via the function mock, not a claim
                 node = [V] if gate["kind"] == "claim_array" else V
                 for k in reversed(gate["path"]):
                     node = {k: node}
@@ -1624,11 +2231,17 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
             else: act = None
             def one(who, V, role):
                 guc = (gate["name"], V) if (gate["kind"] == "guc" and V is not None) else None
+                mock_sql = None
+                if gate["kind"] == "mockfn":
+                    who = who + " [mocked; wiring]"   # flips the report's mock footgun; identity parsing still keys on who's words
+                    mv = V if V is not None else Vb   # value the opaque fn is mocked to return (=Va matches the seeded col -> grant)
+                    mock_sql = (f"CREATE OR REPLACE FUNCTION {gate['q']}({gate['args']}) RETURNS {gate['rettype']} "
+                                f"LANGUAGE sql AS $$ SELECT {_vlit(gate['rettype'], mv)}::{gate['rettype']} $$")
                 claims = None if role == "anon" else _claims_for(gate, V)
                 pid = ([f"SELECT set_config('{guc[0]}', '{guc[1]}', true)"] if guc else [])
                 pid += (["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"] if role == "anon"
                         else [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true)", "SET LOCAL ROLE authenticated"])
-                arrange = [f"DELETE FROM {q}"] + ([] if cmd == "INSERT" else [seedrow])
+                arrange = [f"DELETE FROM {q}"] + ([mock_sql] if mock_sql else []) + ([] if cmd == "INSERT" else [seedrow])
                 if cmd == "SELECT":
                     o = _probe(conn, arrange, pid, "read", f"SELECT count(*) FROM {q}")
                     if o[2]: asrt = _unrel_fail(desc, "SELECT: " + who, o)
@@ -1645,6 +2258,7 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                 body.append("RESET ROLE;")
                 body.append(f"DELETE FROM {q};")
                 if cmd != "INSERT": body.append(seedrow + ";")
+                if mock_sql: body.append(mock_sql + ";")   # install the fn mock as the privileged role, before SET ROLE
                 if guc: body.append(f"SELECT set_config('{guc[0]}', '{guc[1]}', true);")
                 body.extend(["SELECT set_config('request.jwt.claims', '', true);", "SET LOCAL ROLE anon;"] if role == "anon"
                             else [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true);", "SET LOCAL ROLE authenticated;"])
@@ -1653,7 +2267,7 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                 body.append(reseed)
             one("authenticated, authorized", Va, "authenticated")
             one("authenticated, not authorized", Vb, "authenticated")
-            one("anon", Vb if gate["kind"] == "guc" else None, "anon")   # GUC: give anon a valid (mismatch) value so the ::uuid cast can't 22P02
+            one("anon", Vb if gate["kind"] in ("guc", "mockfn") else None, "anon")   # GUC/mockfn: give anon a valid (mismatch) value so the ::uuid cast can't 22P02
             return True
         def synth_recursion_emit(cmd, rg):
             """Seed an ancestor chain (root owned by the user + a descendant) so a self-referential
@@ -1691,6 +2305,169 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
             one("authenticated, not authorized", U2, "authenticated")
             one("anon", None, "anon")
             return True
+        def mock_force_emit(cmd):
+            """Last-resort wiring proof: the predicate references opaque fn(s) no specific path handled. MOCK
+            them to FORCE the predicate true (authorized -> grant) and false (-> deny), PROBE to OBSERVE the
+            real outcome, and bake it. Bails to NT if the forced-grant isn't actually observed -> never a
+            false pass. Single min-term, equality-coordinated atoms only (see _force_atom_plan). The fn's own
+            logic stays unverified -> [mocked; wiring] tag -> report footgun."""
+            ucls = [c for c in per.get(cmd, {}).get("classes", []) if not c.get("handled") and c.get("raw_atoms")]
+            if len(ucls) != 1:                                  # multi-OR opaque -> honest NT
+                return False
+            fns, seedcols = {}, {}
+            for node in ucls[0]["raw_atoms"]:
+                plan = _force_atom_plan(conn, node, coltypes)
+                if not plan:                                    # an atom we can't force -> bail (NT)
+                    return False
+                for (sig, tv, fv) in plan["fns"]:
+                    k = sig["q"]
+                    if k in fns and (fns[k]["t"] != tv or fns[k]["f"] != fv):
+                        return False                            # same fn needs conflicting values -> bail
+                    fns[k] = {"sig": sig, "t": tv, "f": fv}
+                if plan["seed"]:
+                    sc, sv = plan["seed"]
+                    if sc in seedcols and seedcols[sc] != sv:
+                        return False
+                    seedcols[sc] = sv
+            if not fns:
+                return False
+            recipe, srow, setup = _synthesize_row(conn, schema, table, fixed=seedcols)
+            if recipe is None or not srow:
+                return False
+            setup = setup or []
+            ins = f"INSERT INTO {q}({', '.join(srow)}) VALUES ({', '.join(srow.values())})"
+            def mocks(which):
+                return [f"CREATE OR REPLACE FUNCTION {f['sig']['q']}({f['sig']['args']}) RETURNS {f['sig']['rettype']} LANGUAGE sql AS $$ SELECT {f[which]} $$" for f in fns.values()]
+            if cmd == "UPDATE":
+                if not upd_col: return False
+                act = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
+            elif cmd == "DELETE": act = f"DELETE FROM {q}"
+            elif cmd == "INSERT": act = ins
+            elif cmd == "SELECT": act = None
+            else: return False
+            def arr(which):
+                base = [f"DELETE FROM {q}"] + mocks(which) + setup
+                return base if cmd == "INSERT" else base + [ins]
+            NBpid = [f"SELECT set_config('request.jwt.claims', {_qlit(NB)}, true)", "SET LOCAL ROLE authenticated"]
+            anonpid = ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"]
+            if cmd == "SELECT":   # GRANT probe FIRST: only bake if forcing the fn true actually grants
+                og = _probe(conn, arr("t"), NBpid, "read", f"SELECT count(*) FROM {q}")
+                if og[2] or og[0] != "count" or og[1] < 1: return False
+                od = _probe(conn, arr("f"), NBpid, "read", f"SELECT count(*) FROM {q}")
+                oa = _probe(conn, arr("f"), anonpid, "read", f"SELECT count(*) FROM {q}")
+            else:
+                og = _probe(conn, arr("t"), NBpid, "write", act)
+                if og[2] or not (og[0] == "rows" and og[1] >= 1): return False
+                od = _probe(conn, arr("f"), NBpid, "write", act)
+                oa = _probe(conn, arr("f"), anonpid, "write", act)
+            def bake(o, who):
+                if cmd == "SELECT":
+                    if o[2]: return _unrel_fail(desc, "SELECT: " + who, o)
+                    if o[0] == "count": return f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s)')} );"
+                    return f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );"
+                if o[2]: return _unrel_fail(desc, cmd + ": " + who, o)
+                if o[0] == "err" and o[1] != "42501": return _unrel_fail(desc, cmd + ": " + who, ("err", o[1], "the test action raised " + o[1] + ", a constraint/validity error (not the RLS denial 42501) — the probe's own value, not a policy result"))
+                if o[0] == "err": return f"SELECT throws_ok( $$ {act} $$, '{o[1]}', NULL, {desc(cmd + ': ' + who + ' denied (' + o[1] + ')')} );"
+                if o[0] == "rows" and o[1] >= 1: return f"SELECT isnt_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affected ' + str(o[1]) + ' row(s)')} );"
+                return f"SELECT is_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + who + ' affects 0 rows')} );"
+            def emit_one(o, who, which, role):
+                n[0] += 1
+                body.append("RESET ROLE;"); body.append(f"DELETE FROM {q};")
+                body.extend((s.rstrip().rstrip(';') + ";") for s in mocks(which))
+                body.extend((s.rstrip().rstrip(';') + ";") for s in setup)
+                if cmd != "INSERT": body.append(ins + ";")
+                body.extend(["SELECT set_config('request.jwt.claims', '', true);", "SET LOCAL ROLE anon;"] if role == "anon"
+                            else [f"SELECT set_config('request.jwt.claims', {_qlit(NB)}, true);", "SET LOCAL ROLE authenticated;"])
+                body.append(bake(o, who)); body.append("RESET ROLE;"); body.append(reseed)
+            fnlist = ", ".join(f["sig"]["name"] + "()" for f in fns.values())
+            emit_one(og, "authenticated, authorized when " + fnlist + " [mocked; wiring]", "t", "authenticated")
+            emit_one(od, "authenticated, not authorized when " + fnlist + " forced false [mocked; wiring]", "f", "authenticated")
+            emit_one(oa, "anon [mocked; wiring]", "f", "anon")
+            return True
+        def _construct_witness(expr):
+            """BL-6 construct-first DB-ORACLE floor: when no specific leaf can witness `expr`, vary a single free
+            row column over a bounded candidate set and let Postgres tell us which value makes the predicate TRUE
+            (grant) vs FALSE (deny). A brand-new operator/function (`starts_with(col,'x')`, `col % 2 = 0`, a custom
+            operator) becomes solvable with ZERO operator-specific code. Returns (sat, fal) witness contexts or
+            None. SOUND: every candidate is DB-probed and only a confirmed true+false pair is returned (and
+            solve_emit re-verifies before baking) -> never a false pass; no pair within budget -> honest NT.
+            Scope: row-column-driven predicates (claim-dependent ones are left to the claim-aware leaves / NT)."""
+            if _jwt_anywhere(expr):                       # claim-dependent -> not the row-column floor
+                return None
+            cols = _expr_cols(expr, coltypes)
+            if not cols:
+                return None
+            col = cols[0]; ct = coltypes.get(col, "text")
+            cands = []
+            for v in (_candidate_values(ct, enums) + _expr_consts(expr)):
+                if v not in cands: cands.append(v)
+            parents, base_row = _mock_valid_row(schema, table, fkmap, colsmap, enums, checks, relchecks, compfks)
+            pid = [f"SELECT set_config('request.jwt.claims', {_qlit(json.dumps({'sub': _WV_UID, 'role': 'authenticated'}))}, true)",
+                   "SET LOCAL ROLE authenticated"]
+            grant_v = deny_v = None; got_g = got_d = False
+            for cand in cands:
+                rr = dict(base_row); rr[col] = _wv_lit(ct, cand)
+                ins = f"INSERT INTO {q}({', '.join(rr)}) VALUES ({', '.join(rr.values())})"
+                o = _probe(conn, [f"DELETE FROM {q}"] + parents + [ins], pid, "read", f"SELECT count(*) FROM {q}")
+                if o[2] or o[0] != "count":
+                    continue                               # this candidate couldn't be seeded/observed -> try the next
+                if o[1] >= 1 and not got_g: grant_v, got_g = cand, True
+                elif o[1] == 0 and not got_d: deny_v, got_d = cand, True
+                if got_g and got_d: break
+            if not (got_g and got_d):
+                return None
+            sat = _wv_ctx(); sat["sub"] = _WV_UID; sat["row"][col] = grant_v
+            fal = _wv_ctx(); fal["sub"] = _WV_UID; fal["row"][col] = deny_v
+            return (sat, fal)
+        def _search_witness(expr):
+            """BL-11 JOINT signature-driven DB-oracle search — the completion of the construct-first floor. Where
+            `_construct_witness` varies a SINGLE row column, this collects the FULL controllable signature the
+            predicate references (every row column AND every JWT claim path) and searches a bounded cross-product
+            of (session x row) candidate assignments, letting Postgres judge each, until it finds one that GRANTS
+            and one that DENIES. Closes the two real residual gaps: genuinely JOINT multi-column predicates and
+            CLAIM-dependent novel predicates (which `_construct_witness` refuses outright). Budget-capped ->
+            honest NT beyond the bound; DB-confirmed (solve_emit re-verifies before baking) -> never a false pass.
+            Out of scope (correctly NT): hidden/external-state functions, and satisfiers outside the candidate set."""
+            import itertools
+            cols = _expr_cols(expr, coltypes)
+            cpaths = _claim_paths(expr)
+            if not (cols or cpaths) or len(cols) > 3:        # nothing controllable, or too many cols (combinatorial)
+                return None
+            cands = {c: list(dict.fromkeys(_candidate_values(coltypes.get(c, "text"), enums) + _expr_consts(expr))) for c in cols}
+            combos = [dict(zip(cols, p)) for p in itertools.product(*[cands[c] for c in cols])] if cols else [{}]
+            if len(combos) > 96:
+                combos = combos[:96]
+            sessions = _candidate_sessions(cpaths)
+            parents, base_row = _mock_valid_row(schema, table, fkmap, colsmap, enums, checks, relchecks, compfks)
+            def _pid(sub, claimset):
+                base = {"role": "authenticated"}
+                if sub: base["sub"] = sub
+                for keys, val in claimset: _set_claim(base, keys, val)
+                return [f"SELECT set_config('request.jwt.claims', {_qlit(json.dumps(base))}, true)", "SET LOCAL ROLE authenticated"]
+            sat = fal = None; budget = 220
+            for (sub, claimset) in sessions:
+                pid = _pid(sub, claimset)
+                for combo in combos:
+                    if budget <= 0: break
+                    budget -= 1
+                    rr = dict(base_row)
+                    for c, v in combo.items(): rr[c] = _wv_lit(coltypes.get(c, "text"), v)
+                    ins = f"INSERT INTO {q}({', '.join(rr)}) VALUES ({', '.join(rr.values())})"
+                    o = _probe(conn, [f"DELETE FROM {q}"] + parents + [ins], pid, "read", f"SELECT count(*) FROM {q}")
+                    if o[2] or o[0] != "count":
+                        continue
+                    if o[1] >= 1 and sat is None: sat = (sub, claimset, combo)
+                    elif o[1] == 0 and fal is None: fal = (sub, claimset, combo)
+                    if sat and fal: break
+                if sat and fal: break
+            if not (sat and fal):
+                return None
+            def _ctx(sub, claimset, combo):
+                ctx = _wv_ctx(); ctx["sub"] = sub
+                ctx["claims"].extend(claimset)
+                for c, v in combo.items(): ctx["row"][c] = v
+                return ctx
+            return (_ctx(*sat), _ctx(*fal))
         def solve_emit(cmd, node=None):
             """General fallback: derive a witness for an ARBITRARY predicate, VERIFY it against the DB, and
             bake the observed grant/deny pair. With `node` given, solve THAT one predicate (per-min-term
@@ -1711,6 +2488,10 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                 if expr_node is None:
                     continue
                 plan = _solve_predicate(expr_node, coltypes, enums)
+                if not plan or plan[0] is None or plan[1] is None:   # no specific-leaf witness ...
+                    plan = _construct_witness(expr_node)             # ... BL-6 floor: DB-oracle search over a single column ...
+                if not plan or plan[0] is None or plan[1] is None:
+                    plan = _search_witness(expr_node)                # ... BL-11: joint search over (session x multi-column) candidates
                 if not plan or plan[0] is None or plan[1] is None:   # need BOTH a true and a false witness for a grant/deny pair
                     continue
                 sat, fal = plan
@@ -1746,7 +2527,15 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                     n[0] += 1
                     body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_f); body.extend(s + ";" for s in idsql(f_claims, f_gucs))
                     body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized sees nothing [solver]')} );")
-                    body.append("RESET ROLE;"); body.append(reseed)
+                    body.append("RESET ROLE;")
+                    oa = _probe(conn, arr_t, ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"], "read", f"SELECT count(*) FROM {q}")
+                    if not oa[2]:   # also probe anon so the matrix is complete (no stray '– not tested' cell)
+                        n[0] += 1
+                        body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_t)
+                        body.append("SELECT set_config('request.jwt.claims', '', true);"); body.append("SET LOCAL ROLE anon;")
+                        body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, {oa[1]}, {desc('SELECT: anon sees ' + str(oa[1]) + ' row(s) [solver]')} );" if oa[0] == "count"
+                                    else f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{oa[1]}', NULL, {desc('SELECT: anon denied (' + oa[1] + ') [solver]')} );")
+                        body.append("RESET ROLE;"); body.append(reseed)
                     return True
                 if cmd == "INSERT":
                     act_t, act_f = rowins(s_row), rowins(f_row)
@@ -1776,6 +2565,91 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                 else:
                     body.append(f"SELECT is_empty( $$ {act_f} RETURNING 1 $$, {desc(cmd + ': authenticated, not authorized affects 0 rows [solver]')} );")
                 body.append("RESET ROLE;"); body.append(reseed)
+                oa = _probe(conn, arr_t, ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"], "write", act_t)
+                if not oa[2]:   # also probe anon so the matrix is complete (no stray '– not tested' cell)
+                    n[0] += 1
+                    body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_t)
+                    body.append("SELECT set_config('request.jwt.claims', '', true);"); body.append("SET LOCAL ROLE anon;")
+                    if oa[0] == "err":
+                        body.append(f"SELECT throws_ok( $$ {act_t} $$, '{oa[1]}', NULL, {desc(cmd + ': anon denied (' + oa[1] + ') [solver]')} );")
+                    elif oa[0] == "rows" and oa[1] >= 1:
+                        body.append(f"SELECT isnt_empty( $$ {act_t} RETURNING 1 $$, {desc(cmd + ': anon CAN act (policy permits anon) - REVIEW [solver]')} );")
+                    else:
+                        body.append(f"SELECT is_empty( $$ {act_t} RETURNING 1 $$, {desc(cmd + ': anon affects 0 rows [solver]')} );")
+                    body.append("RESET ROLE;"); body.append(reseed)
+                return True
+            return False
+        def relstate_emit(cmd):
+            """BL-12 RELATIONAL-STATE DB-oracle floor: a policy gated on the STATE of the tables it reads (a
+            COUNT/aggregate threshold, a multi-row condition) is not a fixed shape. Find the aux tables the
+            policy's subqueries read, SEED A CANDIDATE NUMBER of matching rows (cardinalities taken from the
+            predicate's own integer constants + small defaults), and let Postgres evaluate the REAL aggregate:
+            the cardinality that makes the gated row visible is the witness, one that hides it is the falsifier.
+            The DB computes the count/sum, so a brand-new aggregate gate works with ZERO per-operator code.
+            Probe-and-baked (sound) + budget-capped -> honest NT past the bound. SELECT only (the common case)."""
+            if cmd != "SELECT":
+                return False
+            _rc = conn.cursor()
+            _rc.execute("SELECT qual FROM pg_policies WHERE schemaname=%s AND tablename=%s AND cmd IN ('SELECT','ALL') AND permissive='PERMISSIVE'", (schema, table))
+            for (qual,) in _rc.fetchall():
+                node = _where(qual) if qual else None
+                if node is None:
+                    continue
+                subs = _subquery_tables(node)
+                if not subs or len(subs) > 2:               # nothing to vary, or too many aux tables (combinatorial)
+                    continue
+                ints = sorted({int(c) for c in _expr_consts(node) if str(c).lstrip("-").isdigit()})
+                Kc = [k for k in sorted(set([0, 1, 2] + ints + [i + 1 for i in ints] + [max(0, i - 1) for i in ints])) if 0 <= k <= 12][:8]
+                parents, base_row = _mock_valid_row(schema, table, fkmap, colsmap, enums, checks, relchecks, compfks)
+                pid = [f"SELECT set_config('request.jwt.claims', {_qlit(json.dumps({'sub': _WV_UID, 'role': 'authenticated'}))}, true)", "SET LOCAL ROLE authenticated"]
+                grow = {}
+                for s in subs:
+                    for (_mc, gcol) in s["corr"]: grow[gcol] = s["scope"]
+                def aux_seed(K):                            # DELETE each aux table, then seed K matching rows
+                    out = []
+                    for s in subs:
+                        out.append(f"DELETE FROM {s['mtable']}")
+                        cols = {}
+                        if s["uid"]: cols[s["uid"]] = _WV_UID
+                        for (mcol, _g) in s["corr"]: cols[mcol] = s["scope"]
+                        cols.update(s["extras"])
+                        for nc in s["num"]: cols[nc] = "1000000"
+                        for _ in range(K):
+                            out += _seed_one(s["mtable"], {k: f"'{v}'" for k, v in cols.items()}, fkmap, colsmap, enums)
+                    return out
+                def gated_ins():
+                    rr = dict(base_row)
+                    for c, v in grow.items(): rr[c] = _wv_lit(coltypes.get(c, "text"), v)
+                    if not rr:                              # every column has a default (no required cols) -> DEFAULT VALUES
+                        return f"INSERT INTO {q} DEFAULT VALUES"
+                    return f"INSERT INTO {q}({', '.join(rr)}) VALUES ({', '.join(rr.values())})"
+                satK = falK = satN = None
+                for K in Kc:
+                    o = _probe(conn, [f"DELETE FROM {q}"] + parents + aux_seed(K) + [gated_ins()], pid, "read", f"SELECT count(*) FROM {q}")
+                    if o[2] or o[0] != "count":
+                        continue
+                    if o[1] >= 1 and satK is None: satK, satN = K, o[1]
+                    elif o[1] == 0 and falK is None: falK = K
+                    if satK is not None and falK is not None:
+                        break
+                if satK is None or falK is None:
+                    continue
+                def bake(K, who, cnt, role):
+                    n[0] += 1
+                    body.append("RESET ROLE;")
+                    body.extend(s + ";" for s in ([f"DELETE FROM {q}"] + parents + aux_seed(K) + [gated_ins()]))
+                    if role == "anon":
+                        body.extend(["SELECT set_config('request.jwt.claims', '', true);", "SET LOCAL ROLE anon;"])
+                    else:
+                        body.extend(s + ";" for s in pid)
+                    body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, {cnt}, {desc('SELECT: ' + who + ' [relstate]')} );")
+                    body.append("RESET ROLE;")
+                bake(satK, f"authenticated, authorized (relstate: {satK} row(s)) sees its row", satN, "authenticated")
+                bake(falK, f"authenticated, not authorized (relstate: {falK} row(s)) sees nothing", 0, "authenticated")
+                _oa = _probe(conn, [f"DELETE FROM {q}"] + parents + aux_seed(satK) + [gated_ins()], ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"], "read", f"SELECT count(*) FROM {q}")
+                if not _oa[2] and _oa[0] == "count":
+                    bake(satK, f"anon (relstate) sees {_oa[1]} row(s)", _oa[1], "anon")
+                body.append(reseed)
                 return True
             return False
 
@@ -1799,10 +2673,14 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                 rg = _synth_recursion_gate(conn, schema, table, fkmap)   # self-referential hierarchy -> SEED an ancestor chain
                 if rg and synth_recursion_emit(cmd, rg):
                     continue
-                if udfs:                                                  # opaque function -> MOCK it (wiring)
+                if udfs:                                                  # opaque BOOLEAN function -> MOCK it (wiring)
                     mock_emit(cmd)
-                elif solve_emit(cmd):                                      # general witness solver (DB-verified) -> last resort before NOT_TESTABLE
+                elif solve_emit(cmd):                                      # general witness solver (DB-verified)
                     continue
+                elif relstate_emit(cmd):                                   # BL-12: relational-state (cardinality/aggregate) DB-oracle floor
+                    continue
+                else:                                                      # opaque SCALAR fn in a comparison -> force-mock (wiring), else NT
+                    mock_force_emit(cmd)
             elif _shadowed_fn:                                            # mixed: also wiring-test the shadowed opaque-fn branch
                 mock_emit(cmd)
             # BL-1: a classifiable branch handled this command, but OTHER min-terms carry a novel (unclassified)
@@ -1819,9 +2697,9 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                     if o[2]:
                         _a = _unrel_fail(desc, "SELECT: " + who, o)
                     elif o[0] == "count":
-                        _a = f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' sees ' + str(o[1]) + ' row(s)')} );"
+                        _a = f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + (' [mocked; wiring]' if _seed_fn_mock else '') + ' sees ' + str(o[1]) + ' row(s)')} );"
                     else:
-                        _a = f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' denied (' + o[1] + ')')} );"
+                        _a = f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + (' [mocked; wiring]' if _seed_fn_mock else '') + ' denied (' + o[1] + ')')} );"
                     read_test(cjson, role, _a)
                     continue
                 if cmd == "INSERT":
@@ -1870,6 +2748,43 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                                 if _ov[0] == "rows" and _ov[1] >= 1 and not _ov[2]:   # accepted a value its own policy forbids -> leak (skip if precondition was unreliable)
                                     mut_test(cjson, role, f"SELECT throws_ok( $$ {_tact} $$, '42501', NULL, {desc('UPDATE: ' + who + ' can set ' + _vcol + '=' + _V + ', but policy [' + str(c.get('src_policy')) + '] WITH CHECK permits only {' + ', '.join(sorted(_allowed)) + '} -- cross-policy WITH CHECK leak [transition-leak]')} );")
 
+        # IMPLICIT-DENY (opt-in --implicit-deny): RLS is ON and these commands have NO policy -> deny-by-default.
+        # Probe each client identity and bake the OBSERVED deny so the FULL command matrix is governed in CI: a
+        # future too-broad GRANT or policy that lets a no-policy command through then turns this test red.
+        # Probe-and-bake (sound): only a cleanly-observed deny is baked; an unreliable seed or a non-RLS
+        # constraint error (our own malformed action) is skipped, never asserted.
+        if implicit_deny:
+            for cmd in [c for c in _CMDS4 if c not in (set(cmds) | _pol)]:
+                for who, role, cj0 in [("authenticated, no policy", "authenticated", NB), ("anon, no policy", "anon", "")]:
+                    if cmd == "SELECT":
+                        o = _probe(conn, arrange_stmts, pident(cj0, role), "read", f"SELECT count(*) FROM {q}")
+                        if o[2]:
+                            continue
+                        if o[0] == "count":
+                            _a = f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + who + ' (implicit deny) sees ' + str(o[1]) + ' row(s)')} );"
+                        else:
+                            _a = f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + who + ' (implicit deny) denied (' + o[1] + ')')} );"
+                        read_test(cj0, role, _a)
+                        continue
+                    if cmd == "INSERT":
+                        if not nobody_ins:
+                            continue
+                        action = f"INSERT INTO {q}({', '.join(nobody_ins)}) VALUES ({', '.join(nobody_ins.values())})"
+                    elif cmd == "UPDATE":
+                        if not upd_col:
+                            continue
+                        action = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
+                    else:
+                        action = f"DELETE FROM {q}"
+                    o = _probe(conn, arrange_stmts, pident(cj0, role), "write", action)
+                    if o[2] or (o[0] == "err" and o[1] != "42501"):
+                        continue   # unreliable seed, or our own action raised a non-RLS constraint error -> don't bake
+                    if o[0] == "err":
+                        mut_test(cj0, role, f"SELECT throws_ok( $$ {action} $$, '{o[1]}', NULL, {desc(cmd + ': ' + who + ' (implicit deny) denied (' + o[1] + ')')} );")
+                    elif o[0] == "rows" and o[1] >= 1:
+                        mut_test(cj0, role, f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' (implicit deny) must affect 0 rows — no policy means deny')} );")
+                    else:
+                        mut_test(cj0, role, f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' (implicit deny) affects 0 rows')} );")
     body_text = "\n".join(body)
     if helpers:
         creates = "\n".join(
@@ -1886,8 +2801,8 @@ SELECT plan({n[0]});
 -- Arrange: create test users (fixed uids), then seed as the privileged (RLS-bypassing) connection role.
 -- NOTE: grants are NOT re-granted — tests run against the database's real grants so a missing grant is proven, not masked.
 {creates}
-DELETE FROM {q};
-{seed}
+SELECT public._rlsa_try($rlsa_seed$ DELETE FROM {q} $rlsa_seed$);
+{seed_emit}
 """
     else:
         header = f"""-- GENERATED by rlsautotest (flat, self-contained / --no-helpers) from {q}.
@@ -1898,8 +2813,8 @@ BEGIN;
 SELECT plan({n[0]});
 -- Arrange: seed as the privileged (RLS-bypassing) connection role.
 -- NOTE: grants are NOT re-granted — tests run against the database's real grants so a missing grant is proven, not masked.
-DELETE FROM {q};
-{seed}
+SELECT public._rlsa_try($rlsa_seed$ DELETE FROM {q} $rlsa_seed$);
+{seed_emit}
 """
     return header + "\n" + body_text + "\n\nSELECT * FROM finish();\nROLLBACK;\n"
 
@@ -1993,7 +2908,11 @@ BEGIN
     EXECUTE $b$ CREATE OR REPLACE FUNCTION public.fail(text) RETURNS text LANGUAGE sql AS $q$ SELECT public._rlsa_ok(false, $1) $q$ $b$;
   END IF;
 END
-$rlsa$;"""
+$rlsa$;
+-- Seed-swallow helper: runs an arrange statement and SWALLOWS any error (in its own subtransaction) so a
+-- failing seed for a genuinely un-seedable table does NOT abort the whole pgTAP file -> the table stays empty
+-- and the baked UNRELIABLE assertion still runs and prints a clean `not ok` line (instead of an opaque abort).
+CREATE OR REPLACE FUNCTION public._rlsa_try(sql text) RETURNS void LANGUAGE plpgsql AS $rt$ BEGIN EXECUTE sql; EXCEPTION WHEN OTHERS THEN NULL; END $rt$;"""
 
 
 def _basejump_present(cur):
@@ -2174,9 +3093,107 @@ def _synth_required_cols(conn, schema, table, fkmap):
     return req, False
 
 
+def _opaque_fn_sig(conn, node, allow_bool=False):
+    """If `node` is a call to a NON-builtin user function (optionally wrapped in a `(SELECT fn() ...)`
+    sublink), return its mock signature {q,args,rettype,def,name}; else None. By default boolean fns are
+    excluded (the mock_emit wiring path owns those); pass allow_bool=True for the general force-mock fallback.
+    Used to MOCK an opaque scalar fn that is COMPARED to a column (e.g. `realtime.topic() = room_topic`):
+    we can't reason into the function, but we can replace it with a constant and seed the other side to
+    match/mismatch — a wiring proof (the function's own logic stays unverified). Boolean fns are excluded
+    here (the mock_emit wiring path owns those)."""
+    n = node
+    if _t(n) == "SubLink":
+        sv = _v(n)
+        if sv.get("subLinkType") != "EXPR_SUBLINK":
+            return None
+        tl = (sv.get("subselect") or {}).get("SelectStmt", {}).get("targetList", [])
+        if not tl:
+            return None
+        n = tl[0].get("ResTarget", {}).get("val")
+    n = _unwrap(n) if n else n
+    if not n or _t(n) != "FuncCall":
+        return None
+    fn = _names(_v(n).get("funcname")); short = fn.split(".")[-1]
+    if any(b in fn for b in ("auth.", "pg_catalog.")) or short in ("now", "current_setting", "uid", "jwt", "role"):
+        return None   # context primitives are CONTROLLED (claims/GUC), not mocked
+    nsp = fn.split(".")[0] if "." in fn else None
+    cur = conn.cursor()
+    if nsp:
+        cur.execute("""SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid),
+            format_type(p.prorettype,NULL), pg_get_functiondef(p.oid), t.typname
+            FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_type t ON t.oid=p.prorettype
+            WHERE n.nspname=%s AND p.proname=%s LIMIT 1""", (nsp, short))
+    else:
+        cur.execute("""SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid),
+            format_type(p.prorettype,NULL), pg_get_functiondef(p.oid), t.typname
+            FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_type t ON t.oid=p.prorettype
+            WHERE p.proname=%s AND n.nspname NOT IN ('pg_catalog','information_schema','auth') LIMIT 1""", (short,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    nspn, pn, args, rettype, fdef, typ = r
+    if typ == "bool" and not allow_bool:
+        return None   # boolean policy fns are wiring-tested by mock_emit, not the scalar `col = fn()` gate
+    return {"q": f'"{nspn}"."{pn}"', "args": args, "rettype": rettype, "def": fdef, "name": pn}
+
+
+def _mocklit(rettype, raw):
+    """A SQL literal of `rettype` for a function-mock body (`SELECT <lit>`)."""
+    rt = (rettype or "").lower()
+    if rt in ("boolean", "bool"):
+        return "true" if str(raw).lower() in ("true", "t", "1") else "false"
+    if any(k in rt for k in ("int", "numeric", "real", "double", "decimal", "money", "serial")) and re.fullmatch(r"-?\d+(\.\d+)?", str(raw or "")):
+        return str(raw)
+    return "'" + str(raw).replace("'", "''") + "'::" + (rettype or "text")
+
+
+def _force_sentinels(typ):
+    t = (typ or "text").lower()
+    if "uuid" in t: return ("5cf00000-0000-4000-8000-0000000000a1", "5cf00000-0000-4000-8000-0000000000b2")
+    if any(k in t for k in ("int", "numeric", "real", "double", "decimal", "money", "serial")): return ("424242", "515151")
+    if "bool" in t: return ("true", "false")
+    return ("rlsf_a", "rlsf_b")
+
+
+def _force_atom_plan(conn, node, coltypes):
+    """How to FORCE one unhandled atom true/false by mocking the opaque fn(s) in it. Returns
+       {"fns": [(sig, true_lit, false_lit), ...], "seed": (col, col_lit) | None}  or None if not forceable.
+    Covers: a boolean fn used as the atom; `fn() = const`; `col = fn()` (seed the col); `fn() = fn()`.
+    Equality only — ordering/pattern/arithmetic stay NT (force can't be coordinated soundly)."""
+    tnode = _t(node)
+    if tnode in ("FuncCall", "SubLink"):                       # boolean fn used directly as the predicate atom
+        sig = _opaque_fn_sig(conn, node, allow_bool=True)
+        if sig and (sig["rettype"] or "").lower() in ("boolean", "bool"):
+            return {"fns": [(sig, "true", "false")], "seed": None}
+        return None
+    if tnode != "A_Expr" or _names(_v(node).get("name")) != "=":
+        return None
+    L, R = _v(node).get("lexpr"), _v(node).get("rexpr")
+    sigL = _opaque_fn_sig(conn, L, allow_bool=True)
+    sigR = _opaque_fn_sig(conn, R, allow_bool=True)
+    if sigL and sigR:                                          # fn() = fn()  -> mock equal (true) / differ (false)
+        return {"fns": [(sigL, _mocklit(sigL["rettype"], "rlsf_eq"), _mocklit(sigL["rettype"], "rlsf_eq")),
+                        (sigR, _mocklit(sigR["rettype"], "rlsf_eq"), _mocklit(sigR["rettype"], "rlsf_ne"))], "seed": None}
+    sig = sigL or sigR
+    other = R if sigL else L
+    if not sig:
+        return None
+    c = _const(other)
+    if c is not None:                                          # fn() = const -> mock fn to const (true) / other (false)
+        Sd = str(int(c) + 1) if re.fullmatch(r"-?\d+", str(c)) else ("rlsf_other" if str(c) != "rlsf_other" else "rlsf_alt")
+        return {"fns": [(sig, _mocklit(sig["rettype"], c), _mocklit(sig["rettype"], Sd))], "seed": None}
+    col = _colname(other)
+    if col and col in coltypes:                                # col = fn() -> seed col, mock fn to match (true) / differ (false)
+        Sg, Sd = _force_sentinels(coltypes[col])
+        return {"fns": [(sig, _mocklit(sig["rettype"], Sg), _mocklit(sig["rettype"], Sd))],
+                "seed": (col, _mocklit(coltypes[col], Sg))}
+    return None
+
+
 def _synth_gate(conn, schema, table, cmd, coltypes):
-    """If the (single) policy for cmd gates on `col = <session GUC / JWT claim>` or `col = ANY(<array claim>)`,
-    return a plan to synthesize a matching identity. Probe-verified downstream, so a wrong guess is harmless."""
+    """If the (single) policy for cmd gates on `col = <session GUC / JWT claim>`, `col = ANY(<array claim>)`,
+    or `col = <opaque scalar fn()>` (mocked), return a plan to synthesize a matching identity. Probe-verified
+    downstream, so a wrong guess is harmless."""
     fld = "with_check" if cmd == "INSERT" else "qual"
     cur = conn.cursor()
     cur.execute(f"SELECT {fld} FROM pg_policies WHERE schemaname=%s AND tablename=%s AND cmd IN (%s,'ALL')", (schema, table, cmd))
@@ -2193,6 +3210,16 @@ def _synth_gate(conn, schema, table, cmd, coltypes):
         if col and col.group(1) in coltypes and keys:
             arr = ("jsonb_array_elements" in e) or re.search(r'=\s*ANY', e, re.I)
             return {"col": col.group(1), "kind": "claim_array" if arr else "claim_scalar", "path": keys}
+    # `col = <opaque scalar fn()>` (e.g. realtime.topic() = room_topic): mock the fn to the seeded value.
+    w = _where(e)
+    if w is not None and _t(w) == "A_Expr" and _names(_v(w).get("name")) == "=":
+        L, R = _v(w).get("lexpr"), _v(w).get("rexpr")
+        gcol = _colname(L) or _colname(R)
+        other = R if _colname(L) else L
+        if gcol in coltypes:
+            sig = _opaque_fn_sig(conn, other)
+            if sig:
+                return {"col": gcol, "kind": "mockfn", **sig}
     return None
 
 
@@ -2259,10 +3286,10 @@ def _load_ctx(cur, schema, table):
                 checks=checks, cuniques=cuniques, relchecks=relchecks, compfks=compfks)
 
 
-def _emit_both(schema, table, ctx, helpers, conn=None):
+def _emit_both(schema, table, ctx, helpers, conn=None, implicit_deny=False):
     nt = "".join(f"-- FOOTGUN NOTE: {x}\n" for x in ctx["notes"])
     args = (schema, table, ctx["per"], ctx["cmds"], ctx["cols"], ctx["fkmap"], ctx["colsmap"], ctx["enums"], ctx["unique_cols"], ctx["checks"], ctx["cuniques"], ctx["relchecks"], ctx["compfks"])
-    return nt + emit_flat(*args, helpers=helpers, grants_map=ctx.get("grants"), conn=conn), nt + emit(*args)
+    return nt + emit_flat(*args, helpers=helpers, grants_map=ctx.get("grants"), conn=conn, implicit_deny=implicit_deny), nt + emit(*args)
 
 
 _CMDS4 = ["SELECT", "INSERT", "UPDATE", "DELETE"]
@@ -2395,9 +3422,12 @@ def _table_report(cur, conn, schema, table, helpers):
         notes.append("UNRELIABLE TEST(S) - the test precondition (seed) could not be established for some identity/command, so the result is NOT trustworthy and the suite fails loudly rather than asserting a possibly-wrong outcome (investigate seeding): " + "; ".join(sorted(set(s.replace("UNRELIABLE - ", "") for s in unreliable_msgs))))
     if "UPDATE" in pol and not idgrid.get("UPDATE", {}).get("authorized") and ("UPDATE", "authorized") not in unreliable_cells:
         notes.append("UPDATE not fully tested - no policy-neutral column to modify (every column is PK / FK / unique or referenced by a policy), so the plain UPDATE grant could not be probed by SETting a harmless column. The '-' for UPDATE is a coverage gap, not a pass; review manually.")
-    return {"table": table, "rls_enabled": rls_on, "policied": sorted(pol),
-            "cells": cells, "idgrid": idgrid, "footguns": notes, "coverage": [ctx["cov"], ctx["tot"]],
-            "transition_leaks": leak_msgs, "unreliable": sorted(set(unreliable_msgs)), "unreliable_cells": unreliable_cells}
+    rep = {"table": table, "rls_enabled": rls_on, "policied": sorted(pol),
+           "cells": cells, "idgrid": idgrid, "footguns": notes, "coverage": [ctx["cov"], ctx["tot"]],
+           "transition_leaks": leak_msgs, "unreliable": sorted(set(unreliable_msgs)), "unreliable_cells": unreliable_cells}
+    # Explain EVERY '–' (not-tested) cell so a dash is never silent (NT-atom note + catch-all). See _explain_dashes.
+    notes.extend(_explain_dashes(rep, ctx["per"], notes))
+    return rep
 
 
 def emit_rls_guard(cur, schema):
@@ -2469,6 +3499,41 @@ def _id_cell(rep, ident, cmd):
     if observed_can:
         return ("✓", "danger", "SHOULD be blocked but CAN act — security hole")
     return ("✗", "fail", "SHOULD be allowed but is blocked — policy too strict")
+
+
+def _explain_dashes(rep, per, notes):
+    """Explain EVERY '–' (not-tested) cell so a dash is NEVER silent. Returns the note(s) to append.
+    Two kinds, keyed on the ACTUAL matrix (`_id_cell` 'na') so cells the solver/mock DID cover never trip it:
+      (a) the command carries an unhandled-class `reason` (an operator/atom we can't witness soundly:
+          `~`/`LIKE`, an opaque expression, an unsatisfiable NOT-IN, …) -> the NOT TESTABLE note; and
+      (b) a '–' with NO known reason on an otherwise-handled command -> the catch-all note: a seed row the
+          engine couldn't synthesize, or an identity a fallback emitter didn't probe. The UPDATE-no-neutral
+          case is excluded (it prints its own note, already in `notes`).
+    This is the report-side guarantee behind 'NT can never go silent': pair it with the loud UNRELIABLE /
+    BROKEN paths (which fail the gate) and every untested cell is accounted for."""
+    if not rep.get("rls_enabled"):
+        return []
+    out = []
+    nt_cells = [(cmd, idr) for (idr, _l) in _ID_ROWS if idr != "service_role"
+                for cmd in _CMDS4 if _id_cell(rep, idr, cmd)[1] == "na"]
+    nt_cmds = sorted({c for (c, _i) in nt_cells})
+    cmd_reasons = {cmd: sorted({c.get("reason") for c in per.get(cmd, {}).get("classes", [])
+                                if not c.get("handled") and c.get("reason")}) for cmd in nt_cmds}
+    nt_reasons = sorted({r for rs in cmd_reasons.values() for r in rs})
+    if nt_reasons:
+        out.append("NOT TESTABLE ('–' cells): the engine could not construct a sound witness for part of the "
+                   "policy, so it left those cells UNTESTED rather than guess (never a fabricated pass) -> "
+                   + "; ".join(nt_reasons) + ". Run `--debug-unhandled` for the exact branch(es) and test them separately.")
+    _upd_noneutral = any("no policy-neutral column" in f for f in notes)
+    unexplained = sorted({c for (c, _i) in nt_cells
+                          if not cmd_reasons.get(c) and not (c == "UPDATE" and _upd_noneutral)})
+    if unexplained:
+        out.append("UNTESTED ('–') with no established cause on: " + ", ".join(unexplained)
+                   + ". The engine could not establish a sound test for these cells — most often a seed row it "
+                   "could not synthesize (an unsatisfiable CHECK/FK, a UNIQUE collision, or a column type the "
+                   "filler doesn't know), occasionally a coverage gap. Treat them as NOT verified (never a pass); "
+                   "inspect the table's constraints, seed a row by hand, or run `--debug-unhandled`.")
+    return out
 
 
 def _table_status(r):
@@ -3123,6 +4188,7 @@ def main():
     ap.add_argument("--describe", action="store_true")
     ap.add_argument("--debug-unhandled", action="store_true", help="read-only: list every policy branch the CLASSIFIER couldn't recognize (table, command, policy, shape) across the schema — to triage parsing gaps")
     ap.add_argument("--no-helpers", action="store_true", help="emit fully self-contained tests (no tests.* helpers / no 000-hook)")
+    ap.add_argument("--implicit-deny", action="store_true", help="with --emit: also emit deny tests for commands a table has NO policy for (RLS-on deny-by-default), so CI governs the FULL command matrix and a future too-broad grant/policy fails the suite")
     ap.add_argument("--db-url", help="Postgres connection string (else uses PG* env)")
     ap.add_argument("--report", action="store_true", help="run the suite and print the grant/deny coverage matrix")
     ap.add_argument("--report-json", help="write the matrix as JSON to this path")
@@ -3288,7 +4354,7 @@ def main():
             tables = [a.table] if a.table else rls_tables(cur, a.schema)
             for i, t in enumerate(sorted(tables), start=1):
                 ctx = _load_ctx(cur, a.schema, t)
-                flat, nested = _emit_both(a.schema, t, ctx, helpers, conn=conn)
+                flat, nested = _emit_both(a.schema, t, ctx, helpers, conn=conn, implicit_deny=a.implicit_deny)
                 num = f"{100 + i:03d}"
                 open(os.path.join(tdir, f"{num}-rls-{t}.test.sql"), "w", encoding="utf-8").write(flat)
                 open(os.path.join(ddir, f"{t}.debug.sql"), "w", encoding="utf-8").write(nested)
@@ -3311,7 +4377,7 @@ def main():
             for x in ctx["notes"]: print(f"  NOTE: {x}")
             print(f"  coverage: {ctx['cov']}/{ctx['tot']}")
             return
-        flat, nested = _emit_both(a.schema, a.table, ctx, helpers, conn=conn)
+        flat, nested = _emit_both(a.schema, a.table, ctx, helpers, conn=conn, implicit_deny=a.implicit_deny)
         hook = setup_hook_sql(_basejump_present(cur)) if (a.setup and helpers) else None
     if a.out: open(a.out, "w", encoding="utf-8").write(nested)
     if a.flat: open(a.flat, "w", encoding="utf-8").write(flat)

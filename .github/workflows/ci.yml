@@ -41,8 +41,16 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/clearance.sql   # numeric-threshold; only the general solver can test it
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/synth.sql       # opaque-fn gate + composite FK + CHECK-UDF; only the probe-and-repair synthesizer can seed it
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/adversarial.sql # novel atoms OR'd with a classifiable branch; the per-min-term solver (BL-1) must DB-verify the novel branch
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/mockforce.sql   # opaque scalar fn in a comparison (fn()=const, fn()=fn()) -> force-mock wiring proof, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_himed.sql # bool col / NOT / IS TRUE / JSONB @>,? / BETWEEN / lower()/cast / cross-col -> all solver-tested, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_array.sql # WB-1: array overlap/containment (&&, @>, <@, reverse-order) -> solver-tested, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_fncol2.sql # WB-2: many-to-one fn-on-col (date_trunc/substring/left/to_char) preimage -> solver-tested, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_subq.sql  # WB-3: non-canonical subqueries (extra cond / two correlations / IN / NOT EXISTS) -> general subquery solver, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_novel.sql # BL-6: construct-first DB-oracle floor (starts_with / `%` / a CUSTOM operator) -> solved with ZERO operator-specific code, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_joint.sql # BL-11: joint signature search (two-column custom op + a claim under a custom op) -> session x multi-column search, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_cardinality.sql # BL-12: relational-state floor (count(*) >= K cardinality gate) -> seeds K rows + lets the DB evaluate the aggregate, must stay green
           rc=0
-          for schema in public tenancy rbac clearance synth adversarial; do
+          for schema in public tenancy rbac clearance synth adversarial mockforce wm wa wf2 wsq wn wj wcard; do
             echo "===== schema: $schema ====="
             rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --emit "out_$schema"
             for f in "out_$schema"/tests/database/rls/*.sql; do
@@ -119,3 +127,21 @@ jobs:
           grep -q "UNRELIABLE" /tmp/uc.txt || { echo "FAIL: expected UNRELIABLE for the CHECK-violating UPDATE (t2)"; exit 1; }
           grep -q "no policy-neutral column" /tmp/uc.txt || { echo "FAIL: expected the explained '–' note (t3)"; exit 1; }
           echo "OK: UPDATE probe correctness guards held (neutral column, valid value, UNRELIABLE, explained dash)"
+      - name: Implicit-deny (--implicit-deny) governs the full command matrix (examples/witness_himed.sql)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/app
+        run: |
+          # wm tables are SELECT-only policies, so INSERT/UPDATE/DELETE are RLS deny-by-default. With
+          # --implicit-deny the emitted suite must ADD passing deny tests for those no-policy commands (full
+          # command-matrix governance). Assert the deny tests appear AND the suite stays green (no 'not ok').
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_himed.sql
+          rlsautotest --db-url "$DATABASE_URL" --schema wm --emit out_wm_idn --implicit-deny
+          found=0; rc=0
+          for f in out_wm_idn/tests/database/rls/*.sql; do
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=0 -f "$f" > /tmp/idn.tap 2>&1 || true
+            grep -q '^ *not ok' /tmp/idn.tap && rc=1 || true
+            grep -q 'implicit deny' /tmp/idn.tap && found=1 || true
+          done
+          if [ "$found" -ne 1 ]; then echo "FAIL: --implicit-deny emitted no deny tests"; exit 1; fi
+          if [ "$rc" -ne 0 ]; then echo "FAIL: implicit-deny suite had a failing test"; exit 1; fi
+          echo "OK: --implicit-deny added passing deny tests for no-policy commands"
