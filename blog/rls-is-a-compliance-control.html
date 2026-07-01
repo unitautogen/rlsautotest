@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your Postgres RLS is a compliance control. Is it tested?</title>
+<style>
+ body{font:15px/1.65 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;color:#1a1a1a;background:#fff}
+ .wrap{max-width:44rem;margin:2.5rem auto;padding:0 1.25rem}
+ h1{font-size:1.6rem;line-height:1.25;margin:0 0 .4rem}
+ .sub{color:#666;margin:0 0 1.25rem;font-size:1rem}
+ h2{font-size:1.15rem;margin:2rem 0 .5rem}
+ p{margin:.7rem 0}
+ a{color:#075985}
+ em{color:#334155}
+ .tags{margin:0 0 1.5rem}
+ .chip{display:inline-block;font-size:.72rem;font-weight:600;padding:.15rem .55rem;border-radius:999px;margin-right:.35rem}
+ .chip.on{background:#e0f2fe;color:#075985}
+ ul{margin:.7rem 0;padding-left:1.2rem}
+ li{margin:.4rem 0}
+ code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#f1f5f9;padding:.1rem .35rem;border-radius:4px}
+ pre{background:#f6f8fa;border:1px solid #e5e7eb;border-radius:6px;padding:.85rem 1rem;overflow:auto;margin:1rem 0}
+ pre code{background:none;padding:0}
+ .note{background:#f8fafc;border:1px solid #e5e7eb;border-left:3px solid #94a3b8;border-radius:6px;padding:.85rem 1.05rem;margin:1.3rem 0;color:#334155;font-size:.95rem}
+ .note strong{color:#1a1a1a}
+ .kick{color:#b91c1c;font-weight:600}
+ .footer{color:#888;font-size:.82rem;margin-top:2.5rem;border-top:1px solid #eee;padding-top:1rem}
+ .footer a{color:#888;text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Your Postgres RLS is a compliance control. Is it tested?</h1>
+<p class="sub">Row-Level Security is your HIPAA and SOC 2 access-control safeguard on any PostgreSQL, but only if you can show it works.</p>
+<div class="tags">
+  <span class="chip on">HIPAA §164.312(a)(1)</span>
+  <span class="chip on">SOC 2 CC6.1</span>
+  <span class="chip on">PostgreSQL</span>
+</div>
+
+<p>If you're building on PostgreSQL (Supabase, RDS, Neon, or your own server) and touching health data, customer records, or anything an auditor cares about, Row-Level Security isn't just a nice-to-have. It's your access-control safeguard: the mechanism that keeps each patient, tenant, or customer to their own rows. Which means the moment you're under HIPAA or SOC 2, your RLS policies aren't just code. They're <em>controls</em>, and controls get audited.</p>
+
+<p>Here's the uncomfortable part: most RLS ships untested. And an untested access control isn't a control. <span class="kick">It's an assumption.</span></p>
+
+<h2>RLS is literally the safeguard the frameworks ask for</h2>
+<p>HIPAA's Security Rule requires technical access controls that allow access "only to those persons or software programs that have been granted access rights" (<a href="https://www.law.cornell.edu/cfr/text/45/164.312">45 CFR §164.312(a)(1)</a>). That's RLS's job description, and RLS is native PostgreSQL, enforced in the database on every deployment. If you're on Supabase, <a href="https://supabase.com/docs/guides/security/hipaa-compliance">their HIPAA guidance</a> points to RLS as the way to guarantee each provider, clinic, or patient sees only their own data; the same mechanism does the same job on RDS, Neon, or a self-hosted cluster.</p>
+<p><a href="https://supabase.com/docs/guides/security/soc-2-compliance">SOC 2</a> says the same thing in different words. Common Criteria CC6.1 requires that logical access to protected information be restricted to authorized users. RLS is that restriction, enforced in the database, where an application bug can't route around it.</p>
+<p>So the compliance question isn't "do you use RLS?" Everyone says yes. The question is "can you show it works?"</p>
+
+<h2>"We use RLS" is a claim. An auditor wants evidence</h2>
+<p>This is where untested RLS quietly fails. A policy with the wrong column, an <code>OR</code> that's too generous, a <code>USING (true)</code> left in from debugging: all of these pass code review and sit in production looking fine. Nothing errors. The dashboard is green. And a different tenant can read PHI.</p>
+<p>You won't catch that by reading the policy. You catch it by <em>exercising</em> it: becoming each identity (the owner, another tenant, an anonymous visitor) and checking what each one can actually <code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code>. That's the difference between asserting a control exists and demonstrating that it enforces.</p>
+
+<h2>What auditable evidence looks like</h2>
+<p>Evidence for an access-control safeguard is concrete and repeatable:</p>
+<ul>
+  <li>a per-identity, per-table, per-command result showing exactly who can touch which rows, including who's blocked;</li>
+  <li>a test suite committed alongside your migrations, so the evidence regenerates on every change;</li>
+  <li>a CI gate that turns the build red the instant a policy leaks or a table ships without RLS.</li>
+</ul>
+<p>That's not a screenshot of a settings page. That's a test run you can hand to a reviewer: dated and reproducible.</p>
+
+<h2>Where rlsautotest fits</h2>
+<p><code>rlsautotest</code> generates exactly that evidence, without you hand-writing test SQL. Point it at a disposable copy of your database; it reads your RLS policies, generates both the tests <em>and</em> the seed data that make them mean something, probes each policy as each identity, and emits a native <a href="https://pgtap.org">pgTAP</a> suite plus a per-identity access report and a CI gate. (pgTAP ships on Supabase and loads on any other Postgres; the tool handles it for you.)</p>
+<pre><code>pip install rlsautotest
+rlsautotest --db-url "$DATABASE_URL" --schema public --html rls-report.html</code></pre>
+<p>One command produces the access matrix. <code>--emit</code> writes the committable suite; wire it into CI and every pull request re-proves your access controls.</p>
+
+<h2>The honest boundary</h2>
+<div class="note">
+<p><strong>What it verifies, and what stays yours.</strong> <code>rlsautotest</code> verifies one thing well: that your database <em>enforces what your policies declare</em>. That's the access-control safeguard: a real, checkable piece of your HIPAA and SOC 2 posture. It is not your whole compliance program. Your BAA (with Supabase, your cloud provider, or however you host), encryption, audit logging, and the rest remain yours to own. And it proves declared-versus-enforced, not intent: a policy that's wrong on purpose will be faithfully, greenly confirmed.</p>
+</div>
+<p>But within its lane, it turns "we use RLS" into "here's the test run that shows our RLS restricts access as designed." For a control that's one misplaced predicate away from a breach notification, that's the difference that matters.</p>
+
+<div class="footer">
+<code>rlsautotest</code> is the free, open-source PostgreSQL member of <a href="https://github.com/unitautogen">UnitAutogen</a>: automated database test generators. Licensed under Apache-2.0.
+</div>
+
+</div>
+</body>
+</html>

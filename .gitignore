@@ -24,8 +24,11 @@ RLSAutotest_showcase_candidates.md
 test-schemas/
 # scratch / generated report + emitted-suite artifacts
 *.html
+# ...but the styled blog post(s) under blog/ DO ship with the repo
+!blog/*.html
 .pytest_cache/
 rls-tests/
 *-rls-tests/
+dist-skill/
 rls_suite/
 rls_helper/
