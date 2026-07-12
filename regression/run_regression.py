@@ -1,183 +1,227 @@
-#!/usr/bin/env python3
-"""rlsautotest regression harness.
+# Copyright 2026 Munaf Ibrahim Khatri
+# SPDX-License-Identifier: Apache-2.0
+"""rlsautotest regression harness with a COMMITTED BASELINE.
 
-Builds (or refreshes) ONE dedicated regression database that holds every example schema we test
-against, generates the RLS suite for each schema, runs it, and records per-file pass/fail results
-in two places:
+What it proves, end to end, against a real (disposable) PostgreSQL database:
+  1. every GREEN example schema loads, its report gate exits 0, and its emitted pgTAP suite is
+     BYTE-IDENTICAL to the committed baseline (any silent output drift fails the run);
+  2. every NEGATIVE example still fails its gate for the RIGHT reason (leak caught, UNRELIABLE
+     flagged, explained dash present) — the tool's teeth stay sharp;
+  3. the report text matches the baseline (matrix cells, footguns, coverage);
+  4. the unit tests pass.
 
-  1. a results table inside the regression DB  ->  regression.results
-  2. committed artifacts in the repo root       ->  REGRESSION.md  +  regression_results.json
+Usage (point it at a DISPOSABLE database — it drops/creates it with --recreate):
+    python regression/run_regression.py --db-url postgresql://user:pw@host:5432/rls_regression \
+        [--recreate] [--rebaseline] [--psql "C:\\path\\to\\psql.exe"] [--skip-pytest]
 
-Run:
-  python regression/run_regression.py
-
-Environment:
-  REGRESSION_DB_URL  full libpq URL of the regression DB
-                     (default postgresql://postgres@127.0.0.1:5432/rls_regression)
-  ADMIN_DB_URL       a DB to connect to so the regression DB can be CREATEd if missing
-                     (default: the REGRESSION_DB_URL with the database swapped to 'postgres')
-  PSQL               path to the psql binary (default 'psql')
-
-The DB password must be supplied via the URL or the standard PGPASSWORD env var — it is never
-written to disk by this script.
+--rebaseline regenerates regression/baseline/ (do this ONLY for an intentional output change and
+review the diff in git). Baselines are byte-stable per PostgreSQL MAJOR version (deparsed policy
+text and pg_get_functiondef output appear inside the emitted SQL); on a major-version mismatch the
+byte-diff is skipped with a warning and only the gates + matrix lines are compared.
 """
-import os, re, sys, json, subprocess, datetime, pathlib, tempfile
+from __future__ import annotations
+import argparse, difflib, hashlib, json, os, re, shutil, subprocess, sys, tempfile
+from datetime import datetime, timezone
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-EXAMPLES = ROOT / "examples"
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+BASELINE = os.path.join(HERE, "baseline")
 
-# (fixture file, schema it defines). schema.sql MUST load first: it creates the auth shim
-# (auth.jwt/uid/role + auth.users) and the anon/authenticated/service_role roles the others need.
-FIXTURES = [("schema.sql", "public"), ("tenancy.sql", "tenancy"),
-            ("exotic.sql", "exotic"), ("rbac.sql", "rbac")]
-SCHEMAS = [s for _, s in FIXTURES]
+# The canonical corpus (mirrors .github/workflows/ci.yml). fixture file -> schema it creates.
+GREEN = [
+    ("schema.sql", "public"), ("tenancy.sql", "tenancy"), ("rbac.sql", "rbac"),
+    ("rbac_tenant.sql", "rbt"), ("clearance.sql", "clearance"), ("synth.sql", "synth"),
+    ("adversarial.sql", "adversarial"), ("mockforce.sql", "mockforce"),
+    ("witness_himed.sql", "wm"), ("witness_array.sql", "wa"), ("witness_fncol2.sql", "wf2"),
+    ("witness_subq.sql", "wsq"), ("witness_novel.sql", "wn"), ("witness_joint.sql", "wj"),
+    ("witness_cardinality.sql", "wcard"), ("recursion.sql", "recursion"),
+    ("exotic_types.sql", "xtypes"), ("zeroarg.sql", "za"), ("regexfree.sql", "rxf"),
+    ("customrole.sql", "crole"),
+]
+# fixture, schema, required marker(s) in the failing report
+NEGATIVE = [
+    ("transitions.sql", "transitions", ["cross-policy WITH CHECK leak"]),
+    ("seedfail.sql", "seedfail", ["UNRELIABLE"]),
+    ("updcheck.sql", "updcheck", ["UNRELIABLE", "no policy-neutral column"]),
+]
+# exotic.sql is deliberately NOT loaded: it contains a broken-by-design 42P17 policy.
 
-PSQL = os.environ.get("PSQL", "psql")
-PY = sys.executable
-REG = os.environ.get("REGRESSION_DB_URL", "postgresql://postgres@127.0.0.1:5432/rls_regression")
-DBNAME = REG.rsplit("/", 1)[1].split("?")[0]
-ADMIN = os.environ.get("ADMIN_DB_URL", REG.rsplit("/", 1)[0] + "/postgres")
+GRID = re.compile(r"^\s{2}\S.*\s{2,}[✓·✗–‼]")   # matrix rows (identity + cells)
 
 
-def _psql(url, sql=None, file=None):
-    cmd = [PSQL, url, "-X", "-q", "-v", "ON_ERROR_STOP=0"]
-    if sql:
-        cmd += ["-c", sql]
-    if file:
-        cmd += ["-f", str(file)]
-    return subprocess.run(cmd, capture_output=True, text=True)
+def sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+def run_cli(dburl, *args):
+    return subprocess.run([sys.executable, "-m", "rlsautotest.cli", "--db-url", dburl, *args],
+                          capture_output=True, text=True, cwd=REPO, timeout=600,
+                          encoding="utf-8", errors="replace")
 
 
 def main():
-    env = dict(os.environ)
-    env.setdefault("PGOPTIONS", "-c client_min_messages=warning")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db-url", required=True, help="DISPOSABLE database (dropped with --recreate)")
+    ap.add_argument("--recreate", action="store_true", help="drop + recreate the database first")
+    ap.add_argument("--rebaseline", action="store_true", help="regenerate regression/baseline/")
+    ap.add_argument("--psql", default="psql", help="psql executable for loading fixtures")
+    ap.add_argument("--skip-pytest", action="store_true")
+    a = ap.parse_args()
 
-    # 1) create the regression DB if it doesn't exist
-    chk = _psql(ADMIN, sql=f"SELECT 1 FROM pg_database WHERE datname='{DBNAME}'")
-    if "1" not in (chk.stdout or ""):
-        _psql(ADMIN, sql=f'CREATE DATABASE "{DBNAME}"')
-        print(f"created database {DBNAME}")
+    import psycopg
+    if a.recreate:
+        m = re.match(r"(postgresql://[^/]+/)(\w+)(.*)$", a.db_url)
+        if not m:
+            print("cannot parse --db-url for --recreate"); return 2
+        admin = m.group(1) + "postgres" + m.group(3)
+        with psycopg.connect(admin, autocommit=True) as c:
+            c.execute(f'DROP DATABASE IF EXISTS "{m.group(2)}" WITH (FORCE)')
+            c.execute(f'CREATE DATABASE "{m.group(2)}"')
+        print(f"recreated database {m.group(2)}")
 
-    # 2) clean rebuild of the fixtures (drop our schemas, reload from examples/)
-    _psql(REG, sql="CREATE EXTENSION IF NOT EXISTS pgtap")
-    for s in ("rbac", "exotic", "tenancy"):
-        _psql(REG, sql=f"DROP SCHEMA IF EXISTS {s} CASCADE")
-    _psql(REG, sql="DROP TABLE IF EXISTS public.profiles, public.notes CASCADE")
-    for f, _ in FIXTURES:
-        r = _psql(REG, file=EXAMPLES / f)
-        if "ERROR" in (r.stderr or ""):
-            print(f"!! loading {f}:\n{r.stderr}")
+    with psycopg.connect(a.db_url) as c:
+        pg_major = c.execute("SHOW server_version").fetchone()[0].split(".")[0]
+    manifest_path = os.path.join(BASELINE, "MANIFEST.txt")
+    base_manifest = json.load(open(manifest_path, encoding="utf-8")) if os.path.exists(manifest_path) else None
+    byte_compare = True
+    if base_manifest and not a.rebaseline and base_manifest.get("pg_major") != pg_major:
+        byte_compare = False
+        print(f"WARNING: baseline was generated on PostgreSQL {base_manifest.get('pg_major')}, "
+              f"this server is {pg_major} — deparse formatting differs across majors, so the "
+              f"byte-diff is skipped; comparing gates + matrix lines only.")
 
-    # 3) results table
-    _psql(REG, sql="CREATE SCHEMA IF NOT EXISTS regression")
-    _psql(REG, sql=("CREATE TABLE IF NOT EXISTS regression.results ("
-                    "run_at timestamptz, schema_name text, test_file text, "
-                    "tests int, ok_count int, not_ok_count int, status text)"))
-    _psql(REG, sql="TRUNCATE regression.results")
+    print(f"loading {len(GREEN) + len(NEGATIVE)} fixtures into {re.sub(r':[^:@/]+@', ':***@', a.db_url)}")
+    for fx, _s in GREEN + [(f, s) for (f, s, _m) in NEGATIVE]:
+        r = subprocess.run([a.psql, a.db_url, "-v", "ON_ERROR_STOP=1", "-q",
+                            "-f", os.path.join(REPO, "examples", fx)], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"FIXTURE FAILED: {fx}\n{r.stderr[-1500:]}"); return 2
 
-    run_at = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="rlsa_reg_"))
-    results, totals = [], {"files": 0, "tests": 0, "not_ok": 0}
+    failures, emitted, reports = [], {}, {}
+    workdir = tempfile.mkdtemp(prefix="rlsa_regress_")
+    for _fx, schema in GREEN:
+        gate = run_cli(a.db_url, "--schema", schema, "--report")
+        if gate.returncode != 0:
+            failures.append(f"{schema}: green gate exited {gate.returncode}")
+            print((gate.stdout + gate.stderr)[-1200:])
+        rep = run_cli(a.db_url, "--schema", schema, "--report", "--no-fail")
+        reports[schema] = rep.stdout
+        em = run_cli(a.db_url, "--schema", schema, "--emit", os.path.join(workdir, schema))
+        if em.returncode != 0:
+            failures.append(f"{schema}: --emit exited {em.returncode}")
+        tdir = os.path.join(workdir, schema, "tests", "database", "rls")
+        emitted[schema] = {f: os.path.join(tdir, f) for f in sorted(os.listdir(tdir))} if os.path.isdir(tdir) else {}
+        print(f"  {schema:<14} gate=0 files={len(emitted[schema])}")
 
-    # 4) generate + run each schema's suite, parse the TAP, record per file
-    for s in SCHEMAS:
-        out = tmp / s
-        gen = subprocess.run([PY, "-m", "rlsautotest", "--schema", s, "--no-helpers",
-                              "--emit", str(out), "--db-url", REG],
-                             cwd=str(ROOT), capture_output=True, text=True, env=env)
-        d = out / "tests" / "database" / "rls"
-        if not d.exists():
-            print(f"!! no suite emitted for schema {s}\n{gen.stderr}")
-            continue
-        for fp in sorted(d.glob("*.sql")):
-            tap = _psql(REG, file=fp).stdout or ""
-            m = re.search(r"1\.\.(\d+)", tap)
-            tests = int(m.group(1)) if m else 0
-            not_ok = len(re.findall(r"not ok", tap))
-            ok = tests - not_ok
-            status = "PASS" if not_ok == 0 else "FAIL"
-            results.append({"schema": s, "file": fp.name, "tests": tests,
-                            "ok": ok, "not_ok": not_ok, "status": status})
-            totals["files"] += 1; totals["tests"] += tests; totals["not_ok"] += not_ok
-            esc = fp.name.replace("'", "''")
-            _psql(REG, sql=("INSERT INTO regression.results VALUES "
-                            f"('{run_at}','{s}','{esc}',{tests},{ok},{not_ok},'{status}')"))
+    for _fx, schema, markers in NEGATIVE:
+        gate = run_cli(a.db_url, "--schema", schema, "--report")
+        out = gate.stdout + gate.stderr
+        if gate.returncode == 0:
+            failures.append(f"{schema}: NEGATIVE gate unexpectedly passed (regression in detection)")
+        for mk in markers:
+            if mk not in out:
+                failures.append(f"{schema}: expected marker missing: {mk!r}")
+        print(f"  {schema:<14} gate={gate.returncode} (expected nonzero)")
 
-    # 5) committed artifacts: JSON + Markdown
-    payload = {"run_at": run_at, "database": DBNAME, "totals": totals, "results": results}
-    (ROOT / "regression_results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if a.rebaseline:
+        shutil.rmtree(BASELINE, ignore_errors=True)
+        os.makedirs(os.path.join(BASELINE, "reports"))
+        files = {}
+        for schema, fmap in emitted.items():
+            os.makedirs(os.path.join(BASELINE, "emit", schema), exist_ok=True)
+            for f, p in fmap.items():
+                dst = os.path.join(BASELINE, "emit", schema, f)
+                shutil.copy(p, dst)
+                files[f"emit/{schema}/{f}"] = sha(dst)
+        for schema, text in reports.items():
+            dst = os.path.join(BASELINE, "reports", schema + ".txt")
+            open(dst, "w", encoding="utf-8", newline="\n").write(text)
+            files[f"reports/{schema}.txt"] = sha(dst)
+        json.dump({"generated_at": datetime.now(timezone.utc).isoformat(), "pg_major": pg_major,
+                   "schemas": [s for _f, s in GREEN], "files": files},
+                  open(manifest_path, "w", encoding="utf-8"), indent=1)
+        print(f"\nBASELINE WRITTEN: {len(files)} files under regression/baseline/ (PostgreSQL {pg_major})")
+    elif base_manifest:
+        for schema, fmap in emitted.items():
+            bdir = os.path.join(BASELINE, "emit", schema)
+            bfiles = sorted(os.listdir(bdir)) if os.path.isdir(bdir) else []
+            if sorted(fmap) != bfiles:
+                failures.append(f"{schema}: emitted file set changed: {sorted(set(bfiles) ^ set(fmap))}")
+                continue
+            for f, p in fmap.items():
+                # newline-insensitive: git autocrlf may check the baseline out with CRLF
+                new = open(p, encoding="utf-8").read().splitlines()
+                old = open(os.path.join(bdir, f), encoding="utf-8").read().splitlines()
+                if byte_compare and new != old:
+                    d = list(difflib.unified_diff(old, new, f"baseline/{f}", f"current/{f}", lineterm=""))
+                    failures.append(f"{schema}/{f}: emitted SQL drifted from baseline "
+                                    f"({len(d)} diff lines)\n" + "\n".join(d[:20]))
+        for schema, text in reports.items():
+            bp = os.path.join(BASELINE, "reports", schema + ".txt")
+            old = open(bp, encoding="utf-8").read() if os.path.exists(bp) else ""
+            if byte_compare:
+                same = (text.splitlines() == old.splitlines())   # newline-insensitive (git autocrlf)
+            else:   # cross-version: matrices must match even if deparsed policy text differs
+                same = [l for l in text.splitlines() if GRID.match(l)] == \
+                       [l for l in old.splitlines() if GRID.match(l)]
+            if not same:
+                d = list(difflib.unified_diff(old.splitlines(), text.splitlines(),
+                                              "baseline", "current", lineterm=""))
+                failures.append(f"{schema}: report drifted from baseline\n" + "\n".join(d[:20]))
+    else:
+        print("NOTE: no baseline present — run with --rebaseline to create one.")
 
-    lines = [f"# Regression results", "",
-             f"- Run (UTC): `{run_at}`",
-             f"- Database: `{DBNAME}` (rebuilt from `examples/` by `regression/run_regression.py`)",
-             f"- Schemas: {', '.join(SCHEMAS)}",
-             f"- Totals: **{totals['files']} files, {totals['tests']} tests, "
-             f"{totals['not_ok']} failed**", "",
-             "| schema | test file | tests | ok | not ok | status |",
-             "|---|---|--:|--:|--:|---|"]
-    for r in results:
-        lines.append(f"| {r['schema']} | {r['file']} | {r['tests']} | {r['ok']} | "
-                     f"{r['not_ok']} | {'✅' if r['status']=='PASS' else '❌'} {r['status']} |")
-    lines += ["", "Results are also stored in the regression DB: `SELECT * FROM regression.results;`."]
-    (ROOT / "REGRESSION.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # ---- PRIVATE targets (real-world schemas, kept OUT of the public repo) --------------------
+    # regression/private_targets.json (gitignored) lists EXISTING local databases to regression-
+    # test alongside the public corpus, e.g.:
+    #   [{"db": "strbac_test", "schemas": ["public", "rbac", "rbt"]}]
+    # Each schema's report gate must exit 0 (or set "expect_gate": {"schema": 1} for known-red) and
+    # its report text is snapshotted/compared under regression/private_baseline/ (also gitignored).
+    # These databases are NOT recreated — probes roll back, so their content stays untouched.
+    PRIVATE = os.path.join(HERE, "private_targets.json")
+    PBASE = os.path.join(HERE, "private_baseline")
+    if os.path.exists(PRIVATE):
+        murl = re.match(r"(postgresql://[^/]+/)(\w+)(.*)$", a.db_url)
+        for t in json.load(open(PRIVATE, encoding="utf-8")):
+            db = t["db"]
+            turl = murl.group(1) + db + murl.group(3)
+            exp_map = t.get("expect_gate", {}) or {}
+            for schema in t["schemas"]:
+                exp = int(exp_map.get(schema, 0))
+                gate = run_cli(turl, "--schema", schema, "--report")
+                if (gate.returncode == 0) != (exp == 0):
+                    failures.append(f"[private {db}] {schema}: gate rc={gate.returncode}, "
+                                    f"expected {'0' if exp == 0 else 'nonzero'}")
+                rep = run_cli(turl, "--schema", schema, "--report", "--no-fail")
+                sp = os.path.join(PBASE, db, schema + ".txt")
+                if a.rebaseline:
+                    os.makedirs(os.path.dirname(sp), exist_ok=True)
+                    open(sp, "w", encoding="utf-8", newline="\n").write(rep.stdout)
+                elif os.path.exists(sp):
+                    old = open(sp, encoding="utf-8").read()
+                    if rep.stdout.splitlines() != old.splitlines():
+                        d = list(difflib.unified_diff(old.splitlines(), rep.stdout.splitlines(),
+                                                      "baseline", "current", lineterm=""))
+                        failures.append(f"[private {db}] {schema}: report drifted from baseline\n"
+                                        + "\n".join(d[:20]))
+                print(f"  [private {db}] {schema:<12} gate={gate.returncode}")
 
-    (ROOT / "regression_report.html").write_text(_html(run_at, DBNAME, SCHEMAS, totals, results), encoding="utf-8")
+    if not a.skip_pytest:
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "tests/test_smoke.py"],
+                           capture_output=True, text=True, cwd=REPO)
+        print("pytest:", (r.stdout + r.stderr).strip().splitlines()[-1])
+        if r.returncode != 0:
+            failures.append("pytest failed")
 
-    print(f"{totals['files']} files, {totals['tests']} tests, {totals['not_ok']} failed "
-          f"-> REGRESSION.md + regression_report.html + regression_results.json + regression.results")
-    return 1 if totals["not_ok"] else 0
-
-
-def _html(run_at, dbname, schemas, totals, results):
-    import html
-    ok_overall = totals["not_ok"] == 0
-    pill_bg, pill_tx = ("#dcfce7", "#166534") if ok_overall else ("#fee2e2", "#991b1b")
-    pill = "ALL GREEN" if ok_overall else f"{totals['not_ok']} FAILED"
-    rows = []
-    for r in results:
-        passed = r["status"] == "PASS"
-        bg, tx = ("#dcfce7", "#166534") if passed else ("#fee2e2", "#991b1b")
-        badge = ("&#10003; PASS" if passed else "&#10007; FAIL")
-        rows.append(
-            f"<tr><td class='sch'>{html.escape(r['schema'])}</td>"
-            f"<td class='mono'>{html.escape(r['file'])}</td>"
-            f"<td class='num'>{r['tests']}</td><td class='num'>{r['ok']}</td>"
-            f"<td class='num'>{r['not_ok']}</td>"
-            f"<td><span class='badge' style='background:{bg};color:{tx}'>{badge}</span></td></tr>")
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>rlsautotest — regression results</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ font: 15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-         margin: 0; padding: 2rem; background:#f8fafc; color:#0f172a; }}
-  .wrap {{ max-width: 920px; margin: 0 auto; }}
-  h1 {{ font-size: 1.5rem; margin: 0 0 .25rem; }}
-  .meta {{ color:#64748b; font-size:.9rem; margin-bottom:1rem; }}
-  .meta code {{ background:#e2e8f0; padding:.05rem .35rem; border-radius:4px; }}
-  .pill {{ display:inline-block; font-weight:700; padding:.3rem .8rem; border-radius:999px;
-          background:{pill_bg}; color:{pill_tx}; margin-bottom:1.25rem; }}
-  table {{ width:100%; border-collapse:collapse; background:#fff; border:1px solid #e2e8f0;
-          border-radius:10px; overflow:hidden; box-shadow:0 1px 2px rgba(0,0,0,.04); }}
-  th,td {{ text-align:left; padding:.55rem .8rem; border-bottom:1px solid #f1f5f9; }}
-  th {{ background:#f1f5f9; font-size:.78rem; letter-spacing:.04em; text-transform:uppercase; color:#475569; }}
-  td.num {{ text-align:right; font-variant-numeric:tabular-nums; }}
-  td.sch {{ font-weight:600; }}
-  .mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.85rem; color:#334155; }}
-  .badge {{ font-size:.78rem; font-weight:700; padding:.12rem .5rem; border-radius:6px; }}
-  tr:last-child td {{ border-bottom:none; }}
-  .foot {{ color:#94a3b8; font-size:.8rem; margin-top:1rem; }}
-</style></head><body><div class="wrap">
-  <h1>rlsautotest — regression results</h1>
-  <div class="meta">Run (UTC) <code>{html.escape(run_at)}</code> &middot; database <code>{html.escape(dbname)}</code>
-    &middot; schemas {html.escape(', '.join(schemas))}</div>
-  <div class="pill">{pill} &middot; {totals['files']} files &middot; {totals['tests']} tests</div>
-  <table><thead><tr><th>schema</th><th>test file</th><th>tests</th><th>ok</th><th>not ok</th><th>status</th></tr></thead>
-  <tbody>{''.join(rows)}</tbody></table>
-  <p class="foot">Generated by <span class="mono">regression/run_regression.py</span> from the
-  <span class="mono">examples/</span> fixtures. Results also stored in the regression DB
-  (<span class="mono">regression.results</span>).</p>
-</div></body></html>"""
+    print("\n" + ("=" * 60))
+    if failures:
+        print(f"REGRESSION: {len(failures)} FAILURE(S)")
+        for f in failures:
+            print(" -", f)
+        return 1
+    print(f"REGRESSION PASS: {len(GREEN)} green schemas byte-checked against baseline, "
+          f"{len(NEGATIVE)} negative gates verified, unit tests green. (PostgreSQL {pg_major})")
+    return 0
 
 
 if __name__ == "__main__":

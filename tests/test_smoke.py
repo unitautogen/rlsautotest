@@ -302,3 +302,144 @@ def test_report_render():
     }]
     out = render_report_text(reps)
     assert "t" in out and "SELECT" in out and "legend" in out
+
+
+def test_report_files_cells_structurally_not_by_label_wording():
+    """F4: with an Observation present, an arbitrarily-worded test label files into the right
+    matrix cell; the legacy keyword parser (the fallback) would misread both of these."""
+    from rlsautotest.report import _file_tap_lines
+    from rlsautotest.structs import Observation
+    cells, idgrid, leaks, unrel, unrel_cells = {}, {}, [], [], set()
+    taps = ["ok 1 - SELECT: the quokka gazes upon an empty warren",   # deny-proof, but no deny keyword
+            "not ok 2 - UPDATE: xyzzy"]                               # grant-proof, no command-ish wording
+    obs = [Observation(cmd="SELECT", ident="other", exp=False),
+           Observation(cmd="UPDATE", ident="authorized", exp=True)]
+    leftovers = _file_tap_lines(taps, obs, cells, idgrid, leaks, unrel, unrel_cells)
+    assert leftovers == []
+    assert idgrid["SELECT"]["other"] == {"exp": False, "pass": True}       # a passing deny cell
+    assert idgrid["UPDATE"]["authorized"] == {"exp": True, "pass": False}  # a failing grant cell
+    assert cells == {"SELECT": {"deny": True}, "UPDATE": {"grant": False}}
+    # unreliable + leak kinds route to their buckets, not the matrix
+    cells2, idgrid2 = {}, {}
+    _file_tap_lines(["not ok 1 - UNRELIABLE - INSERT: whatever", "not ok 2 - UPDATE: leaky [transition-leak]"],
+                    [Observation(cmd="INSERT", ident="authorized", kind="unreliable"),
+                     Observation(cmd="UPDATE", ident="authorized", exp=False, kind="leak")],
+                    cells2, idgrid2, leaks, unrel, unrel_cells)
+    assert cells2 == {} and idgrid2 == {}
+    assert ("INSERT", "authorized") in unrel_cells and leaks == ["UPDATE: leaky"]
+    # without observations the same lines fall through to the legacy label parser (safety net)
+    lo = _file_tap_lines(taps, [], {}, {}, [], [], set())
+    assert [x[1] for x in lo] == ["SELECT: the quokka gazes upon an empty warren", "UPDATE: xyzzy"]
+
+
+def test_reserved_sentinels_are_unique():
+    """F10: every reserved uuid the engine may write during probes is registered once and never
+    collides — two strategies silently sharing a value would let one strategy's seed satisfy
+    another strategy's predicate."""
+    from rlsautotest.values import ALL_SENTINELS
+    vals = list(ALL_SENTINELS.values())
+    assert len(vals) == len(set(vals)), "sentinel collision: " + str(
+        sorted(v for v in set(vals) if vals.count(v) > 1))
+    # the canonical constants stay wired to the registry
+    from rlsautotest.values import REC_OTHER, REC_ROOT, WV_UID
+    from rlsautotest.witness import _WV_UID
+    assert _WV_UID == WV_UID == ALL_SENTINELS["WV_UID"]
+    assert ALL_SENTINELS["REC_ROOT"] == REC_ROOT and ALL_SENTINELS["REC_OTHER"] == REC_OTHER
+
+
+def test_issue2_mock_ddl_failure_is_never_baked():
+    """Issue #2 regression (github.com/unitautogen/rlsautotest/issues/2): when the connection role
+    cannot CREATE OR REPLACE a policy function (Supabase: helpers owned by supabase_admin), the
+    failure must NOT be swallowed as a benign seed error — the probe would then observe the REAL
+    function, see everything denied, and bake owner-denied as the expected behavior (a false-passing
+    suite). The DDL failure must mark the probe UNRELIABLE, the baker must emit a loud fail() line
+    (never the observed grant/deny), and the report cell must render ‼."""
+    from rlsautotest.probe import _DDL_RE, _probe, ProbeBaker
+
+    # 1) the detector: mock/helper installs are DDL; ordinary seeds are not
+    assert _DDL_RE.match("CREATE OR REPLACE FUNCTION public.f() RETURNS text LANGUAGE sql AS $$ SELECT 'x' $$")
+    assert _DDL_RE.match("  alter table public.notes owner to x")
+    assert not _DDL_RE.match("INSERT INTO public.notes(owner_id) VALUES ('a')")
+    assert not _DDL_RE.match("DELETE FROM public.notes")
+
+    # 2) _probe: permission-denied on the mock CREATE -> unreliable, even though seeding succeeded
+    #    (row present) and the action itself runs cleanly — the observation is an environment
+    #    artifact, not a policy outcome.
+    class Cur:
+        def execute(self, sql, params=None):
+            if sql.strip().upper().startswith("CREATE OR REPLACE FUNCTION"):
+                e = Exception("permission denied for schema public")
+                e.sqlstate = "42501"
+                raise e
+        def fetchone(self): return (1,)
+        rowcount = 1
+    class Conn:
+        def cursor(self): return Cur()
+    arrange = ["DELETE FROM public.notes",
+               "INSERT INTO public.notes(owner_id) VALUES ('rls_synth_a')",
+               "CREATE OR REPLACE FUNCTION \"public\".\"current_app_user\"() RETURNS text "
+               "LANGUAGE sql AS $$ SELECT 'rls_synth_a'::text $$"]
+    o = _probe(Conn(), arrange, ["SET LOCAL ROLE authenticated"], "read", "SELECT count(*) FROM public.notes")
+    assert o[0] == "count" and o[2], "DDL failure in arrange must set the unreliable reason"
+    assert "mock/helper DDL failed (42501)" in o[2]
+
+    # 3) the baker: an unreliable observation bakes a loud, never-passing fail() — NOT the observed
+    #    count — and records kind='unreliable' for the report/gate.
+    class Ctx: pass
+    c = Ctx()
+    c.desc = lambda s: "'" + s.replace("'", "''") + "'"
+    c.q = "public.notes"
+    c.observations = []
+    b = ProbeBaker(c)
+    line = b.read_assert(o, "authenticated, authorized", ident="authorized", mocked=True)
+    assert line.startswith("SELECT fail(") and "UNRELIABLE" in line
+    assert "sees" not in line, "the observed degenerate outcome must never be baked as the expectation"
+    assert c.observations[-1].kind == "unreliable"
+    wline = b.write_assert(("err", "42501", o[2]), "INSERT", "INSERT INTO public.notes DEFAULT VALUES",
+                           "authenticated, authorized", ident="authorized", mocked=True)
+    assert wline.startswith("SELECT fail(") and "UNRELIABLE" in wline and "throws_ok" not in wline
+
+    # 4) the report cell for an unreliable identity x command renders ‼ (class 'unrel'), not '·'/'–'
+    from rlsautotest.cli import _id_cell
+    rep = {"rls_enabled": True, "policied": ["SELECT"], "idgrid": {},
+           "unreliable_cells": {("SELECT", "authorized")}}
+    assert _id_cell(rep, "authorized", "SELECT")[1] == "unrel"
+
+    # 5) the bool-UDF wiring preflight: same permission wall -> sqlstate reported; permitted -> None
+    from rlsautotest.strategies.mock import _mock_preflight
+    ctx2 = Ctx()
+    ctx2.conn = Conn()
+    ctx2.udfs = [{"q": '"public"."can_see"', "args": ""}]
+    assert _mock_preflight(ctx2) == "42501"
+    class OKCur(Cur):
+        def execute(self, sql, params=None): pass
+    class OKConn:
+        def cursor(self): return OKCur()
+    ctx2.conn = OKConn()
+    assert _mock_preflight(ctx2) is None
+
+
+def test_extract_signature_and_shared_subquery_reader():
+    """F2 (= BL-5): one walker yields the predicate's full controllable signature; the three
+    subquery consumers are labelers/adapters over the same _subquery_sig."""
+    from rlsautotest.astutil import _subquery_sig, _where, extract_signature
+    q = ("EXISTS ( SELECT 1 FROM public.memberships m WHERE m.org_id = orgs.id "
+         "AND m.user_id = ( SELECT auth.uid() ) AND m.role = 'admin' AND m.active)")
+    node = _where(q)
+    sig = extract_signature(node, {"id": "uuid"})
+    assert sig["row_cols"] == ["id"] and sig["claim_paths"] == []
+    assert len(sig["subqueries"]) == 1
+    sq = sig["subqueries"][0]
+    assert sq["mtable"] == "public.memberships" and sq["uid"] == "user_id"
+    assert sq["corr"] == [("org_id", "id")]
+    assert sq["extras"] == {"role": "admin", "active": "true"} and not sq["unmodeled"]
+    # the canonical classifier rejects the extra conditions; the solver adapter accepts them
+    from rlsautotest.atoms import _membership
+    sv = node["SubLink"]
+    assert _membership(sv["subselect"], None)["kind"] == "unknown"
+    canonical = _where("EXISTS ( SELECT 1 FROM public.memberships m WHERE m.org_id = orgs.id "
+                       "AND m.user_id = ( SELECT auth.uid() ))")["SubLink"]
+    m = _membership(canonical["subselect"], None)
+    assert m["kind"] == "membership" and m["mscope_col"] == "org_id" and m["row_scope_col"] == "id"
+    # OR in the WHERE -> no signature at all
+    assert _subquery_sig(_where("EXISTS ( SELECT 1 FROM t m WHERE m.a = x.b OR m.c = 1 )")["SubLink"]["subselect"]) is None

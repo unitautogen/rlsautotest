@@ -1,6 +1,10 @@
-# rlsautotest
+﻿# rlsautotest
+
+[![Featured in Supabase's July 2026 Developer Update](https://img.shields.io/badge/Featured_in-Supabase_Developer_Update-3ECF8E?logo=supabase&logoColor=white)](https://github.com/supabase/supabase/releases/tag/v1.26.07)
 
 **Deterministic pgTAP test generation for Postgres / Supabase Row-Level Security.**
+
+> Featured in Supabase's [July 2026 Developer Update](https://github.com/supabase/supabase/releases/tag/v1.26.07) under "Made with Supabase."
 
 > **Status: beta (v0.x).** Actively developed and the CLI may still change - but it's built to **never emit a false-passing test**: anything it can't verify soundly is marked, not faked.
 
@@ -16,7 +20,7 @@ rlsautotest --db-url "$DATABASE_URL" --schema public --html rls-report.html
 rlsautotest --db-url "$DATABASE_URL" --schema public --emit supabase/
 ```
 
-> ⚠️ **Point `--db-url` at a disposable copy of your database, never production.** rlsautotest probes each policy by seeding rows and running real `SELECT`/`INSERT`/`UPDATE`/`DELETE`. Every probe is wrapped in a transaction and rolled back (nothing is committed), but the statements do run (table locks, triggers, sequences fire). `--emit`, `--report`, and `--html` all connect and probe; only `--describe` and the static checks (`lint`/`snapshot`/`diff`) just read the catalog.
+> âš ï¸ **Point `--db-url` at a disposable copy of your database, never production.** rlsautotest probes each policy by seeding rows and running real `SELECT`/`INSERT`/`UPDATE`/`DELETE`. Every probe is wrapped in a transaction and rolled back (nothing is committed), but the statements do run (table locks, triggers, sequences fire). `--emit`, `--report`, and `--html` all connect and probe; only `--describe` and the static checks (`lint`/`snapshot`/`diff`) just read the catalog.
 
 _Running the suite - on a local Supabase (`supabase test db`), `pg_prove`, or in CI - is covered in [INSTALL.md](INSTALL.md)._
 
@@ -44,7 +48,7 @@ You point it at your database and it:
 
 ## Verifying RLS for HIPAA and SOC 2
 
-Storing PHI or other regulated data in PostgreSQL? RLS is the access control that keeps each patient, tenant, or customer to their own rows. It's the technical safeguard HIPAA's Security Rule requires ([45 CFR §164.312(a)(1), Access Control](https://www.law.cornell.edu/cfr/text/45/164.312)), enforced in the database itself on any Postgres, whether that's Supabase, RDS, Neon, or your own server. On Supabase specifically, [their HIPAA guidance](https://supabase.com/docs/guides/security/hipaa-compliance) calls out RLS for exactly this and offers a [BAA](https://supabase.com/docs/guides/platform/hipaa-projects).
+Storing PHI or other regulated data in PostgreSQL? RLS is the access control that keeps each patient, tenant, or customer to their own rows. It's the technical safeguard HIPAA's Security Rule requires ([45 CFR Â§164.312(a)(1), Access Control](https://www.law.cornell.edu/cfr/text/45/164.312)), enforced in the database itself on any Postgres, whether that's Supabase, RDS, Neon, or your own server. On Supabase specifically, [their HIPAA guidance](https://supabase.com/docs/guides/security/hipaa-compliance) calls out RLS for exactly this and offers a [BAA](https://supabase.com/docs/guides/platform/hipaa-projects).
 
 But RLS only counts if it actually enforces what it claims. A policy with the wrong column or an always-true `USING (true)` passes review while silently exposing PHI across tenants. `rlsautotest` produces the evidence that it holds: a per-identity proof, per table and per command, that PHI can't cross a tenant boundary or reach an unauthorized role, plus a committed pgTAP suite and a CI gate that fails the build the moment a policy leaks. That's access-control verification you can put in front of a reviewer.
 
@@ -80,7 +84,7 @@ supabase/tests/database/rls/     # our own folder, separate from your hand-writt
 .rlsautotest/debug/               # nested/structured copies for debugging
 ```
 
-Each test is Arrange-Act-Assert: seed as a privileged role (RLS bypassed), act as a mocked identity (`authenticate_as` / `set_config('request.jwt.claims', …)` + `SET ROLE`), assert the visible/affected rows, with `SAVEPOINT` isolation so a write test can't corrupt the next one.
+Each test is Arrange-Act-Assert: seed as a privileged role (RLS bypassed), act as a mocked identity (`authenticate_as` / `set_config('request.jwt.claims', â€¦)` + `SET ROLE`), assert the visible/affected rows, with `SAVEPOINT` isolation so a write test can't corrupt the next one.
 
 ## Modes
 
@@ -93,6 +97,7 @@ Each test is Arrange-Act-Assert: seed as a privileged role (RLS bypassed), act a
 | `--no-fail` | with `--report`/`--html`: don't exit non-zero on problems (default **does**, for CI gating) |
 | `--table T` | a single table instead of the whole schema |
 | `--describe` | show the identity classes the generator derived for a table |
+| `doctor` | subcommand: verify the probe environment (role privileges, pgTAP, policy-function ownership); writes `doctor.json` to attach to bug reports |
 
 ## The report
 
@@ -100,15 +105,27 @@ One grid per table (rows are identities, columns are commands), so it reads like
 
 ```
 notes                          SELECT  INSERT  UPDATE  DELETE
-service_role                     ✓       ✓       ✓       ✓     bypasses RLS
-authenticated, authorized        ✓       ✓       ✓       ✓
-authenticated, not authorized    ·       ·       ·       ·
-anon                             ·       ·       ·       ·
+service_role                     âœ“       âœ“       âœ“       âœ“     bypasses RLS
+authenticated, authorized        âœ“       âœ“       âœ“       âœ“
+authenticated, not authorized    Â·       Â·       Â·       Â·
+anon                             Â·       Â·       Â·       Â·
 ```
 
-`✓` = can, `·` = blocked. The one thing that lights up red is a `✓` where it should be `·`: an *authenticated-but-not-authorized* user or *anon* that can act (a security hole). It jumps out without decoding anything. `service_role` is shown for completeness; it bypasses RLS by design. A table with **RLS off** is flagged loud (it has no row-level protection at all).
+`âœ“` = can, `Â·` = blocked. The one thing that lights up red is a `âœ“` where it should be `Â·`: an *authenticated-but-not-authorized* user or *anon* that can act (a security hole). It jumps out without decoding anything. `service_role` is shown for completeness; it bypasses RLS by design. A table with **RLS off** is flagged loud (it has no row-level protection at all).
 
 The identity rows are deliberately worded so they aren't mistaken for database roles: `authenticated, authorized` and `authenticated, not authorized` are the **same Postgres role** (`authenticated`) under different JWT identities/claims. Only `service_role`, `authenticated`, and `anon` are actual Postgres roles. "Authorized" vs "not authorized" is simply whether that identity passes the table's policies (owns the row, is in the right tenant/org, or has the required role).
+
+## When something looks wrong: `rlsautotest doctor`
+
+The probe needs real privileges from the connection role: `SET ROLE` to the client roles (`anon`, `authenticated`, `service_role`), `CREATE` on the target schema (for the pgTAP shim and seed helpers), and the ability to replace any function your policies delegate to (for the mock-wiring proof). If the role can't do one of these, the affected cells show `â€¼ UNRELIABLE` instead of a result, the suite fails loudly on those tests, and the run exits 1. It never bakes a result it couldn't actually observe.
+
+`doctor` checks all of this in seconds and prints the exact remedy for each failed check (for example, on Supabase local: connect as `supabase_admin`, which owns the helper functions). It is read-only: every write it attempts is savepoint-wrapped and rolled back.
+
+```bash
+rlsautotest doctor --schema public --db-url "postgresql://..."
+```
+
+It also writes `doctor.json` alongside the on-screen report. **Filing an issue? Attach that file.** It contains catalog metadata only (role, function and table names, sqlstates, check results, and a per-table classification summary). No row data, no credentials. It usually lets a problem be reproduced and fixed without any back-and-forth about your environment.
 
 ## Catching unprotected tables in CI (important)
 
@@ -165,7 +182,7 @@ The `examples/` folder is the runnable test corpus, covering the common and the 
 
 ## Honest limitations
 
-`rlsautotest` proves your database *enforces what your policies declare*. It cannot know your *intent*: a wrong policy will be faithfully (and greenly) confirmed. It tests the permissions your policies define; commands left with no policy show as `·` (implicit deny) and aren't asserted unless you opt in. Policies behind opaque/external functions it can't reason about are reported, not faked.
+`rlsautotest` proves your database *enforces what your policies declare*. It cannot know your *intent*: a wrong policy will be faithfully (and greenly) confirmed. It tests the permissions your policies define; commands left with no policy show as `Â·` (implicit deny) and aren't asserted unless you opt in. Policies behind opaque/external functions it can't reason about are reported, not faked.
 
 ## Requirements
 

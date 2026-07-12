@@ -38,6 +38,7 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/schema.sql
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/tenancy.sql
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/rbac.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/rbac_tenant.sql # multi-tenant RBAC patterns: login-only INSERT + ownership trigger, multi-col unique + text[], array-cardinality CHECK, composite FK + FOR ALL w/o UPDATE grant + service_role USING(true) -> all must stay green
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/clearance.sql   # numeric-threshold; only the general solver can test it
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/synth.sql       # opaque-fn gate + composite FK + CHECK-UDF; only the probe-and-repair synthesizer can seed it
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/adversarial.sql # novel atoms OR'd with a classifiable branch; the per-min-term solver (BL-1) must DB-verify the novel branch
@@ -49,8 +50,13 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_novel.sql # BL-6: construct-first DB-oracle floor (starts_with / `%` / a CUSTOM operator) -> solved with ZERO operator-specific code, must stay green
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_joint.sql # BL-11: joint signature search (two-column custom op + a claim under a custom op) -> session x multi-column search, must stay green
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/witness_cardinality.sql # BL-12: relational-state floor (count(*) >= K cardinality gate) -> seeds K rows + lets the DB evaluate the aggregate, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/recursion.sql # VALID self-referential hierarchy (WITH RECURSIVE from owner=auth.uid(), read via a SECURITY DEFINER fn so RLS is not re-entered -> no 42P17) -> exercises the recursion strategy (synth_recursion_emit) on a GREEN path, must stay green. The broken counterpart lives in exotic.folders (excluded above).
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/exotic_types.sql # F3: NOT NULL columns of exotic types (inet/macaddr/bytea/DOMAIN) that the static value table cannot represent -> seeded by the DB-oracle _castable_lit; before F3 the row could not be built and the branch went UNRELIABLE, must stay green. Also xtypes.sensors: the same exotic types on a CLASSIFIED (owner-scoped) table -> the oracle-verified fill seeds it and the UPDATE probe SETs a castable value, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/zeroarg.sql # F10: a ZERO-arg boolean fn whose body is a transparent JWT-claim check (is_admin()) -> introspected to a claim_const atom and tested FOR REAL (no [mocked; wiring] tags), must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/regexfree.sql # F6: a policy whose WITH CHECK contains a column NAME inside a string literal -> the AST (not a text regex) decides which columns the policy references, so the real neutral column stays SETtable and UPDATE is tested, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/customrole.sql # F5: policies granted TO a custom role (reporter) -> probed via SET ROLE and shown as their own report row instead of silently vanishing from the client DNF, must stay green
           rc=0
-          for schema in public tenancy rbac clearance synth adversarial mockforce wm wa wf2 wsq wn wj wcard; do
+          for schema in public tenancy rbac rbt clearance synth adversarial mockforce wm wa wf2 wsq wn wj wcard recursion xtypes za rxf crole; do
             echo "===== schema: $schema ====="
             rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --emit "out_$schema"
             for f in "out_$schema"/tests/database/rls/*.sql; do

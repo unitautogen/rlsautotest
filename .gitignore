@@ -12,11 +12,14 @@ out/
 # internal project brain / handoff — NEVER publish (contains strategy, competitor notes, launch plan)
 CLAUDE.md
 # internal design docs / backlog — not for the public repo (like CLAUDE.md)
+CODE_REVIEW_EXTENSIBILITY.md
 PARSING_IMPROVEMENTS.md
 PARSING_BACKLOG.md
 WITNESS_BACKLOG.md
 PROJECT_BACKLOG.md
 witness_survey.md
+CODE_REVIEW_EXTENSIBILITY.md
+EXTENSIBILITY_BACKLOG.md
 # internal showcase / candidate analysis (references the private schemas + competitive/launch framing)
 RLSAutotest_schema_showcase.md
 RLSAutotest_showcase_candidates.md
@@ -32,3 +35,16 @@ rls-tests/
 dist-skill/
 rls_suite/
 rls_helper/
+# internal launch / marketing drafts - NEVER publish (like CLAUDE.md)
+LAUNCH-DRAFTS-supabase-feature.md
+# personal file - never publish
+Munaf_Khatri_Resume.docx
+# private regression targets + their snapshots (real-world schemas, never published)
+regression/private_baseline/
+
+# session runtime/debug scratch - never published, safe to delete anytime
+temp/
+
+# internal regression harness + baselines - never published
+regression/
+REGRESSION.md

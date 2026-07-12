@@ -4,7 +4,155 @@ All notable changes to **rlsautotest** are documented here. The format is based 
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and versions
 roughly follow semantic versioning.
 
-## [0.1.6] — 2026-06-24
+## [0.2.0] - 2026-07-12
+
+### Fixed
+- **A mock/helper `CREATE` permission failure can no longer produce a false-passing suite** (#2).
+  When the connection role cannot `CREATE OR REPLACE` a policy function or install helpers (typical on
+  Supabase when connecting as `postgres`, since helpers are owned by `supabase_admin`), the probe used to
+  swallow the failure, observe the real (unmocked) function denying everything, and bake that degenerate
+  outcome as the expected behavior. Now: any failed `CREATE`/`ALTER`/`DROP` in a probe's arrange marks the
+  affected identity/command **UNRELIABLE** (a loud failing `fail()` test, a `‼` report cell, exit 1); the
+  bool-UDF wiring battery preflights mock creatability and refuses to emit assertions it could not prove;
+  the report files UNRELIABLE cells from generation-time observations even when the replay itself cannot
+  run pgTAP (e.g. the shim is not creatable), with an explanatory note.
+- **`--parallel N` no longer shares one connection across worker threads.** Each worker gets a private
+  connection, fixing the `InFailedSqlTransaction` crash where one aborted probe poisoned every other
+  table's transaction, and eliminating cross-thread identity/claim bleed. Parallel output is identical to
+  sequential.
+- **`--flat`/`--out` combined with `--report`/`--html` now writes the test files too** (the report path
+  used to exit before the file was written); the CI gate exit code still applies.
+
+### Added
+- **`rlsautotest doctor`**: one command that verifies the probe environment (server/role, `SET ROLE` to
+  each client role, schema `CREATE` privilege, pgTAP availability, and per-policy-function ownership /
+  `CREATE OR REPLACE`-ability, each failed check printing its exact remedy) and always writes a redacted
+  `doctor.json` diagnostic bundle to attach to bug reports: catalog metadata and sqlstates only, no row
+  data, no credentials. All checks are savepoint-wrapped and rolled back.
+
+### Changed
+- **Internal architecture: the single-module engine was split into focused modules** (astutil, values,
+  catalog, atoms, witness, probe, seeding, structs, emit, report, lint, snapshot, commands) and the
+  emitter's nine nested strategy closures became plug-in **witness strategies** dispatched by an ordered
+  registry (`rlsautotest/strategies/`). The four duplicated probe-then-bake sqlstate triages are unified
+  in a single `ProbeBaker`. Behavior-preserving: the emitted SQL for the whole example corpus is
+  byte-identical; `from rlsautotest.cli import X` still works for every symbol.
+- **The report matrix is now filed from machine-readable observations, not from parsing the English test
+  descriptions.** Every emitted test records what command/identity it exercises and the outcome it
+  asserts; the report matches TAP lines to those records by test number. A strategy's label wording can
+  no longer misfile a matrix cell (the old keyword parser remains only as a fallback for files emitted by
+  older versions).
+
+### Added
+- **Zero-argument claim functions are introspected instead of mocked.** A policy gated on a
+  zero-arg boolean function whose body is a transparent JWT-claim check (`is_admin()` as
+  `auth.jwt()->>'app_role' = 'admin'`) previously fell to the opaque-fn mock wiring path (sound,
+  but only a wiring proof plus a footgun note). The introspector now reads the expected value from
+  the function body, so the authorized identity carries the real claim and the policy is tested for
+  real. New fixture `examples/zeroarg.sql`. A wrong guess stays sound: the probe bakes only the
+  observed outcome.
+
+### Changed
+- **The legacy nested `runtests()` debug artifact is no longer written by default.** It predates the
+  probe engine (no probe, no transition audit, no UNRELIABLE, no solver) and drifted further from the
+  real suite each release. `--emit` now writes only the native flat pgTAP suite; pass
+  `--debug-emitter` to also get `.rlsautotest/debug/` (and `--out` still produces it for a single
+  table). Reports get faster since the unused artifact is no longer generated per table.
+
+### Added
+- **Policies granted `TO some_custom_role` stop vanishing.** The client matrix models
+  PUBLIC/authenticated/anon, so a policy for any other role used to be silently excluded. A new
+  custom-role strategy probes each role named by a table's policies via a real `SET ROLE` (no JWT
+  identity) against a synthesized existence row, bakes the observed grant/deny for every command,
+  and the report grows a per-role row (`reporter (custom role)`). New fixture
+  `examples/customrole.sql`.
+
+### Added
+- **A missing client grant on an opaque-fn-gated command is now a baked, passing deny test instead
+  of an untested dash.** When a FOR ALL policy delegates to an opaque function but the client role
+  was never granted the command (e.g. permission-override tables that allow INSERT/DELETE but not
+  UPDATE), the suite records the expected behavior: even a fully policy-authorized identity is
+  denied at the GRANT layer (`throws_ok ... 42501 ... denied as expected`). Only a cleanly observed
+  42501 is baked; anything else stays an honest dash.
+
+- **Commands no client policy grants are now proven under the authorized row too.** When a command
+  is in the matrix only through non-client policies (a `service_role` FOR ALL, a custom role's
+  policy), no identity could ever be "authorized", so the engine emits the expected-behavior proof
+  for the whole authenticated population: the observed deny is baked as a passing test in the
+  authorized row (like every other row's per-identity proofs) instead of an untested dash. Only a
+  cleanly observed deny is baked; an unexpected grant stays visible as the not-authorized row's
+  danger cell.
+
+- **Every report cell is now backed by an emitted test.** Two inference-only areas remain tested:
+  - **Implicit-deny tests are emitted by DEFAULT** (previously opt-in `--implicit-deny`, now kept as
+    a no-op for compatibility; `--no-implicit-deny` restores the old behavior). Commands no policy
+    mentions at all get their observed deny-by-default baked per client identity, so the full
+    command matrix is governed in CI.
+  - **The service_role row is probed and baked like every other identity** (via
+    `tests.authenticate_as_service_role()` in helper mode, `SET LOCAL ROLE service_role` otherwise)
+    instead of being inferred from the grants map. Its INSERT uses a fresh synthesizer-built row,
+    since service INSERTs actually land and a reused identity row collided with the seed (23505).
+    The report prefers the tested observation; the grants inference remains only as the fallback
+    for cells where no sound test could be constructed.
+
+### Added
+- **Key-and-scope-only tables get a real UPDATE test via self-assignment.** When a table has no
+  policy-neutral column at all (`wcard.events` pattern: just a primary key and the owner column the
+  policy watches), the UPDATE probe falls back to `SET owner = owner`: nothing changes and no row
+  moves between scopes, but Postgres still enforces the UPDATE privilege and re-evaluates
+  USING/WITH CHECK — exactly what the cell claims to measure. The explained dash now appears only
+  when nothing is even self-assignable (identity/generated or unique columns only; new negative
+  fixture table `updcheck.t4` guards that residual path).
+
+### Fixed
+- **`--report-json` works again.** The in-memory report grew sets (`unreliable_cells`) and
+  tuple-keyed dicts (`grants`) that `json.dumps` cannot serialize, so the flag crashed and wrote an
+  empty file. The writer now renders sets as sorted lists and tuple keys as `a:b` strings.
+- **The fresh-identity INSERT test now acts AS the fresh identity.** When the owner/link column is
+  unique or the primary key (the classic `profiles` pattern: `WITH CHECK (auth.uid() = id)`), the
+  authorized INSERT must use a fresh user whose uid matches the inserted row; the probe was
+  authenticating with the class's claims instead, observed the WITH CHECK denial, and baked a
+  wrong-direction "denied" cell (never a false pass, but the matrix said blocked where the policy
+  clearly allows). The insert plan's own claims are now used, and the fresh identity's uuid is
+  seeded into `auth.users` alongside the other synthetic subs. `public.profiles` INSERT flips from
+  blocked to a real passing lives_ok across the corpus.
+- **Solver aux rows (membership side-tables) now seed exotic column types, and solver-discovered
+  tables are loaded on demand.** A non-canonical membership policy whose side table carries an
+  exotic NOT NULL column (or any required column, since the classifier-rejected table was never
+  loaded into the column map at all) failed its aux INSERT, the witness never confirmed, and the
+  cells stayed an explained dash. `_seed_one` is now DB-oracle verified and the solver/relstate
+  paths load a discovered table's columns and FKs on demand. New fixture tables `xtypes.rooms` /
+  `xtypes.room_members`.
+- **A boolean function whose name appears only inside a policy's string literal is no longer
+  mock-listed.** The opaque-function detector matches actual function-call nodes in the policy parse
+  tree instead of regexing the policy text, so the wiring tests mock (and their labels blame) only
+  functions the policy really calls.
+- **Tables where every column is defaultable can now be wiring-tested.** The synthesized existence
+  row for such a table produced invalid SQL (`INSERT INTO t() VALUES ()`), which silently killed the
+  mock-test precondition and turned the wiring tests red; it now emits `INSERT ... DEFAULT VALUES`
+  (the INSERT wiring test also becomes possible). Fixture `rxf.reviews` covers both fixes.
+- **A column name inside a policy's string literal no longer blocks the UPDATE probe.** The set of
+  columns a policy references (used to pick the policy-neutral UPDATE column) is now read from the
+  policy's parse tree instead of a regex over the policy text, so `status <> 'note deleted'` no longer
+  disqualifies a real `note` column and the UPDATE cell is tested instead of an explained dash. New
+  fixture `examples/regexfree.sql`.
+- **Exotic column types are now seeded (and UPDATE-probed) on the classified path too.** 0.1.7 routed the
+  probe-and-repair synthesizers through the DB-oracle literal check; now the classified seed plan and the
+  UPDATE probe's SET value use it as well, so an owner/tenant-scoped table with `inet`/`macaddr`/`bytea`/
+  DOMAIN columns flips from UNRELIABLE to a fully tested green matrix (new fixture table
+  `xtypes.sensors` in `examples/exotic_types.sql`). Known types keep byte-identical literals.
+
+## [0.1.7] — 2026-07-11
+
+### Fixed
+- **Real multi-tenant-RBAC extensions (e.g. supabase-tenant-rbac) now generate a correct, fully green suite.** Running the engine against a real RBAC extension's own tables surfaced a cluster of gaps; each is fixed and guarded by the new `examples/rbac_tenant.sql` regression fixture. None of these was ever a false pass — they were mis-classifications, seed failures, or file aborts.
+  - **Per-command classification.** A login-only `WITH CHECK (auth.uid() IS NOT NULL)` is now recognized as "open to any authenticated user" and tested on its own predicate, instead of being mock-wired against helper functions the command never calls. A command is classified by its OWN predicate, not by the table's other policies.
+  - **Identity seeding.** The synthetic test identities are registered in `auth.users`, so a bootstrap trigger that inserts an ownership row (foreign-keyed to `auth.users`) resolves during the probe; and every synthetic authenticated JWT now carries a future `exp`, so an expiry-aware helper (a `_jwt_is_expired`-style guard) returns false instead of raising `invalid_jwt`.
+  - **Identity-neutral seeding.** Seeding as the privileged role now clears the JWT claim, so an ownership-on-insert trigger does not attribute a freshly seeded row to the last probed identity.
+  - **UPDATE probe.** The policy-neutral column picker no longer excludes a column just because it has a `DEFAULT` (only `IDENTITY`/`GENERATED` columns are truly unsettable), and array columns are SET to a valid non-empty literal.
+  - **Row synthesis.** The probe-and-repair synthesizer satisfies an array-cardinality `CHECK` (`cardinality(col) > 0`) by seeding a non-empty array, and the mock `INSERT` cleans the table first so the insert-under-test can't collide with a seeded row on a multi-column `UNIQUE`.
+  - **Grant-aware mocking.** A command the client role has no `GRANT` for is no longer mock-"authorized" (which would hit `42501` and abort the pgTAP file); the real no-grant denial is baked instead.
+  - **Role-scoped classes.** A policy granted only to `service_role` (e.g. `USING (true)`) no longer spawns a bogus authenticated "open" branch; the client matrix is derived only from `PUBLIC`/`authenticated`/`anon` policies.
 
 ### Added
 - **Opaque scalar functions in a policy predicate are now wiring-tested instead of `NOT_TESTABLE`.** When a
@@ -22,6 +170,8 @@ roughly follow semantic versioning.
     real (stronger); mocking is the fallback. Non-equality operators, multi-branch opaque predicates, and
     functions the test role can't `CREATE OR REPLACE` still fall to honest `NOT_TESTABLE`.
 - New example `examples/mockforce.sql` — regression fixture for the force-mock fallback (`fn()=const`, `fn()=fn()`).
+- New example `examples/recursion.sql` — a VALID self-referential hierarchy (`WITH RECURSIVE` from an `owner = auth.uid()` base, reading the tree through a `SECURITY DEFINER` function so the policy does not re-enter its own RLS, i.e. no `42P17`). Wired into the CI green loop so the recursion strategy's happy path is guarded end-to-end; previously only the deliberately-broken `exotic.folders` case exercised that code, and it is excluded from the green loop.
+- **Exotic column types can now be seeded (DB-oracle value synthesis).** The row synthesizers (`_synthesize_row` and the mock-path `_mock_valid_row`) previously filled a NOT NULL column with a substring-guessed literal (`'x'` for anything unrecognized), so a table with an `inet`, `macaddr`, `bytea`, `citext`, range, or `DOMAIN` column could not be seeded — the INSERT failed to cast and the policy branch degraded to UNRELIABLE / NOT_TESTABLE. A new `_castable_lit` verifies a literal against the live type (trying the fast guess first, so every previously-handled type is byte-for-byte unchanged) and, for an unknown type, probes a small candidate list with the database as the oracle. New regression fixture `examples/exotic_types.sql`. (The UPDATE-probe SET value and the classified `_seed_plan` fill are separate value sites not yet routed through the oracle.)
 - **Pattern-match predicates are now tested** (`~`, `~*`, `!~`, `!~*`, `LIKE`, `ILIKE`). The solver constructs a
   string that matches the pattern (and one that doesn't), DB-verifies both, and bakes a real grant/deny test —
   e.g. `email ~ '@example\.com$'` flips from NOT_TESTABLE to ✓/blocked. Patterns it can't build a match for
