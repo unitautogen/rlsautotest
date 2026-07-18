@@ -5,9 +5,7 @@
 Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
-import argparse, json, re, sys
 import psycopg
-from pglast.parser import parse_sql_json
 
 
 
@@ -32,7 +30,44 @@ def _nonempty_array_lit(arrtyp):
     return "'{x}'"
 
 
+def _enum_lit(typ, enums):
+    """The enum's first label as a typed literal (e.g. 'active'::status), or None when `typ` is not a
+    known non-empty enum. Central home for the enum guess the three seeders each duplicated."""
+    base = (typ or "").split("(")[0].strip()
+    labels = enums.get(base)
+    return f"'{labels[0]}'::{base}" if labels else None
+
+
+def _fill_lit(typ, enums):
+    """Base 'any valid value' guess for a required (NOT NULL) column: enum first label, else the static
+    _lit table. DB-verify it at the call site with _verified_lit (exotic types get oracle-repaired)."""
+    return _enum_lit(typ, enums) or _lit(typ)
+
+
+def _pick_lit(typ, enums):
+    """Base 'FK-key value' guess: a DETERMINISTIC constant so a child FK and its seeded parent key line
+    up (enum first label; fixed uuid/int/bool/text constants; else 'x'). DB-verify at the call site.
+    Unifies the uuid/int/bool tables _seed_one / _seed_plan / _mock_valid_row each re-implemented."""
+    e = _enum_lit(typ, enums)
+    if e is not None: return e
+    tl = (typ or "").lower()
+    if "uuid" in tl: return "'000000c1-0000-0000-0000-0000000000c1'"
+    if any(k in tl for k in ("int", "numeric", "real", "double", "serial", "decimal")): return "1"
+    if "bool" in tl: return "false"
+    return "'x'"
+
+
 _CASTABLE_CACHE = {}
+_CASTABLE_CACHE_MAX = 4096   # cap cache growth on large / multi-schema (--parallel) runs; values are
+                            # deterministic per key, so clearing at the cap only costs recomputation,
+                            # never a wrong literal (code_review_findings.md 3.1).
+
+
+def _cache_put(key, value):
+    if len(_CASTABLE_CACHE) >= _CASTABLE_CACHE_MAX:
+        _CASTABLE_CACHE.clear()
+    _CASTABLE_CACHE[key] = value
+    return value
 
 def _castable_lit(conn, typ, salt=0):
     """A literal VALID for column type `typ`, verified against the DB (F3: the type analog of the
@@ -63,18 +98,15 @@ def _castable_lit(conn, typ, salt=0):
     for cand in [guess, "'x'", "1", "0", "false", "now()", "'{}'", "'0.0.0.0'",
                  "'00:00:00:00:00:00'", "'\\x00'", "'[0,1)'", "'a'"]:
         if casts(cand):
-            _CASTABLE_CACHE[key] = cand
-            return cand
+            return _cache_put(key, cand)
     # F3 last resort: resolve the type through the catalog (a DOMAIN's base type, an array's element
     # type) and try THAT type's literal — covers a domain over a type the candidate list can't hit.
     base = _pg_base_type(conn, typ)
     if base and base != typ:
         cand = _castable_lit(conn, base, salt)
         if casts(cand):
-            _CASTABLE_CACHE[key] = cand
-            return cand
-    _CASTABLE_CACHE[key] = guess
-    return guess
+            return _cache_put(key, cand)
+    return _cache_put(key, guess)
 
 
 def _pg_base_type(conn, typ):
@@ -120,6 +152,15 @@ class TypeValueProvider:
     def nonempty_array(self, arrtyp):
         return _nonempty_array_lit(arrtyp)
 
+    def enum_lit(self, typ, enums):        # enum first-label literal, else None
+        return _enum_lit(typ, enums)
+
+    def fill_lit(self, typ, enums):        # base guess for a required column (enum or _lit)
+        return _fill_lit(typ, enums)
+
+    def pick_lit(self, typ, enums):        # base guess for an FK-key column (deterministic constant)
+        return _pick_lit(typ, enums)
+
 
 def _verified_lit(conn, typ, guess):
     """F3: keep `guess` when the DB confirms it casts to `typ` (so every already-handled type is
@@ -135,16 +176,14 @@ def _verified_lit(conn, typ, guess):
     try:
         cur.execute(f"SELECT ({guess})::{typ}")
         cur.execute("RELEASE SAVEPOINT _vl")
-        _CASTABLE_CACHE[key] = guess
-        return guess
+        return _cache_put(key, guess)
     except psycopg.Error:
         try:
             cur.execute("ROLLBACK TO SAVEPOINT _vl")
         except psycopg.Error:
             pass
     out = _castable_lit(conn, typ)
-    _CASTABLE_CACHE[key] = out
-    return out
+    return _cache_put(key, out)
 
 
 CV = ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222", "33333333-3333-3333-3333-333333333333"]

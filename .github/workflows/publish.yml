@@ -4,21 +4,70 @@ on:
     types: [published]   # fires when you publish a GitHub Release
 
 jobs:
-  pypi:
+  # 1) Build the artifacts and RUN the wheel from a clean install BEFORE anything is uploaded.
+  #    This is the gate that would have stopped 0.2.0: a wheel missing rlsautotest.strategies fails here
+  #    instead of shipping. Only the exact artifact tested in this job is what later gets published.
+  build:
     runs-on: ubuntu-latest
-    environment: pypi              # must match the PyPI trusted-publisher config (or remove from both)
-    permissions:
-      id-token: write             # PyPI trusted publishing (OIDC) - no stored token
-      contents: write             # attach the built wheel + sdist to the GitHub Release
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install --upgrade build
       - run: python -m build        # -> dist/*.whl + dist/*.tar.gz
+      - name: Smoke-test the built wheel from a clean venv (never publish a broken artifact)
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          # cd OUTSIDE the source tree so the INSTALLED package is imported, not ./rlsautotest
+          cd /tmp
+          /tmp/clean/bin/rlsautotest --help
+          /tmp/clean/bin/python -c "import rlsautotest.cli, rlsautotest.emit, rlsautotest.strategies; print('clean-install import OK')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  # 2) Publish ONLY the artifacts that passed the smoke test above.
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi              # must match the PyPI trusted-publisher config (or remove from both)
+    permissions:
+      id-token: write             # PyPI trusted publishing (OIDC) - no stored token
+      contents: write             # attach the built wheel + sdist to the GitHub Release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
       - name: Attach wheel + sdist to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+
+  # 3) Verify the ACTUAL published artifact installs and runs from PyPI (the "distribution site" check).
+  verify:
+    needs: pypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install the just-published version from PyPI and smoke-test it
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"   # strip a leading v from a tag like v0.2.1
+          echo "Verifying published rlsautotest==${VERSION} from PyPI"
+          python -m venv /tmp/pypi
+          # the PyPI index can lag a few seconds after upload — retry before giving up
+          ok=""
+          for i in 1 2 3 4 5 6; do
+            if /tmp/pypi/bin/pip install "rlsautotest==${VERSION}"; then ok=1; break; fi
+            echo "not visible yet, retry $i"; sleep 15
+          done
+          [ -n "$ok" ] || { echo "FAIL: ${VERSION} did not become installable from PyPI"; exit 1; }
+          cd /tmp
+          /tmp/pypi/bin/rlsautotest --help
+          /tmp/pypi/bin/python -c "import rlsautotest.strategies; print('PyPI install import OK')"

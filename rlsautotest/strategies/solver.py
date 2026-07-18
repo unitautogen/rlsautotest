@@ -8,7 +8,7 @@ import json
 
 from ..astutil import _claim_paths, _expr_cols, _expr_consts, _jwt_anywhere, _qlit, _where
 from ..atoms import _set_claim
-from ..probe import _probe, _unrel_fail
+from ..probe import _probe
 from ..seeding import _aux_row_stmts, _ensure_table_loaded, _mock_valid_row, _synth_required_cols
 from ..witness import _WV_UID, _candidate_sessions, _candidate_values, _solve_predicate, _wv_ctx, _wv_lit
 from ..structs import Observation

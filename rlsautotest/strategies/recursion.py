@@ -3,11 +3,11 @@
 """Self-referential-hierarchy strategy: seed an ancestor chain (root owned by the user +
 a descendant) so a WITH RECURSIVE policy admits the descendant; probe-verify. SELECT only."""
 from __future__ import annotations
-import json, re
+import json
 
 from ..astutil import _colname, _is_func, _names, _qlit, _t, _v, _where
 from ..values import REC_OTHER, REC_ROOT
-from ..probe import _probe, _unrel_fail
+from ..probe import _probe
 from ..seeding import _synth_required_cols
 from .base import HANDLED, PASS
 

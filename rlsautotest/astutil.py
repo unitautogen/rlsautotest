@@ -5,8 +5,8 @@
 Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
-import argparse, json, re, sys
-import psycopg
+import json
+import re
 from pglast.parser import parse_sql_json
 
 ORDER = ["SELECT", "INSERT", "UPDATE", "DELETE"]

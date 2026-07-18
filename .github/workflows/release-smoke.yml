@@ -1,0 +1,28 @@
+name: release-smoke
+# On-demand check that a PUBLISHED version on PyPI installs and runs from a clean environment.
+# Manual only: the publish workflow already runs a post-upload PyPI verify for a fresh release, so this
+# is for re-checking an existing/older version on demand (e.g. after a yank). Triggering it on the
+# release event too would race the publish workflow (install before the upload finished), so it doesn't.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to install from PyPI (e.g. 0.2.1)"
+        required: true
+
+jobs:
+  pypi-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install from PyPI and smoke-test the CLI
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          VERSION="${VERSION#v}"
+          echo "Testing published rlsautotest==${VERSION} from PyPI"
+          python -m venv /tmp/pypi
+          /tmp/pypi/bin/pip install "rlsautotest==${VERSION}"
+          cd /tmp   # import the installed package, not any repo source
+          /tmp/pypi/bin/rlsautotest --help
+          /tmp/pypi/bin/python -c "import rlsautotest.cli, rlsautotest.emit, rlsautotest.strategies; print('PyPI install import OK')"

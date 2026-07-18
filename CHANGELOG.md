@@ -4,6 +4,22 @@ All notable changes to **rlsautotest** are documented here. The format is based 
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and versions
 roughly follow semantic versioning.
 
+## [0.2.1] - 2026-07-18
+
+### Fixed
+- **0.2.0 was uninstallable from PyPI.** The built wheel omitted the `rlsautotest.strategies` subpackage
+  (introduced by the 0.2.0 modular refactor), so `pip install rlsautotest` followed by any invocation failed
+  with `ModuleNotFoundError: No module named 'rlsautotest.strategies'`. Root cause: `pyproject.toml` hardcoded
+  `packages = ["rlsautotest"]`, which excluded the subpackage from the wheel. Switched to setuptools package
+  auto-discovery (`[tool.setuptools.packages.find]`, `include = ["rlsautotest*"]`) so every subpackage ships.
+  0.1.6 was the last working release; **0.2.0 has been yanked**. No behavior change from 0.2.0 otherwise.
+
+### Changed
+- **CI now tests the packaged artifact, not just the source tree.** A `package` job builds the wheel and runs
+  it (`rlsautotest --help` + `import rlsautotest.strategies`) from a clean venv, and a post-publish
+  `release-smoke` workflow installs the released version from PyPI and smoke-tests it. A packaging regression
+  now fails the build instead of shipping.
+
 ## [0.2.0] - 2026-07-12
 
 ### Fixed

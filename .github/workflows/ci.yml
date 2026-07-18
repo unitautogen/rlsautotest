@@ -11,6 +11,27 @@ jobs:
       - run: pip install -e . pytest
       - run: pytest -q
 
+  package:
+    # Build the WHEEL and run it from a clean install — not editable source. This is the check that would
+    # have caught 0.2.0 shipping without rlsautotest.strategies. Tests the artifact users actually get.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build --wheel
+      - name: Install the built wheel into a clean venv and run it
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          # cd OUTSIDE the source tree so the INSTALLED package is imported, not ./rlsautotest
+          cd /tmp
+          /tmp/clean/bin/rlsautotest --help
+          /tmp/clean/bin/python -c "import rlsautotest.cli, rlsautotest.emit, rlsautotest.strategies; print('clean-install import OK')"
+
   integration:
     runs-on: ubuntu-latest
     steps:

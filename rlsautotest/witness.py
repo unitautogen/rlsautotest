@@ -5,12 +5,11 @@
 Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
-import argparse, json, re, sys
-import psycopg
-from pglast.parser import parse_sql_json
+import json
+import re
 from .structs import WitnessCtx
 from .values import WV_UID
-from .astutil import _and_conjuncts, _array_consts, _bool_extra, _colname, _colqual, _const, _is_func, _jwt_keys, _names, _t, _unwrap, _v, _subquery_sig
+from .astutil import _array_consts, _colname, _const, _is_func, _jwt_keys, _names, _t, _unwrap, _v, _subquery_sig
 from .atoms import _membership, _scalar_lookup
 
 

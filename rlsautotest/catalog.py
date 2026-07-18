@@ -5,9 +5,7 @@
 Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
-import argparse, json, re, sys
-import psycopg
-from pglast.parser import parse_sql_json
+import re
 from .astutil import _CMDS4, _and_conjuncts, _array_consts, _colname, _const, _list_consts, _names, _t, _unwrap, _v, _where
 
 

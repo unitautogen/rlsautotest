@@ -5,17 +5,15 @@
 Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
-import argparse, json, re, sys
-import psycopg
-from pglast.parser import parse_sql_json
-from .astutil import _CMDS4, _TAGLINE, _TAGLINE2, _expr_cols, _is_uuid, _qlit, _split_statements, _sq, _where
+import json
+from .astutil import _CMDS4, _TAGLINE, _TAGLINE2, _expr_cols, _split_statements, _sq, _where
 from .values import CV, FOREIGN, FUTURE_EXP, INS, MV, NOBODY, RIVAL_SUB
 from .catalog import _FK_SQL, _columns, _constraint_meta, _effective_grants, _exposed, all_tables
 from .atoms import _check_value_set, analyze
 from .probe import ProbeBaker, _probe
 from .seeding import _seed_plan, _synthesize_row, _wrap_seed
 from .structs import EmitContext, Observation
-from .strategies import AUGMENT, CONTINUE, HANDLED, REGISTRY
+from .strategies import AUGMENT, HANDLED, REGISTRY
 from .strategies.mock import _opaque_fn_sig, _policy_bool_udfs, mock_emit
 from .strategies.solver import solve_emit
 

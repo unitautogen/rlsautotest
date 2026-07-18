@@ -5,11 +5,10 @@
 Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
-import argparse, json, re, sys
-import psycopg
+import json
 from pglast.parser import parse_sql_json
 from .structs import Atom, IdentityClass
-from .astutil import ORDER, _and_conjuncts, _array_consts, _colname, _colqual, _const, _eq_pairs, _find_queries, _is_func, _is_true_clause, _is_uuid, _jwt_anywhere, _jwt_keys, _list_consts, _names, _not, _t, _unwrap, _v, _where, _subquery_sig
+from .astutil import ORDER, _array_consts, _colname, _colqual, _const, _eq_pairs, _find_queries, _is_func, _is_true_clause, _is_uuid, _jwt_anywhere, _jwt_keys, _list_consts, _names, _not, _t, _unwrap, _v, _where, _subquery_sig
 from .values import CV, FUTURE_EXP, MV
 
 

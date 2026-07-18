@@ -15,9 +15,10 @@ Unhandled atoms -> reason-coded NOT_TESTABLE.
   python -m testgen.rls --schema <s> --table <t> [--describe] [--out f.sql]
 """
 from __future__ import annotations
-import argparse, json, re, sys
+import argparse
+import json
+import sys
 import psycopg
-from pglast.parser import parse_sql_json
 
 # The engine was split into focused modules; cli re-exports every symbol so that
 # `from rlsautotest.cli import X` keeps working for tests and downstream users.
@@ -90,6 +91,8 @@ def main():
     ap.add_argument("--as-user", metavar="EMAIL",
                     help="after --report: show what a specific auth.users identity can/cannot do")
     a = ap.parse_args()
+    if a.label and not all(ch.isalnum() or ch in "-_" for ch in a.label):
+        ap.error("--label may contain only letters, digits, '-' and '_' (it names an emit subfolder; this blocks path traversal)")
     try: sys.stdout.reconfigure(encoding="utf-8")   # render matrix glyphs on Windows too
     except Exception: pass
     helpers = not a.no_helpers

@@ -4,7 +4,7 @@
 into, so MOCK them true/false and prove the policy wires to them (wiring proof — the
 function's own logic stays unverified -> report footgun)."""
 from __future__ import annotations
-import json, re
+import re
 
 from ..astutil import _names, _qlit, _t, _unwrap, _v, _where
 from ..probe import _probe, _unrel_fail

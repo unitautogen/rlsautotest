@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rlsautotest"
-version = "0.2.0"
+version = "0.2.1"
 description = "Deterministic pgTAP test generation for Postgres/Supabase Row-Level Security (RLS) policies."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -31,5 +31,8 @@ Issues = "https://github.com/unitautogen/rlsautotest/issues"
 [project.scripts]
 rlsautotest = "rlsautotest.cli:main"
 
-[tool.setuptools]
-packages = ["rlsautotest"]
+[tool.setuptools.packages.find]
+# Auto-discover every rlsautotest package INCLUDING subpackages (rlsautotest.strategies).
+# The old hardcoded `packages = ["rlsautotest"]` silently dropped the strategies/ subpackage from the
+# built wheel (0.2.0 shipped uninstallable). find + the wildcard ships all current and future subpackages.
+include = ["rlsautotest*"]

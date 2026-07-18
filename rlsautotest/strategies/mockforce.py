@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 
 from ..astutil import _colname, _const, _names, _qlit, _t, _v
-from ..probe import _probe, _unrel_fail
+from ..probe import _probe
 from ..seeding import _synthesize_row
 from .base import AUGMENT, PASS
 from .mock import _mocklit, _opaque_fn_sig

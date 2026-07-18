@@ -7,7 +7,6 @@ Split out of the original single-module cli.py; behavior-preserving.
 from __future__ import annotations
 import argparse, json, re, sys
 import psycopg
-from pglast.parser import parse_sql_json
 
 
 

@@ -5,11 +5,11 @@
 Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
-import argparse, json, re, sys
+import json
+import re
 import psycopg
-from pglast.parser import parse_sql_json
 from .astutil import _split_statements, _sq
-from .values import FOREIGN, FUTURE_EXP, INS, RIVAL_ORG, RIVAL_SUB, _bump_lit, _castable_lit, _lit, _nonempty_array_lit, _verified_lit
+from .values import FOREIGN, FUTURE_EXP, INS, RIVAL_ORG, RIVAL_SUB, _bump_lit, _castable_lit, _fill_lit, _nonempty_array_lit, _pick_lit, _verified_lit
 from .catalog import _FK_SQL, _check_bool_udfs, _columns, _constraint_meta, _fk_by_name
 from .atoms import _set_claim
 
@@ -52,17 +52,8 @@ def _seed_one(table_fqn, fixed, fkmap, colsmap, enums, conn=None):
     literal is DB-verified (F3): known types keep their exact literal, an exotic type gets an
     oracle-repaired castable value instead of a doomed 'x'."""
     stmts = []
-    def fill(t):
-        base = t.split("(")[0].strip()
-        v = f"'{enums[base][0]}'::{base}" if (base in enums and enums[base]) else _lit(t)
-        return _verified_lit(conn, t, v)
-    def pick(t):
-        base = t.split("(")[0].strip(); tl = t.lower()
-        if base in enums and enums[base]: return _verified_lit(conn, t, f"'{enums[base][0]}'::{base}")
-        if "uuid" in tl: return "'000000c1-0000-0000-0000-0000000000c1'"
-        if any(k in tl for k in ("int", "numeric", "real", "double", "serial", "decimal")): return "1"
-        if "bool" in tl: return "false"
-        return _verified_lit(conn, t, "'x'")
+    def fill(t): return _verified_lit(conn, t, _fill_lit(t, enums))
+    def pick(t): return _verified_lit(conn, t, _pick_lit(t, enums))
     def ensure(tbl, vals):
         fks = fkmap.get(tbl, {}); full = dict(vals)
         for (n, t, nn, hd) in colsmap.get(tbl, []):
@@ -126,24 +117,13 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
     pkind = primary["kinds"][0] if primary and primary["kinds"] else None
     total_rows = (len(rowlinked) + 1) if rowlinked else (2 if any_grant else 0)
 
-    def fill(t):
-        base = t.split("(")[0].strip()
-        return f"'{enums[base][0]}'::{base}" if base in enums else _lit(t)
-    def pick(t):
-        base = t.split("(")[0].strip(); tl = t.lower()
-        if base in enums: return f"'{enums[base][0]}'::{base}"
-        if "uuid" in tl: return "'000000c1-0000-0000-0000-0000000000c1'"
-        if any(k in tl for k in ("int", "numeric", "real", "double", "serial")): return "1"
-        if "bool" in tl: return "false"
-        return "'x'"
-    if conn is not None:
-        # F3: DB-verify every guessed literal. A type the static tables know keeps its exact literal
-        # (emitted SQL unchanged); an exotic column type (inet, bytea, DOMAIN, citext, range, custom)
-        # gets an oracle-repaired value instead of a doomed 'x' -> the seed INSERT stops dying at the
-        # cast and the classified path (and the UPDATE-probe SET, which uses this same fill) can test it.
-        _fill0, _pick0 = fill, pick
-        def fill(t): return _verified_lit(conn, t, _fill0(t))
-        def pick(t): return _verified_lit(conn, t, _pick0(t))
+    # F3: DB-verify every guessed literal (_verified_lit). A type the static tables know keeps its exact
+    # literal (emitted SQL unchanged); an exotic column type (inet, bytea, DOMAIN, citext, range, custom)
+    # is oracle-repaired to a castable value instead of a doomed 'x' -> the seed INSERT stops dying at the
+    # cast and the classified path (and the UPDATE-probe SET, which uses this same fill) can test it. Base
+    # guess tables are shared via values._fill_lit / _pick_lit (same tables as _seed_one / _mock_valid_row).
+    def fill(t): return _verified_lit(conn, t, _fill_lit(t, enums))
+    def pick(t): return _verified_lit(conn, t, _pick_lit(t, enums))
 
     stmts, seen = [], set()
     def ensure_comp(tbl, pvals):   # seed a composite-FK parent tuple (its key cols fixed to pvals)
@@ -321,17 +301,8 @@ def _mock_valid_row(schema, table, fkmap, colsmap, enums, checks=None, relchecks
     checks = checks or {}
     def _ck(tbl, col): return (checks.get(tbl) or {}).get(col)   # CHECK-satisfying literal, if any
 
-    def _fill(t):
-        base = t.split("(")[0].strip()
-        return f"'{enums[base][0]}'::{base}" if (base in enums and enums[base]) else (_castable_lit(conn, t) if conn is not None else _lit(t))
-
-    def _pick(t):
-        base = t.split("(")[0].strip(); tl = t.lower()
-        if base in enums and enums[base]: return f"'{enums[base][0]}'::{base}"
-        if "uuid" in tl: return "'000000c1-0000-0000-0000-0000000000c1'"
-        if any(k in tl for k in ("int", "numeric", "real", "double", "serial", "decimal")): return "1"
-        if "bool" in tl: return "false"
-        return _castable_lit(conn, t) if conn is not None else "'x'"
+    def _fill(t): return _verified_lit(conn, t, _fill_lit(t, enums))
+    def _pick(t): return _verified_lit(conn, t, _pick_lit(t, enums))
 
     stmts, seen = [], set()
 

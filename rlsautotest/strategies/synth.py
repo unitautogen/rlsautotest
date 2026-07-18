@@ -3,10 +3,9 @@
 """GUC / JWT-claim / mocked-scalar-fn gate strategy: SET the session input the policy reads,
 SEED a matching row, and probe-verify (a wrong guess is harmless — the probe observes)."""
 from __future__ import annotations
-import json, re
 
 from ..astutil import _colname, _const, _jwt_anywhere, _jwt_keys, _names, _qlit, _t, _unwrap, _v, _where
-from ..probe import _probe, _unrel_fail
+from ..probe import _probe
 from ..seeding import _synth_required_cols
 from .base import HANDLED, PASS
 from .mock import _opaque_fn_sig
