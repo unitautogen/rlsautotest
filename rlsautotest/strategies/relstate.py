@@ -5,7 +5,7 @@
 from __future__ import annotations
 import json
 
-from ..astutil import _expr_consts, _qlit, _where
+from ..astutil import _expr_consts, _qi, _qlit, _where
 from ..probe import _probe
 from ..seeding import _aux_row_stmts, _ensure_table_loaded, _mock_valid_row
 from ..witness import _WV_UID, _subquery_tables, _wv_lit
@@ -61,7 +61,7 @@ def relstate_emit(ctx, baker, cmd):
             for c, v in grow.items(): rr[c] = _wv_lit(coltypes.get(c, "text"), v)
             if not rr:                              # every column has a default (no required cols) -> DEFAULT VALUES
                 return f"INSERT INTO {q} DEFAULT VALUES"
-            return f"INSERT INTO {q}({', '.join(rr)}) VALUES ({', '.join(rr.values())})"
+            return f"INSERT INTO {q}({', '.join(_qi(c) for c in rr)}) VALUES ({', '.join(rr.values())})"
         satK = falK = satN = None
         for K in Kc:
             o = _probe(conn, [f"DELETE FROM {q}"] + parents + aux_seed(K) + [gated_ins()], pid, "read", f"SELECT count(*) FROM {q}")

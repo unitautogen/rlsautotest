@@ -6,7 +6,7 @@ DB-oracle floors (BL-6 single-column, BL-11 joint session x multi-column search)
 from __future__ import annotations
 import json
 
-from ..astutil import _claim_paths, _expr_cols, _expr_consts, _jwt_anywhere, _qlit, _where
+from ..astutil import _claim_paths, _expr_cols, _expr_consts, _jwt_anywhere, _qi, _qlit, _qt, _where
 from ..atoms import _set_claim
 from ..probe import _probe
 from ..seeding import _aux_row_stmts, _ensure_table_loaded, _mock_valid_row, _synth_required_cols
@@ -41,7 +41,7 @@ def _construct_witness(ctx, expr):
     grant_v = deny_v = None; got_g = got_d = False
     for cand in cands:
         rr = dict(base_row); rr[col] = _wv_lit(ct, cand)
-        ins = f"INSERT INTO {q}({', '.join(rr)}) VALUES ({', '.join(rr.values())})"
+        ins = f"INSERT INTO {q}({', '.join(_qi(c) for c in rr)}) VALUES ({', '.join(rr.values())})"
         o = _probe(conn, [f"DELETE FROM {q}"] + parents + [ins], pid, "read", f"SELECT count(*) FROM {q}")
         if o[2] or o[0] != "count":
             continue                               # this candidate couldn't be seeded/observed -> try the next
@@ -91,7 +91,7 @@ def _search_witness(ctx, expr):
             budget -= 1
             rr = dict(base_row)
             for c, v in combo.items(): rr[c] = _wv_lit(coltypes.get(c, "text"), v)
-            ins = f"INSERT INTO {q}({', '.join(rr)}) VALUES ({', '.join(rr.values())})"
+            ins = f"INSERT INTO {q}({', '.join(_qi(c) for c in rr)}) VALUES ({', '.join(rr.values())})"
             o = _probe(conn, [f"DELETE FROM {q}"] + parents + [ins], pid, "read", f"SELECT count(*) FROM {q}")
             if o[2] or o[0] != "count":
                 continue
@@ -159,7 +159,7 @@ def solve_emit(ctx, baker, cmd, node=None):
             rr = dict(base_row); rr.update(over)
             if not rr:                              # every column has a default -> DEFAULT VALUES (not broken `t() VALUES ()`)
                 return f"INSERT INTO {q} DEFAULT VALUES"
-            return f"INSERT INTO {q}({', '.join(rr)}) VALUES ({', '.join(rr.values())})"
+            return f"INSERT INTO {q}({', '.join(_qi(c) for c in rr)}) VALUES ({', '.join(rr.values())})"
         def idsql(claims, gucs):
             return list(gucs) + [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true)", "SET LOCAL ROLE authenticated"]
         if cmd == "SELECT":
@@ -197,7 +197,7 @@ def solve_emit(ctx, baker, cmd, node=None):
             if cmd == "UPDATE":
                 if not upd_col:
                     continue
-                act_t = act_f = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
+                act_t = act_f = f"UPDATE {q} SET {_qi(upd_col[0])}={_upd_val(upd_col[0], upd_col[1])}"
             else:
                 act_t = act_f = f"DELETE FROM {q}"
             arr_t = [f"DELETE FROM {q}"] + parents + s_aux + [rowins(s_row)]

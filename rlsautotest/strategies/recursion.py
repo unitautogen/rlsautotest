@@ -5,7 +5,7 @@ a descendant) so a WITH RECURSIVE policy admits the descendant; probe-verify. SE
 from __future__ import annotations
 import json
 
-from ..astutil import _colname, _is_func, _names, _qlit, _t, _v, _where
+from ..astutil import _colname, _is_func, _names, _qi, _qlit, _t, _v, _where
 from ..values import REC_OTHER, REC_ROOT
 from ..probe import _probe
 from ..seeding import _synth_required_cols
@@ -82,13 +82,13 @@ def synth_recursion_emit(ctx, baker, cmd, rg):
         if rn in (owner, sfk): continue
         if rn in fkc: return False   # another required FK we can't parent -> honest fall-through
         extra[rn] = fill(rt)
-    xc = ("" if not extra else ", " + ", ".join(extra))
+    xc = ("" if not extra else ", " + ", ".join(_qi(c) for c in extra))
     xv = ("" if not extra else ", " + ", ".join(extra.values()))
     U, U2 = REC_ROOT, REC_OTHER   # canonical home: values.ALL_SENTINELS (F10)
     arrange = [f"DELETE FROM {q}",
                f"INSERT INTO auth.users(id) VALUES ('{U}') ON CONFLICT DO NOTHING",
-               f"INSERT INTO {q}({owner}{xc}) VALUES ('{U}'{xv})",                                   # root owned by U
-               f"INSERT INTO {q}({sfk}{xc}) VALUES ((SELECT {pk} FROM {q} WHERE {owner}='{U}' ORDER BY {pk} LIMIT 1){xv})"]  # descendant under root
+               f"INSERT INTO {q}({_qi(owner)}{xc}) VALUES ('{U}'{xv})",                                   # root owned by U
+               f"INSERT INTO {q}({_qi(sfk)}{xc}) VALUES ((SELECT {_qi(pk)} FROM {q} WHERE {_qi(owner)}='{U}' ORDER BY {_qi(pk)} LIMIT 1){xv})"]  # descendant under root
     def one(who, sub, role, ident):
         claims = None if role == "anon" else json.dumps({"sub": sub, "role": "authenticated"})
         pidl = (["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"] if role == "anon"

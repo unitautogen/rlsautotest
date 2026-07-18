@@ -12,6 +12,7 @@ from ..probe import _probe
 from ..seeding import _mock_valid_row, _synthesize_row
 from .base import CONTINUE
 from .mock import _ins_sql
+from ..astutil import _qi
 
 # roles that are the modeled client trio or platform plumbing, never a "custom" policy audience
 _STANDARD = {"public", "authenticated", "anon", "service_role", "authenticator",
@@ -66,7 +67,7 @@ def run(ctx, baker, cmd):
             elif cmd == "UPDATE":
                 if not ctx.upd_col:
                     continue
-                act = f"UPDATE {q} SET {ctx.upd_col[0]}={ctx.upd_val(ctx.upd_col[0], ctx.upd_col[1])}"
+                act = f"UPDATE {q} SET {_qi(ctx.upd_col[0])}={ctx.upd_val(ctx.upd_col[0], ctx.upd_col[1])}"
             else:
                 act = f"DELETE FROM {q}"
             arrange = pre[:-1] if (cmd == "INSERT" and pre and pre[-1].startswith("INSERT")) else pre

@@ -366,6 +366,29 @@ def _qlit(s):
     return "'" + str(s).replace("'", "''") + "'"
 
 
+_IDENT_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789_")
+
+def _qi(name):
+    """Conditionally quote a SQL identifier (quote_ident semantics, pattern-only). A bare lowercase-simple
+    identifier passes through UNCHANGED (so emitted SQL for lowercase schemas stays byte-identical); a
+    mixed-case / special-char name (e.g. EF-Core "TenantId", "Accounts") gets double-quoted. No keyword list
+    on purpose: quoting only on character shape guarantees zero drift for existing lowercase corpora."""
+    s = str(name)
+    if s and s[0] in "abcdefghijklmnopqrstuvwxyz_" and all(c in _IDENT_CHARS for c in s):
+        return s
+    return '"' + s.replace('"', '""') + '"'
+
+def _qt(schema, table=None):
+    """Quote a (possibly schema-qualified) table reference, each part conditionally.
+    `_qt('s', 't')` or `_qt('s.t')`; a bare unqualified name is quoted as one identifier."""
+    if table is None:
+        s = str(schema)
+        schema, dot, table = s.partition(".")
+        if not dot:
+            return _qi(schema)
+    return _qi(schema) + "." + _qi(table)
+
+
 
 def _sq(name):
     return name.split(".", 1) if "." in name else ("public", name)

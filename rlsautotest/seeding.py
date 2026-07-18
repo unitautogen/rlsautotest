@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 import psycopg
-from .astutil import _split_statements, _sq
+from .astutil import _split_statements, _sq, _qi, _qt
 from .values import FOREIGN, FUTURE_EXP, INS, RIVAL_ORG, RIVAL_SUB, _bump_lit, _castable_lit, _fill_lit, _nonempty_array_lit, _pick_lit, _verified_lit
 from .catalog import _FK_SQL, _check_bool_udfs, _columns, _constraint_meta, _fk_by_name
 from .atoms import _set_claim
@@ -29,7 +29,7 @@ def _aux_row_stmts(conn, a, fkmap, colsmap, enums):
         if comp:
             recipe, srow, setup = _synthesize_row(conn, s2, t2, fixed=fixed)
             if recipe is not None and srow:
-                return (setup or []) + [f"INSERT INTO {a['table']}({', '.join(srow)}) VALUES ({', '.join(srow.values())})"]
+                return (setup or []) + [f"INSERT INTO {_qt(a['table'])}({', '.join(_qi(c) for c in srow)}) VALUES ({', '.join(srow.values())})"]
     return _seed_one(a["table"], fixed, fkmap, colsmap, enums, conn=conn)
 
 
@@ -61,7 +61,7 @@ def _seed_one(table_fqn, fixed, fkmap, colsmap, enums, conn=None):
             full[n] = pick(t) if n in fks else fill(t)
         for n, vv in full.items():
             if n in fks: pt, pc = fks[n]; ensure(pt, {pc: vv})
-        stmts.append(f"INSERT INTO {tbl}({', '.join(full)}) VALUES ({', '.join(full.values())}) ON CONFLICT DO NOTHING")
+        stmts.append(f"INSERT INTO {_qt(tbl)}({', '.join(_qi(c) for c in full)}) VALUES ({', '.join(full.values())}) ON CONFLICT DO NOTHING")
     ensure(table_fqn, fixed)
     return stmts
 
@@ -135,7 +135,7 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
             if n in full or not nn or hd: continue
             full[n] = pick(t) if n in fks else (chkval(tbl, n) or fill(t))
         relfill(tbl, full, set(pvals)); anc(full, tbl)
-        stmts.append(f"  INSERT INTO {tbl}({', '.join(full)}) VALUES ({', '.join(full.values())}) ON CONFLICT DO NOTHING;")
+        stmts.append(f"  INSERT INTO {_qt(tbl)}({', '.join(_qi(c) for c in full)}) VALUES ({', '.join(full.values())}) ON CONFLICT DO NOTHING;")
     def ensure(tbl, col, val):
         k = (tbl, col, val)
         if k in seen: return
@@ -149,7 +149,7 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
             if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
         for cf in compfks.get(tbl, []):
             if all(c in vals for c in cf["cols"]): ensure_comp(cf["parent"], {pc: vals[lc] for lc, pc in zip(cf["cols"], cf["pcols"])})
-        stmts.append(f"  INSERT INTO {tbl}({', '.join(vals)}) VALUES ({', '.join(vals.values())}) ON CONFLICT DO NOTHING;")
+        stmts.append(f"  INSERT INTO {_qt(tbl)}({', '.join(_qi(c) for c in vals)}) VALUES ({', '.join(vals.values())}) ON CONFLICT DO NOTHING;")
     def _distinct(t, salt):
         tl = t.lower(); base = t.split("(")[0].strip()
         if base in enums: return f"'{enums[base][0]}'::{base}"
@@ -178,7 +178,7 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
         for cf in compfks.get(tbl, []):   # composite FK -> seed the parent tuple
             if all(c in vals for c in cf["cols"]): ensure_comp(cf["parent"], {pc: vals[lc] for lc, pc in zip(cf["cols"], cf["pcols"])})
     def insert(tbl, vals, conflict=False):
-        return f"  INSERT INTO {tbl}({', '.join(vals)}) VALUES ({', '.join(vals.values())})" + (" ON CONFLICT DO NOTHING" if conflict else "") + ";"
+        return f"  INSERT INTO {_qt(tbl)}({', '.join(_qi(c) for c in vals)}) VALUES ({', '.join(vals.values())})" + (" ON CONFLICT DO NOTHING" if conflict else "") + ";"
     def foreign_val(kind):
         if kind == "array_col": return f"ARRAY['{FOREIGN}']::uuid[]"
         if kind == "temporal": return "now() - interval '1 day'"
@@ -207,7 +207,7 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
     q_scope_parent = any(a.get("table") and a["table"] != q and q in _anc_tables(a["table"])
                          for c in all_h for a in c["aux"])
     for at in {a["table"] for c in all_h for a in c["aux"]}:
-        stmts.append(f"  DELETE FROM {at};")
+        stmts.append(f"  DELETE FROM {_qt(at)};")
     def seed_aux():
         aux_seen = set()
         for c in all_h:
@@ -283,7 +283,7 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
                 insert_plan[c["idx"]] = (json.dumps(c["claims"]), iv)
     nobody_ins = row_values(q, primary["rowseed"], salt=300) if primary else (row_values(q, {}, salt=301) if any_grant else None)
     seed = "\n".join(stmts)
-    return {"q": q, "seed": seed, "total_rows": total_rows, "insert_plan": insert_plan,
+    return {"q": _qt(q), "seed": seed, "total_rows": total_rows, "insert_plan": insert_plan,
             "nobody_ins": nobody_ins, "primary": primary, "pkind": pkind, "rowlinked": rowlinked,
             "any_grant": any_grant, "fill": fill, "foreign_val": foreign_val,
             "rival": {"on": rival_on, "claims": json.dumps(rival_claims)}}
@@ -316,7 +316,7 @@ def _mock_valid_row(schema, table, fkmap, colsmap, enums, checks=None, relchecks
             vals[n] = _pick(t) if n in fks else (_ck(tbl, n) or _fill(t))
         for n, v in vals.items():
             if n in fks: pt, pc = fks[n]; ensure(pt, pc, v)
-        stmts.append(f"INSERT INTO {tbl}({', '.join(vals)}) VALUES ({', '.join(vals.values())}) ON CONFLICT DO NOTHING")
+        stmts.append(f"INSERT INTO {_qt(tbl)}({', '.join(_qi(c) for c in vals)}) VALUES ({', '.join(vals.values())}) ON CONFLICT DO NOTHING")
 
     fks = fkmap.get(q, {}); row = {}
     for (n, t, nn, hd) in colsmap.get(q, []):
@@ -355,7 +355,7 @@ def _synthesize_row(conn, schema, table, fixed=None, _depth=0, budget=24):
     parents, mocks, salt = [], [], [0]
     def mock_create(sig): return f"CREATE OR REPLACE FUNCTION {sig} RETURNS boolean LANGUAGE sql AS $$ SELECT true $$;"
     def ins_sql():
-        base = (f"INSERT INTO {q} ({', '.join(row)}) VALUES ({', '.join(row.values())})" if row else f"INSERT INTO {q} DEFAULT VALUES")
+        base = (f"INSERT INTO {_qt(q)} ({', '.join(_qi(c) for c in row)}) VALUES ({', '.join(row.values())})" if row else f"INSERT INTO {_qt(q)} DEFAULT VALUES")
         # parents (depth>0) are re-seeded on every per-test preseed and never deleted -> make them idempotent;
         # the top-level target row is DELETEd before each re-seed (or is the action itself), so it stays plain.
         return base + (" ON CONFLICT DO NOTHING" if _depth > 0 else "")

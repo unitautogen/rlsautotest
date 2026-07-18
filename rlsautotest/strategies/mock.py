@@ -6,7 +6,7 @@ function's own logic stays unverified -> report footgun)."""
 from __future__ import annotations
 import re
 
-from ..astutil import _names, _qlit, _t, _unwrap, _v, _where
+from ..astutil import _names, _qi, _qlit, _t, _unwrap, _v, _where
 from ..probe import _probe, _unrel_fail
 from ..seeding import _mock_valid_row, _synthesize_row
 from ..structs import Observation
@@ -116,7 +116,7 @@ def _ins_sql(q, row):
     DEFAULT VALUES — `INSERT INTO t() VALUES ()` is not (it silently killed the wiring precondition)."""
     if not row:
         return f"INSERT INTO {q} DEFAULT VALUES"
-    return f"INSERT INTO {q}({', '.join(row)}) VALUES ({', '.join(row.values())})"
+    return f"INSERT INTO {q}({', '.join(_qi(c) for c in row)}) VALUES ({', '.join(row.values())})"
 
 
 def _mock_preflight(ctx):
@@ -240,7 +240,7 @@ def mock_emit(ctx, baker, cmd):
         return
     if cmd == "UPDATE":
         if not upd_col: return
-        action = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
+        action = f"UPDATE {q} SET {_qi(upd_col[0])}={_upd_val(upd_col[0], upd_col[1])}"
     else:
         action = f"DELETE FROM {q}"
     preseed = _exist_pre() or []   # UPDATE/DELETE need a row present to affect

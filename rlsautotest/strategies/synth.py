@@ -4,7 +4,7 @@
 SEED a matching row, and probe-verify (a wrong guess is harmless — the probe observes)."""
 from __future__ import annotations
 
-from ..astutil import _colname, _const, _jwt_anywhere, _jwt_keys, _names, _qlit, _t, _unwrap, _v, _where
+from ..astutil import _colname, _const, _jwt_anywhere, _jwt_keys, _names, _qi, _qlit, _t, _unwrap, _v, _where
 from ..probe import _probe
 from ..seeding import _synth_required_cols
 from .base import HANDLED, PASS
@@ -86,7 +86,7 @@ def synth_emit(ctx, baker, cmd, gate):
     seedcols = {gate["col"]: _vlit(ctype, Va)}
     for rn, rt in req:
         if rn != gate["col"]: seedcols[rn] = fill(rt)
-    seedrow = f"INSERT INTO {q}({', '.join(seedcols)}) VALUES ({', '.join(seedcols.values())})"
+    seedrow = f"INSERT INTO {q}({', '.join(_qi(c) for c in seedcols)}) VALUES ({', '.join(seedcols.values())})"
     if cmd == "UPDATE":
         # Update a NEUTRAL column (not the gated/scope column): SET gate_col would test scope-movement,
         # not the UPDATE grant. Prefer the global upd_col if it isn't the gate col, else pick any plain
@@ -94,7 +94,7 @@ def synth_emit(ctx, baker, cmd, gate):
         wc = upd_col if (upd_col and upd_col[0] != gate["col"]) else next(
             ((n0, t0) for (n0, t0, c0, h0) in cols if not h0 and n0 != gate["col"] and n0 not in unique_cols and n0 not in _fk_cols), None)
         if not wc: return True   # no neutral column to UPDATE without touching the gated column -> honest skip
-        act = f"UPDATE {q} SET {wc[0]}={_upd_val(wc[0], wc[1])}"
+        act = f"UPDATE {q} SET {_qi(wc[0])}={_upd_val(wc[0], wc[1])}"
     elif cmd == "DELETE": act = f"DELETE FROM {q}"
     elif cmd == "INSERT": act = seedrow
     else: act = None

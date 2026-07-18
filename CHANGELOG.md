@@ -4,6 +4,19 @@ All notable changes to **rlsautotest** are documented here. The format is based 
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and versions
 roughly follow semantic versioning.
 
+## [0.2.2] - 2026-07-18
+
+### Fixed
+- **Quoted / mixed-case (PascalCase) identifiers are now handled correctly.** Tables and columns whose names
+  require quoting — e.g. EF Core's `"Accounts"`, `"TenantId"` — were emitted unquoted, so Postgres folded them
+  to lowercase and generation either crashed (`has_table_privilege` on a mixed-case table) or produced seed
+  `INSERT`s that failed with `undefined column`, marking every cell UNRELIABLE. Every identifier the generator
+  emits (table references and INSERT/UPDATE column lists across the catalog scan, seed planner, and all witness
+  strategies) is now quoted **conditionally** via a `quote_ident`-style rule: a bare lowercase-simple name is
+  left unchanged (so emitted SQL for existing schemas is byte-identical), and anything requiring quoting is
+  double-quoted. A GUC-tenancy schema with PascalCase names (`"TenantId" = current_setting('app.tenant', true)`,
+  admin override, app role) now generates a fully green, probe-baked pgTAP suite instead of an all-UNRELIABLE one.
+
 ## [0.2.1] - 2026-07-18
 
 ### Fixed

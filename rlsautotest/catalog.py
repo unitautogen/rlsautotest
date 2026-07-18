@@ -198,8 +198,8 @@ def _exposed(cur, schema, table):
     cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('anon','authenticated')")
     roles = [r[0] for r in cur.fetchall()]
     for role in roles:
-        cur.execute("SELECT bool_or(has_table_privilege(%s, %s, priv)) FROM unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS priv",
-                    (role, f"{schema}.{table}"))
+        cur.execute("SELECT bool_or(has_table_privilege(%s, format('%%I.%%I', %s::text, %s::text), priv)) FROM unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS priv",
+                    (role, schema, table))
         if cur.fetchone()[0]:
             return True
     return False
@@ -221,7 +221,7 @@ def _effective_grants(cur, schema, table):
         for cmd in _CMDS4:
             if not usage:
                 g[(role, cmd)] = False; continue
-            cur.execute("SELECT has_table_privilege(%s, %s, %s)", (role, f"{schema}.{table}", cmd))
+            cur.execute("SELECT has_table_privilege(%s, format('%%I.%%I', %s::text, %s::text), %s)", (role, schema, table, cmd))
             g[(role, cmd)] = bool(cur.fetchone()[0])
     return g
 

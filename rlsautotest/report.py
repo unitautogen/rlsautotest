@@ -7,7 +7,7 @@ Split out of the original single-module cli.py; behavior-preserving.
 from __future__ import annotations
 import json
 import re
-from .astutil import _CMDS4, _HOME, _TAGLINE, _TAGLINE2, _split_statements
+from .astutil import _CMDS4, _HOME, _TAGLINE, _TAGLINE2, _qi, _qt, _split_statements
 from .emit import _emit_both, _load_ctx
 
 
@@ -412,7 +412,7 @@ def _as_user_report(conn, cur, schema, table, user_id, app_meta, user_meta):
                     results[cmd] = "–"
                     continue
                 col, typ = col_row
-                action = f"INSERT INTO {schema}.{table}({col}) VALUES (NULL::text::{typ}) RETURNING 1"
+                action = f"INSERT INTO {_qt(schema, table)}({_qi(col)}) VALUES (NULL::text::{typ}) RETURNING 1"
             elif cmd == "UPDATE":
                 cur.execute(f"SELECT attname FROM pg_attribute a "
                             f"JOIN pg_class c ON c.oid=a.attrelid "

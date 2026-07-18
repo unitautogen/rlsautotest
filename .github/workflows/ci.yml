@@ -76,8 +76,9 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/zeroarg.sql # F10: a ZERO-arg boolean fn whose body is a transparent JWT-claim check (is_admin()) -> introspected to a claim_const atom and tested FOR REAL (no [mocked; wiring] tags), must stay green
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/regexfree.sql # F6: a policy whose WITH CHECK contains a column NAME inside a string literal -> the AST (not a text regex) decides which columns the policy references, so the real neutral column stays SETtable and UPDATE is tested, must stay green
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/customrole.sql # F5: policies granted TO a custom role (reporter) -> probed via SET ROLE and shown as their own report row instead of silently vanishing from the client DNF, must stay green
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/quoted_idents.sql # #357 GUARD: PascalCase (quoted) table + columns with GUC tenancy -> the generator must QUOTE every identifier it emits, else seeds die 42703/undefined_table and every cell goes UNRELIABLE. Must stay green.
           rc=0
-          for schema in public tenancy rbac rbt clearance synth adversarial mockforce wm wa wf2 wsq wn wj wcard recursion xtypes za rxf crole; do
+          for schema in public tenancy rbac rbt clearance synth adversarial mockforce wm wa wf2 wsq wn wj wcard recursion xtypes za rxf crole qident; do
             echo "===== schema: $schema ====="
             rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --emit "out_$schema"
             for f in "out_$schema"/tests/database/rls/*.sql; do

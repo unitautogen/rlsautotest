@@ -5,7 +5,7 @@ path handled — mock them to force the predicate true/false, probe, and bake (w
 from __future__ import annotations
 import re
 
-from ..astutil import _colname, _const, _names, _qlit, _t, _v
+from ..astutil import _colname, _const, _names, _qi, _qlit, _t, _v
 from ..probe import _probe
 from ..seeding import _synthesize_row
 from .base import AUGMENT, PASS
@@ -89,12 +89,12 @@ def mock_force_emit(ctx, baker, cmd):
     if recipe is None or not srow:
         return False
     setup = setup or []
-    ins = f"INSERT INTO {q}({', '.join(srow)}) VALUES ({', '.join(srow.values())})"
+    ins = f"INSERT INTO {q}({', '.join(_qi(c) for c in srow)}) VALUES ({', '.join(srow.values())})"
     def mocks(which):
         return [f"CREATE OR REPLACE FUNCTION {f['sig']['q']}({f['sig']['args']}) RETURNS {f['sig']['rettype']} LANGUAGE sql AS $$ SELECT {f[which]} $$" for f in fns.values()]
     if cmd == "UPDATE":
         if not upd_col: return False
-        act = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
+        act = f"UPDATE {q} SET {_qi(upd_col[0])}={_upd_val(upd_col[0], upd_col[1])}"
     elif cmd == "DELETE": act = f"DELETE FROM {q}"
     elif cmd == "INSERT": act = ins
     elif cmd == "SELECT": act = None

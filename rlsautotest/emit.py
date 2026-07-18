@@ -6,7 +6,7 @@ Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
 import json
-from .astutil import _CMDS4, _TAGLINE, _TAGLINE2, _expr_cols, _split_statements, _sq, _where
+from .astutil import _CMDS4, _TAGLINE, _TAGLINE2, _expr_cols, _qi, _split_statements, _sq, _where
 from .values import CV, FOREIGN, FUTURE_EXP, INS, MV, NOBODY, RIVAL_SUB
 from .catalog import _FK_SQL, _columns, _constraint_meta, _effective_grants, _exposed, all_tables
 from .atoms import _check_value_set, analyze
@@ -74,20 +74,20 @@ END $$;
             for c in classes:
                 if c["idx"] in insert_plan:
                     icl, iv = insert_plan[c["idx"]]
-                    out.append(fn(f"insert_b{c['idx']}_ok", "got text;", f"  BEGIN INSERT INTO {q}({', '.join(iv)}) VALUES ({', '.join(iv.values())}); got:='OK'; EXCEPTION WHEN others THEN got:=SQLSTATE; END;", icl,
+                    out.append(fn(f"insert_b{c['idx']}_ok", "got text;", f"  BEGIN INSERT INTO {q}({', '.join(_qi(c) for c in iv)}) VALUES ({', '.join(iv.values())}); got:='OK'; EXCEPTION WHEN others THEN got:=SQLSTATE; END;", icl,
                                   [f"is(got, 'OK', 'INSERT branch {c['idx']}: authorized may write')"]))
             if not pc["open"] and nobody_ins:
-                out.append(fn("insert_nobody_denied", "got text;", f"  BEGIN INSERT INTO {q}({', '.join(nobody_ins)}) VALUES ({', '.join(nobody_ins.values())}); got:='NO ERROR'; EXCEPTION WHEN insufficient_privilege THEN got:=SQLSTATE; WHEN others THEN got:=SQLSTATE; END;", NB,
+                out.append(fn("insert_nobody_denied", "got text;", f"  BEGIN INSERT INTO {q}({', '.join(_qi(c) for c in nobody_ins)}) VALUES ({', '.join(nobody_ins.values())}); got:='NO ERROR'; EXCEPTION WHEN insufficient_privilege THEN got:=SQLSTATE; WHEN others THEN got:=SQLSTATE; END;", NB,
                               ["is(got, '42501', 'INSERT: unauthorized cannot write')"]))
         elif cmd == "UPDATE" and (upd := next(((nn0, tt0) for (nn0, tt0, c0, h0) in cols if nn0 not in {x for cc in rowlinked for x in cc['rowseed']} and not h0), None)):
             for c in classes:
-                out.append(fn(f"update_b{c['idx']}_ok", "m int;", f"  UPDATE {q} SET {upd[0]}={fill(upd[1])}; GET DIAGNOSTICS m=ROW_COUNT;", cj(c),
+                out.append(fn(f"update_b{c['idx']}_ok", "m int;", f"  UPDATE {q} SET {_qi(upd[0])}={fill(upd[1])}; GET DIAGNOSTICS m=ROW_COUNT;", cj(c),
                               [f"cmp_ok(m, '>=', 1, 'UPDATE branch {c['idx']}: authorized may update its rows')"]))
                 if c["rowlinked"] and c["scalar_link"] and c["fk_val"] and c["scalar_link"] not in unique_cols:
-                    out.append(fn(f"update_b{c['idx']}_reassign_denied", "got text;", f"  BEGIN UPDATE {q} SET {c['scalar_link']}='{FOREIGN}'; got:='NO ERROR'; EXCEPTION WHEN insufficient_privilege THEN got:=SQLSTATE; WHEN others THEN got:=SQLSTATE; END;", cj(c),
+                    out.append(fn(f"update_b{c['idx']}_reassign_denied", "got text;", f"  BEGIN UPDATE {q} SET {_qi(c['scalar_link'])}='{FOREIGN}'; got:='NO ERROR'; EXCEPTION WHEN insufficient_privilege THEN got:=SQLSTATE; WHEN others THEN got:=SQLSTATE; END;", cj(c),
                                   [f"is(got, '42501', 'UPDATE branch {c['idx']}: cannot move row out of scope')"]))
             if classes:
-                out.append(fn("update_nobody_denied", "m int;", f"  UPDATE {q} SET {upd[0]}={fill(upd[1])}; GET DIAGNOSTICS m=ROW_COUNT;", NB, ["is(m, 0, 'UPDATE: unauthorized affects 0 rows')"]))
+                out.append(fn("update_nobody_denied", "m int;", f"  UPDATE {q} SET {_qi(upd[0])}={fill(upd[1])}; GET DIAGNOSTICS m=ROW_COUNT;", NB, ["is(m, 0, 'UPDATE: unauthorized affects 0 rows')"]))
         elif cmd == "DELETE":
             for c in classes:
                 out.append(fn(f"delete_b{c['idx']}_ok", "m int;", f"  DELETE FROM {q}; GET DIAGNOSTICS m=ROW_COUNT;", cj(c),
@@ -299,9 +299,9 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                     else:
                         _nact = None
                         if cmd == "INSERT" and nobody_ins:
-                            _nact = f"INSERT INTO {q}({', '.join(nobody_ins)}) VALUES ({', '.join(nobody_ins.values())})"
+                            _nact = f"INSERT INTO {q}({', '.join(_qi(c) for c in nobody_ins)}) VALUES ({', '.join(nobody_ins.values())})"
                         elif cmd == "UPDATE" and upd_col:
-                            _nact = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
+                            _nact = f"UPDATE {q} SET {_qi(upd_col[0])}={_upd_val(upd_col[0], upd_col[1])}"
                         elif cmd == "DELETE":
                             _nact = f"DELETE FROM {q}"
                         _nact = _nact or (ctx.deny_stmt or {}).get(cmd)
@@ -347,17 +347,17 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                             if not o[2] and o[0] == "err" and o[1] == "42501":
                                 mut_test(cjson, role, baker.write_assert(o, cmd, _dstmt, who, ident=_oid))
                         continue
-                    action = f"INSERT INTO {q}({', '.join(icols)}) VALUES ({', '.join(icols.values())})"
+                    action = f"INSERT INTO {q}({', '.join(_qi(c) for c in icols)}) VALUES ({', '.join(icols.values())})"
                 elif cmd == "UPDATE":
                     # SET <plain non-FK col> = <literal>: needs ONLY the UPDATE privilege (a literal RHS
                     # avoids the SELECT-on-read requirement of `col=col`), and a non-FK col avoids an RI
                     # false-denial. upd_col already excludes FK/identity/handled cols.
                     if upd_col:
-                        action = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
+                        action = f"UPDATE {q} SET {_qi(upd_col[0])}={_upd_val(upd_col[0], upd_col[1])}"
                     elif _upd_self:
                         # self-assignment fallback (no neutral column exists): permission + policy
                         # re-check with an unchanged row — the probe observes the real outcome.
-                        action = f"UPDATE {q} SET {_upd_self}={_upd_self}"
+                        action = f"UPDATE {q} SET {_qi(_upd_self)}={_qi(_upd_self)}"
                     else:
                         continue
                 else:
@@ -380,7 +380,7 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                             for _V in _dom:
                                 if _V in _allowed:
                                     continue
-                                _tact = f"UPDATE {q} SET {_vcol}='{_V}'::{_ctype}"
+                                _tact = f"UPDATE {q} SET {_qi(_vcol)}='{_V}'::{_ctype}"
                                 _ov = _probe(conn, arrange_stmts, pident(cjson, role), "write", _tact)
                                 if _ov[0] == "rows" and _ov[1] >= 1 and not _ov[2]:   # accepted a value its own policy forbids -> leak (skip if precondition was unreliable)
                                     ctx.observations.append(Observation(cmd="UPDATE", ident=_oid, exp=False, kind="leak"))
@@ -409,11 +409,11 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                     if cmd == "INSERT":
                         if not nobody_ins:
                             continue
-                        action = f"INSERT INTO {q}({', '.join(nobody_ins)}) VALUES ({', '.join(nobody_ins.values())})"
+                        action = f"INSERT INTO {q}({', '.join(_qi(c) for c in nobody_ins)}) VALUES ({', '.join(nobody_ins.values())})"
                     elif cmd == "UPDATE":
                         if not upd_col:
                             continue
-                        action = f"UPDATE {q} SET {upd_col[0]}={_upd_val(upd_col[0], upd_col[1])}"
+                        action = f"UPDATE {q} SET {_qi(upd_col[0])}={_upd_val(upd_col[0], upd_col[1])}"
                     else:
                         action = f"DELETE FROM {q}"
                     o = _probe(conn, arrange_stmts, pident(cj0, role), "write", action)
