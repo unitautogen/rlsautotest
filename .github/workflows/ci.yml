@@ -173,3 +173,28 @@ jobs:
           if [ "$found" -ne 1 ]; then echo "FAIL: --implicit-deny emitted no deny tests"; exit 1; fi
           if [ "$rc" -ne 0 ]; then echo "FAIL: implicit-deny suite had a failing test"; exit 1; fi
           echo "OK: --implicit-deny added passing deny tests for no-policy commands"
+      - name: Bypass-surface lint flags the side doors (examples/bypass.sql)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/app
+        run: |
+          # bypass.sql has real side doors (a definer view, a matview, anon-callable SECURITY DEFINER fns incl. one
+          # with a mutable search_path) plus safe objects (a security_invoker view, an unreachable view, an
+          # EXECUTE-revoked helper, and a definer view/fn over a NON-RLS table). lint must flag the doors with the
+          # right severity and leave the safe ones alone. The internal L0xx codes are shown in no output now, so this
+          # asserts via --json on object + severity (with jq) and checks that no code leaks into any output.
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/bypass.sql
+          text=$(rlsautotest lint --schema bypasssurf --db-url "$DATABASE_URL" --json /tmp/bypass.json 2>&1 || true)
+          echo "$text"
+          echo "$text" | grep -Eq '\bL0[0-9][0-9][a-z]?\b' && { echo "FAIL: a lint code leaked into text output"; exit 1; } || true
+          j=/tmp/bypass.json
+          has(){ jq -e --arg t "$1" --arg s "$2" 'any(.[]; .table==$t and .severity==$s)' "$j" >/dev/null; }
+          has leaky_secrets CRITICAL || { echo "FAIL: leaky definer view not CRITICAL"; exit 1; }
+          has mv_secrets    CRITICAL || { echo "FAIL: materialized-view leak not CRITICAL"; exit 1; }
+          has auth_secrets  HIGH     || { echo "FAIL: authenticated-only definer view not HIGH"; exit 1; }
+          jq -e 'any(.[]; (.table|startswith("all_secrets(")) and .severity=="CRITICAL")' "$j" >/dev/null || { echo "FAIL: anon-callable SECURITY DEFINER fn reading RLS not CRITICAL"; exit 1; }
+          jq -e 'any(.[]; (.message|test("search_path")) and .severity=="HIGH")' "$j" >/dev/null || { echo "FAIL: mutable-search_path fn not HIGH"; exit 1; }
+          jq -e 'any(.[]; has("rule") or has("code"))' "$j" >/dev/null && { echo "FAIL: a code field leaked into lint JSON"; exit 1; } || true
+          for safe in safe_secrets internal_secrets internal_helper menu_view menu_count; do
+            jq -e --arg t "$safe" 'any(.[]; .table==$t)' "$j" >/dev/null && { echo "FAIL: safe object $safe wrongly flagged"; exit 1; } || true
+          done
+          echo "OK: bypass-surface lint flagged the doors with correct severity and left the safe objects alone (codes hidden)"

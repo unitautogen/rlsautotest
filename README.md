@@ -72,6 +72,7 @@ It verifies the access-control safeguard, not your whole HIPAA or SOC 2 program.
 - **Sound by design: never a false pass.** Tests are derived from your policies and the catalog, not guessed by an LLM. When a policy can't be proven soundly (e.g. an opaque function) it's marked clearly instead of turned into a green checkmark. And if a test's data precondition can't be established (the seed for a row fails), the engine still probes, then marks that cell **UNRELIABLE** and fails loudly rather than letting a seeding failure masquerade as a policy outcome.
 - **Native, ownable output.** Standard pgTAP into `supabase/tests/database/rls/`, runnable by `supabase test db`, `pg_prove`, or plain `psql`. Uses the [basejump test helpers](https://github.com/usebasejump/supabase-test-helpers) when present, or ships a tiny offline shim when they aren't, so it runs online or air-gapped.
 - **Static checks too.** It flags open `USING (true)` reads, `WITH CHECK (true)` writes, asymmetric `USING`/`WITH CHECK`, self-referential (recursive) policies, RLS-on-but-no-policy, and policy drift via snapshot/diff.
+- **Maps the bypass surface around your policies.** Correct policies can still be undone by *how the data is reached*, so it also reports the objects and roles that sidestep RLS: owner-rights (`SECURITY DEFINER`) views and functions a client can reach, materialized views, `BYPASSRLS`/superuser roles, and RLS-on-but-not-`FORCE`d tables (see [Beyond the policies: bypass surfaces](#beyond-the-policies-bypass-surfaces)).
 
 ## What it generates
 
@@ -114,6 +115,19 @@ anon                             Â·       Â·       Â·       Â·
 `âœ“` = can, `Â·` = blocked. The one thing that lights up red is a `âœ“` where it should be `Â·`: an *authenticated-but-not-authorized* user or *anon* that can act (a security hole). It jumps out without decoding anything. `service_role` is shown for completeness; it bypasses RLS by design. A table with **RLS off** is flagged loud (it has no row-level protection at all).
 
 The identity rows are deliberately worded so they aren't mistaken for database roles: `authenticated, authorized` and `authenticated, not authorized` are the **same Postgres role** (`authenticated`) under different JWT identities/claims. Only `service_role`, `authenticated`, and `anon` are actual Postgres roles. "Authorized" vs "not authorized" is simply whether that identity passes the table's policies (owns the row, is in the right tenant/org, or has the required role).
+
+## Beyond the policies: bypass surfaces
+
+A correct set of table policies can still be undone by *how the data is reached*. A `SECURITY DEFINER` view or function runs with its owner's rights, so it can hand a client rows that client's own RLS would hide. A materialized view is always a frozen, owner-populated copy of its source. A role with `BYPASSRLS` (or superuser) skips RLS entirely. And an RLS-enabled table that isn't `FORCE`d is bypassed by its own owner. None of these show up when you only test the policies, which is exactly where real leaks tend to hide.
+
+`rlsautotest` maps that surface straight from the catalog, alongside the policy checks, and reports each object or role that can sidestep RLS, with a severity and the reason:
+
+- **Views and materialized views** that run with owner's rights (not `security_invoker`), are readable by `anon`/`authenticated`, and read an RLS-protected table.
+- **`SECURITY DEFINER` functions** a client can `EXECUTE` that reach RLS-protected data (or whose body is opaque), plus any with a mutable `search_path` (a search-path-injection risk).
+- **Roles** that bypass RLS (`BYPASSRLS`/superuser) and aren't a sanctioned platform role, flagged higher when a client can log in as or `SET ROLE` into them. Use `--allow-bypass-role` to allowlist the ones you expect.
+- **Tables** with RLS enabled but not `FORCE`d whose owner isn't a superuser.
+
+These are **review flags, not pass/fail**: a `SECURITY DEFINER` view is often exactly what you intended. They appear in `rlsautotest lint` and in a **Bypass surfaces** section of the `--report` / `--html` output (and in `--report-json`), so a reviewer sees, in one place, every way RLS could be sidestepped and can confirm each is deliberate. Reachability is judged by *effective* privilege (`has_table_privilege` / `has_function_privilege`, which include grants to `PUBLIC`), so a function a client can call only through Postgres's default `PUBLIC` `EXECUTE` grant is surfaced even when you never granted it explicitly.
 
 ## When something looks wrong: `rlsautotest doctor`
 

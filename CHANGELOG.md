@@ -4,6 +4,26 @@ All notable changes to **rlsautotest** are documented here. The format is based 
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and versions
 roughly follow semantic versioning.
 
+## [0.3.0] - 2026-07-19
+
+### Added
+- **Bypass-surface detection: the objects and roles that sidestep RLS even when every table policy is correct.**
+  A new catalog scan (in `rlsautotest lint`, in a **Bypass surfaces** section of `--report` / `--html`, and as
+  `bypass_surfaces` in `--report-json`) flags: owner-rights (`SECURITY DEFINER`) views and **materialized views**
+  a client can read that reach an RLS-protected table; `SECURITY DEFINER` functions a client can `EXECUTE` that
+  reach RLS data or whose body is opaque, plus any with a mutable `search_path` (search-path-injection risk);
+  roles with `BYPASSRLS`/superuser that aren't sanctioned platform roles (higher severity when a client can log in
+  as or `SET ROLE` into them, `--allow-bypass-role` to allowlist the expected ones); and RLS-enabled tables not
+  `FORCE`d whose owner isn't a superuser. Reachability is judged by *effective* privilege
+  (`has_table_privilege` / `has_function_privilege`, which include grants to `PUBLIC`), so a function reachable only
+  through Postgres's default `PUBLIC` `EXECUTE` grant is surfaced too. These are informational review flags, not
+  pass/fail, and do not change the exit gate.
+
+### Changed
+- **The internal lint codes (L0xx) are no longer shown in any output.** They were rlsautotest-specific identifiers,
+  not a recognized community standard, so they've been removed from `lint` text output, `lint --json`, the HTML
+  report, and `--report-json`. Findings are now identified by object, type, severity, and a plain-language reason.
+
 ## [0.2.2] - 2026-07-18
 
 ### Fixed

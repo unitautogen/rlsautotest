@@ -25,6 +25,7 @@ import psycopg
 from .astutil import ORDER, _CMDS4, _HOME, _TAGLINE, _TAGLINE2, _and_conjuncts, _array_consts, _bool_extra, _claim_paths, _colname, _colqual, _const, _eq_pairs, _expr_cols, _expr_consts, _find_queries, _is_func, _is_true_clause, _is_uuid, _jwt_anywhere, _jwt_keys, _list_consts, _names, _not, _qlit, _split_statements, _sq, _t, _unwrap, _v, _where  # noqa: F401
 from .values import CV, FOREIGN, FUTURE_EXP, INS, MV, NOBODY, RIVAL_ORG, RIVAL_SUB, _CASTABLE_CACHE, _bump_lit, _castable_lit, _lit, _nonempty_array_lit  # noqa: F401
 from .catalog import _FK_SQL, _action_table, _basejump_present, _check_bool_udfs, _columns, _constraint_meta, _effective_grants, _exposed, _fk_by_name, _fk_of, all_tables, rls_tables  # noqa: F401
+from .bypass import find_bypass, finding_type  # noqa: F401
 from .atoms import _DNF_BUDGET, _check_value_set, _classify_aexpr, _cmd_dnf, _dnf_ast, _folder_owner, _func_selects, _introspect_claim_fn, _introspect_rbac, _membership, _scalar_lookup, _set_claim, analyze, build_class, classify_node  # noqa: F401
 from .witness import _WV_UID, _array_elem_type, _candidate_sessions, _candidate_values, _class_pick, _col_textfn, _flip_first, _flip_last, _fn_preimage, _like_match, _pg_array_literal, _range_witness, _regex_match, _side_role, _solve_array, _solve_between, _solve_eq, _solve_fncol_eq, _solve_fncol_preimage, _solve_ineq, _solve_jsonb, _solve_leaf, _solve_node, _solve_pattern, _solve_predicate, _solve_subquery, _subquery_tables, _wv_ctx, _wv_lit, _wv_merge, _wv_other, _wv_some  # noqa: F401
 from .probe import _probe, _unrel_fail  # noqa: F401
@@ -198,6 +199,9 @@ def main():
             else:
                 reps_display = reps
 
+            # bypass surfaces (views / SECURITY DEFINER fns / roles that sidestep RLS) — shown in HTML + JSON.
+            with conn.cursor() as _bcur:
+                bypass_findings = find_bypass(_bcur, a.schema)
             if a.report_json:
                 # the in-memory report holds sets (unreliable_cells) and tuple-keyed dicts (grants),
                 # neither JSON-serializable: render sets as sorted lists and tuple keys as "a:b".
@@ -210,9 +214,12 @@ def main():
                     if isinstance(o, (list, tuple)):
                         return [_jsonable(x) for x in o]
                     return o
-                open(a.report_json, "w", encoding="utf-8").write(json.dumps(_jsonable(reps), indent=2))
+                _payload = {"tables": reps, "bypass_surfaces": [
+                    {"object": o, "type": finding_type(c, m), "severity": s, "why": m}
+                    for (c, s, o, _d, m) in bypass_findings]}
+                open(a.report_json, "w", encoding="utf-8").write(json.dumps(_jsonable(_payload), indent=2))
             if a.html:
-                open(a.html, "w", encoding="utf-8").write(render_report_html(reps_display, a.schema))
+                open(a.html, "w", encoding="utf-8").write(render_report_html(reps_display, a.schema, bypass_findings))
                 _abs = os.path.abspath(a.html)
                 print(f"HTML report for {len(reps_display)} table(s) written to:\n  {_abs}")
                 try:    # clickable file:// URL in most terminals

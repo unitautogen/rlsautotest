@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 from .astutil import _CMDS4, _HOME, _TAGLINE, _TAGLINE2, _qi, _qt, _split_statements
+from .bypass import finding_type
 from .emit import _emit_both, _load_ctx
 
 
@@ -302,7 +303,7 @@ def render_report_text(reps):
 
 
 
-def render_report_html(reps, schema):
+def render_report_html(reps, schema, bypass=None):
     import html as _h
     esc = _h.escape
     exposed = [r["table"] for r in reps if not r["rls_enabled"] and r.get("exposed")]
@@ -342,6 +343,31 @@ def render_report_html(reps, schema):
                f'<span class="kpi {"bad" if exposed else "good"}">{len(exposed)} exposed</span> &middot; '
                f'<span class="kpi {"bad" if holes else "good"}">{len(holes)} with problems</span> &middot; '
                f'<span class="kpi good">{len(ok_tables)} enforced as declared</span>')
+    # ── Bypass surfaces section (views / SECURITY DEFINER fns / roles that sidestep RLS) ──
+    _SEVRANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "INFO": 3}
+    bx = sorted(bypass or [], key=lambda f: (_SEVRANK.get(f[1], 9), f[0], f[2]))
+    summary += f' &middot; <span class="kpi {"bad" if bx else "good"}">{len(bx)} bypass surface(s)</span>'
+    if bx:
+        _brows = ""
+        for (c, s, obj, _d, msg) in bx:
+            scls = {"CRITICAL": "crit", "HIGH": "high", "MEDIUM": "med"}.get(s, "med")
+            _brows += (f'<tr><td class="obj">{esc(obj)}</td><td>{esc(finding_type(c, msg))}</td>'
+                       f'<td><span class="sevbadge {scls}">{esc(s)}</span></td>'
+                       f'<td>{esc(msg)}</td></tr>')
+        bypass_html = (
+            '<section id="bypass" class="bypass"><h2>Bypass surfaces '
+            f'<span class="chip danger">{len(bx)} found</span></h2>'
+            '<p class="sub">Objects and roles that can sidestep RLS. These are review flags, not pass/fail.</p>'
+            '<table class="blist"><thead><tr><th>object / role</th><th>type</th><th>severity</th>'
+            f'<th>why</th></tr></thead><tbody>{_brows}</tbody></table>'
+            '<p class="footnote">Why an object is listed: a view or function only when it runs with definer&#39;s '
+            'rights AND a client role (anon/authenticated) can reach it AND it reaches an RLS-protected table; a '
+            'role only when it bypasses RLS (superuser/BYPASSRLS) and is not sanctioned. security_invoker views, '
+            'unreachable objects, in-policy helpers, and service_role / platform roles are not listed.</p></section>')
+    else:
+        bypass_html = ('<section id="bypass" class="bypass"><h2>Bypass surfaces</h2>'
+                       '<p class="clean good">No bypass surfaces: no client-reachable definer views or SECURITY '
+                       'DEFINER functions over RLS tables, and no unexpected RLS-bypassing roles.</p></section>')
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>rlsautotest — RLS report ({esc(schema)})</title>
 <style>
  body{{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:2rem;color:#1a1a1a}}
@@ -364,6 +390,13 @@ def render_report_html(reps, schema):
  .unrel{{background:#fde68a;color:#92400e;font-weight:700}}
  ul.flags{{margin:.4rem 0 0;padding-left:1.1rem;color:#92400e;font-size:.85rem}}
  .legend{{color:#666;font-size:.85rem;margin-top:1.5rem;max-width:48rem}}
+ section.bypass{{margin:1.6rem 0}} section.bypass h2{{font-size:1.05rem;margin:0 0 .3rem}}
+ table.blist{{border-collapse:collapse;width:100%;max-width:64rem}}
+ .blist th,.blist td{{border:1px solid #e5e7eb;padding:.4rem .6rem;text-align:left;vertical-align:top;font-size:.87rem}}
+ .blist th{{background:#f9fafb;font-weight:600}} td.obj{{font-family:ui-monospace,Menlo,monospace;white-space:nowrap}}
+ .sevbadge{{font-size:.7rem;font-weight:700;padding:.1rem .45rem;border-radius:999px;white-space:nowrap}}
+ .sevbadge.crit{{background:#dc2626;color:#fff}} .sevbadge.high{{background:#fde68a;color:#92400e}} .sevbadge.med{{background:#fef9c3;color:#854d0e}}
+ .footnote{{color:#666;font-size:.82rem;margin:.6rem 0 0;max-width:64rem}} .clean{{font-weight:600;margin:.5rem 0}}
  .footer{{color:#888;font-size:.8rem;margin-top:1.2rem;border-top:1px solid #eee;padding-top:.6rem}}
 </style></head><body>
 <h1>RLS access report</h1>
@@ -371,6 +404,7 @@ def render_report_html(reps, schema):
 <div class="summary">{summary}</div>
 {banner}
 {"".join(blocks)}
+{bypass_html}
 <p class="legend"><b>Each row is an identity, each column a command.</b>
  <span class="c pass">✓</span> can &middot; <span class="c none">·</span> blocked &middot;
  <span class="c danger">✓</span> can but <b>should be blocked</b> (security hole) &middot;

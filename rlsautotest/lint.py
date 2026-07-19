@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse, json, re, sys
 import psycopg
 
+from .bypass import find_bypass
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,6 +120,8 @@ def cmd_lint():
     ap.add_argument("--json", metavar="FILE", help="write findings as JSON")
     ap.add_argument("--min-severity", choices=["INFO","MEDIUM","HIGH","CRITICAL"], default="INFO",
                     help="minimum severity to report (default: INFO)")
+    ap.add_argument("--allow-bypass-role", action="append", default=[], metavar="ROLE",
+                    help="a role allowed to bypass RLS (repeatable); adds to the L014 sanctioned allowlist")
     a = ap.parse_args(sys.argv[2:])
     try: sys.stdout.reconfigure(encoding="utf-8")
     except Exception: pass
@@ -132,6 +136,8 @@ def cmd_lint():
         all_findings = []
         for t in tables:
             all_findings.extend(_lint_table(cur, a.schema, t))
+        if not a.table:   # bypass surfaces (views / SECURITY DEFINER fns / roles) are schema-level, only on a full scan
+            all_findings.extend(find_bypass(cur, a.schema, a.allow_bypass_role))
 
     min_sev = _SEV_ORDER[a.min_severity]
     filtered = [(rid, sev, tbl, pol, msg) for (rid, sev, tbl, pol, msg) in all_findings
@@ -139,7 +145,7 @@ def cmd_lint():
     filtered.sort(key=lambda x: (-_SEV_ORDER.get(x[1], 0), x[2], x[3] or ""))
 
     if a.json:
-        data = [{"rule": r, "severity": s, "table": t, "policy": p, "message": m}
+        data = [{"severity": s, "table": t, "policy": p, "message": m}
                 for (r, s, t, p, m) in filtered]
         open(a.json, "w", encoding="utf-8").write(json.dumps(data, indent=2))
 
@@ -153,7 +159,7 @@ def cmd_lint():
             print(f"  {a.schema}.{tbl}")
             cur_table = tbl
         pol_tag = f"  [{pol}]" if pol else ""
-        print(f"    {_SEV_ICON.get(sev,'·')} {rid} {sev}{pol_tag}: {msg}")
+        print(f"    {_SEV_ICON.get(sev,'·')} {sev}{pol_tag}: {msg}")
     print()
     n_crit = sum(1 for (_, s, *_) in filtered if s == "CRITICAL")
     n_high = sum(1 for (_, s, *_) in filtered if s == "HIGH")
