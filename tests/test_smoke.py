@@ -309,12 +309,12 @@ def test_report_files_cells_structurally_not_by_label_wording():
     matrix cell; the legacy keyword parser (the fallback) would misread both of these."""
     from rlsautotest.report import _file_tap_lines
     from rlsautotest.structs import Observation
-    cells, idgrid, leaks, unrel, unrel_cells = {}, {}, [], [], set()
+    cells, idgrid, leaks, leak_cells, unrel, unrel_cells = {}, {}, [], set(), [], set()
     taps = ["ok 1 - SELECT: the quokka gazes upon an empty warren",   # deny-proof, but no deny keyword
             "not ok 2 - UPDATE: xyzzy"]                               # grant-proof, no command-ish wording
     obs = [Observation(cmd="SELECT", ident="other", exp=False),
            Observation(cmd="UPDATE", ident="authorized", exp=True)]
-    leftovers = _file_tap_lines(taps, obs, cells, idgrid, leaks, unrel, unrel_cells)
+    leftovers = _file_tap_lines(taps, obs, cells, idgrid, leaks, leak_cells, unrel, unrel_cells)
     assert leftovers == []
     assert idgrid["SELECT"]["other"] == {"exp": False, "pass": True}       # a passing deny cell
     assert idgrid["UPDATE"]["authorized"] == {"exp": True, "pass": False}  # a failing grant cell
@@ -324,11 +324,12 @@ def test_report_files_cells_structurally_not_by_label_wording():
     _file_tap_lines(["not ok 1 - UNRELIABLE - INSERT: whatever", "not ok 2 - UPDATE: leaky [transition-leak]"],
                     [Observation(cmd="INSERT", ident="authorized", kind="unreliable"),
                      Observation(cmd="UPDATE", ident="authorized", exp=False, kind="leak")],
-                    cells2, idgrid2, leaks, unrel, unrel_cells)
+                    cells2, idgrid2, leaks, leak_cells, unrel, unrel_cells)
     assert cells2 == {} and idgrid2 == {}
     assert ("INSERT", "authorized") in unrel_cells and leaks == ["UPDATE: leaky"]
+    assert ("UPDATE", "authorized") in leak_cells   # the leak observation also records its grid cell
     # without observations the same lines fall through to the legacy label parser (safety net)
-    lo = _file_tap_lines(taps, [], {}, {}, [], [], set())
+    lo = _file_tap_lines(taps, [], {}, {}, [], set(), [], set())
     assert [x[1] for x in lo] == ["SELECT: the quokka gazes upon an empty warren", "UPDATE: xyzzy"]
 
 

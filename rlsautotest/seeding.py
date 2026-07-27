@@ -184,6 +184,17 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
         if kind == "temporal": return "now() - interval '1 day'"
         if kind == "folder_owner": return f"'{FOREIGN}/x'"
         return f"'{FOREIGN}'"
+    def foreign_links(c):
+        """{col: foreign literal} for EVERY identity link of class `c` — the row must be foreign in
+        every dimension it is owned through. Flipping only `scalar_link` (singular, last-writer-wins)
+        leaves a composite-ownership row half-owned: foreign in one dimension, still the identity's
+        own in the other, which is not a foreign row and makes the negative control prove less than
+        it claims. Falls back to the single link when the class predates `scalar_links` or when its
+        only link is a value constraint (row_const), so single-link behaviour is unchanged."""
+        links = (c.get("scalar_links") if c else None) or []
+        if links:
+            return {col: foreign_val(kind) for col, kind in links}
+        return {c["scalar_link"]: foreign_val(pkind)} if (c and c["scalar_link"]) else {}
 
     def _anc_tables(t0):                                 # t0 + its transitive FK-parent tables
         seen2, st = set(), [t0]
@@ -224,8 +235,7 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
                 tcol = [k for k in c["rowseed"] if "now()" in c["rowseed"][k]][0]
                 v2 = row_values(q, {**c["rowseed"], tcol: "now() - interval '1 day'"}, salt=c["idx"] + 50); anc(v2, q); stmts.append(insert(q, v2) + "  -- expired")
         if primary:
-            ov = {}
-            if primary["scalar_link"]: ov[primary["scalar_link"]] = foreign_val(pkind)
+            ov = dict(foreign_links(primary))
             for col in primary["rowseed"]:
                 if "ARRAY[" in primary["rowseed"][col]: ov[col] = foreign_val("array_col")
                 elif "now()" in primary["rowseed"][col]: ov[col] = "now() + interval '1 day'"
@@ -279,7 +289,7 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
                 iv = row_values(q, ifixed, salt=200 + c["idx"]); anc(iv, q)
                 insert_plan[c["idx"]] = (json.dumps(iclaims), iv)
             else:
-                iv = row_values(q, {primary["scalar_link"]: foreign_val(pkind)} if primary and primary["scalar_link"] else {}, salt=250); anc(iv, q)
+                iv = row_values(q, foreign_links(primary), salt=250); anc(iv, q)
                 insert_plan[c["idx"]] = (json.dumps(c["claims"]), iv)
     nobody_ins = row_values(q, primary["rowseed"], salt=300) if primary else (row_values(q, {}, salt=301) if any_grant else None)
     seed = "\n".join(stmts)

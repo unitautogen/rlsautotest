@@ -19,7 +19,7 @@ _DENY_WORDS = ("unauthorized", "anon", "nothing", "cannot", "affects 0", "out of
 
 
 
-def _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, unreliable_msgs, unreliable_cells):
+def _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, leak_cells, unreliable_msgs, unreliable_cells):
     """F4 structural filing: match each numbered TAP line to the emitter's own Observation (by the
     pgTAP test number == plan-order index) and file the matrix cell from the Observation — the
     English label is display-only, so a strategy's wording can no longer misfile a cell. Returns
@@ -45,7 +45,9 @@ def _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, unreliable_msgs, un
             unreliable_cells.add((ob.cmd, ob.ident or "authorized"))
             continue
         if ob.kind == "leak":
-            if not passed: leak_msgs.append(label.replace(" [transition-leak]", ""))
+            if not passed:
+                leak_msgs.append(label.replace(" [transition-leak]", ""))
+                leak_cells.add((ob.cmd, ob.ident or "authorized"))
             continue
         d = cells.setdefault(ob.cmd, {})
         side = "grant" if ob.exp else "deny"
@@ -88,6 +90,7 @@ def _table_report(cur, conn, schema, table, helpers):
     cells = {}
     idgrid = {}   # cmd -> { identity -> {"exp": <should-be-able>, "pass": <test passed>} }
     leak_msgs = []   # cross-policy WITH CHECK transition leaks (baked as failing throws_ok lines)
+    leak_cells = set()   # (cmd, identity) cells where a cross-policy WITH CHECK leak actually fired -> mark the grid cell red
     unreliable_msgs = []   # tests whose precondition (seed) could not be established -> not trustworthy
     unreliable_cells = set()
     # UNRELIABLE is a GENERATION-TIME fact (the probe's precondition failed), not a replay outcome:
@@ -96,7 +99,7 @@ def _table_report(cur, conn, schema, table, helpers):
     for ob in obs:
         if getattr(ob, "kind", None) == "unreliable":
             unreliable_cells.add((ob.cmd, ob.ident or "authorized"))
-    _filed = _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, unreliable_msgs, unreliable_cells)
+    _filed = _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, leak_cells, unreliable_msgs, unreliable_cells)
     if obs and not taplines:
         unreliable_msgs.append("the report battery produced NO pgTAP output when replayed (pgTAP is not "
                                "installed and the fallback shim could not be created by this connection role); "
@@ -110,7 +113,12 @@ def _table_report(cur, conn, schema, table, helpers):
             if _cmdu: unreliable_cells.add((_cmdu, _idu))
             continue
         if "[transition-leak]" in label:                       # value-space leak; tracked separately, not a per-command cell
-            if not passed: leak_msgs.append(label.replace(" [transition-leak]", ""))
+            if not passed:
+                leak_msgs.append(label.replace(" [transition-leak]", ""))
+                _lc = next((c for c in _CMDS4 if label.upper().startswith(c)), None)
+                _ll = label.lower()
+                _li = "anon" if "anon" in _ll else ("other" if any(k in _ll for k in ("not authoriz", "other user", "non-owner", "unauthorized")) else "authorized")
+                if _lc: leak_cells.add((_lc, _li))
             continue
         cmd = next((c for c in _CMDS4 if label.upper().startswith(c)), None)
         if not cmd: continue
@@ -155,7 +163,7 @@ def _table_report(cur, conn, schema, table, helpers):
         notes.append("UPDATE not fully tested - no policy-neutral column to modify AND nothing safely self-assignable (every column is identity/generated or unique), so the UPDATE permission could not be probed by SETting a harmless column or by SET col=col. The '-' for UPDATE is a coverage gap, not a pass; review manually.")
     rep = {"table": table, "rls_enabled": rls_on, "policied": sorted(pol),
            "cells": cells, "idgrid": idgrid, "footguns": notes, "coverage": [ctx["cov"], ctx["tot"]],
-           "transition_leaks": leak_msgs, "unreliable": sorted(set(unreliable_msgs)), "unreliable_cells": unreliable_cells}
+           "transition_leaks": leak_msgs, "leak_cells": leak_cells, "unreliable": sorted(set(unreliable_msgs)), "unreliable_cells": unreliable_cells}
     # Explain EVERY '–' (not-tested) cell so a dash is never silent (NT-atom note + catch-all). See _explain_dashes.
     notes.extend(_explain_dashes(rep, ctx["per"], notes))
     return rep
@@ -214,6 +222,8 @@ def _id_cell(rep, ident, cmd):
         return ("·", "none", "no policy for this command (implicit deny)")
     if (cmd, ident) in rep.get("unreliable_cells", set()):
         return ("‼", "unrel", "UNRELIABLE — the test precondition (seed) could not be established, so this result is NOT trustworthy (the suite fails loudly here; see notes)")
+    if (cmd, ident) in rep.get("leak_cells", set()):
+        return ("✓", "danger", "CAN act, but this identity can also write values only another policy should allow (cross-policy WITH CHECK leak); see the SECURITY HOLE note below")
     g = rep.get("idgrid", {}).get(cmd, {}).get(ident)
     if not g:
         if ident == "anon" and cmd != "SELECT":

@@ -4,6 +4,11 @@ All notable changes to **rlsautotest** are documented here. The format is based 
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and versions
 roughly follow semantic versioning.
 
+## [0.3.1] - 2026-07-27
+
+### Fixed
+- **The access-matrix report now flags a cross-policy `WITH CHECK` leak in the grid itself, so it can no longer read greener than its own tests.** When two or more permissive `UPDATE`/`INSERT` policies each pin a narrow `WITH CHECK` value but the role/owner/tenant guard sits only in `USING`, Postgres OR-combines every policy's `WITH CHECK`, letting an authorized identity write a value only a *different* policy intended. The generated pgTAP suite already caught this (a failing `throws_ok` per forbidden value) and the CI gate already exited non-zero, but the report understated it: the offending `authenticated, authorized` cell showed a plain `✓` and the HTML summary counted the table under "enforced as declared / 0 with problems". That cell is now marked as a security hole (`✓!` in text, a red `✓` in HTML) and the table is counted in the report's problem summary. Report-only change; emitted pgTAP is byte-identical.
+
 ## [0.3.0] - 2026-07-19
 
 ### Added

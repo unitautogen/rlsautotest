@@ -215,6 +215,9 @@ class IdentityClass(_DictCompat):
     rowseed: dict = None
     aux: list = None
     scalar_link: str = None
+    scalar_links: list = None  # [(col, atom_kind)] EVERY identity link, in order; scalar_link is
+                               # last-writer-wins and names only one, which builds a half-owned
+                               # negative control on a composite-ownership predicate. See _ident_link.
     fk_val: Any = None
     rowlinked: bool = False
     handled: bool = True

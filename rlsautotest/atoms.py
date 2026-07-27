@@ -329,17 +329,39 @@ def _set_claim(c, keys, v):
 # One handler per atom kind: contribute claims / row seed / aux rows to the identity class being
 # built. Adding a kind = ONE entry here (plus, if it needs special seeding, its arm in _seed_plan).
 # Handler contract: handler(at, st) mutates the build state `st` (claims, rowseed, aux,
-# scalar_link, fk_val, tenant_keys, fn_mocks, has_temporal, handled/reason, idx, col_dom).
+# scalar_link, scalar_links, fk_val, tenant_keys, fn_mocks, has_temporal, handled/reason, idx, col_dom).
+
+def _ident_link(st, col, kind):
+    """Record an IDENTITY-linking column: one the row belongs to the identity THROUGH.
+
+    `scalar_link` is singular and last-writer-wins, so on a conjunction like
+    `org_id = auth.uid() AND project_id = (auth.jwt() ->> 'pid')` it names only ONE column, and the
+    negative-control row the seed planner builds by flipping it is HALF-OWNED: foreign in one
+    dimension and still the identity's own in the other. That is not a foreign row, so the negative
+    control proves less than it claims. It is green today only because the conjunction denies a
+    half-owned row anyway -- green for a reason other than the one asserted. Loosen the same policy
+    to a disjunction and the block goes silently green and wrong.
+
+    `scalar_links` accumulates EVERY identity link in order, each with its atom kind (foreign_val is
+    kind-dependent). `scalar_link` keeps its existing value untouched, so the single-link consumers
+    (emit's reassign-denied probe, the INSERT unique-link path) are unaffected.
+
+    Deliberately NOT recorded: `row_const` / `col_in_set` -- value constraints, not identity links.
+    Flipping those makes a row foreign for the wrong reason and can violate a CHECK or enum domain.
+    Also not `array_col` / `temporal`: the seed planner already flips those by sniffing the literal."""
+    if col and not any(c == col for c, _k in st["scalar_links"]):
+        st["scalar_links"].append((col, kind))
 
 def _atom_owner(at, st):
     v = CV[st["idx"] % len(CV)]; st["claims"]["sub"] = v; st["rowseed"][at["col"]] = f"'{v}'"; st["scalar_link"] = at["col"]; st["fk_val"] = v
+    _ident_link(st, at["col"], "owner")
 
 def _atom_const_identity(at, st):
     st["claims"]["sub"] = at["value"]
 
 def _atom_tenant(at, st):
     v = CV[st["idx"] % len(CV)]; _set_claim(st["claims"], at["keys"], v); st["rowseed"][at["col"]] = f"'{v}'"; st["scalar_link"] = at["col"]; st["fk_val"] = v
-    st["tenant_keys"].append(at["keys"])
+    st["tenant_keys"].append(at["keys"]); _ident_link(st, at["col"], "tenant")
 
 def _atom_claim_const(at, st):
     _set_claim(st["claims"], at["keys"], at["value"])
@@ -350,6 +372,7 @@ def _atom_row_const(at, st):
 def _atom_membership(at, st):
     uid = MV[st["idx"] % len(MV)]; sc = CV[st["idx"] % len(CV)]; st["claims"]["sub"] = uid
     st["rowseed"][at["row_scope_col"]] = f"'{sc}'"; st["scalar_link"] = at["row_scope_col"]; st["fk_val"] = sc
+    _ident_link(st, at["row_scope_col"], "membership")
     st["aux"].append({"table": at["mtable"], "cols": {at["muser_col"]: uid, at["mscope_col"]: sc},
                       "kind": "membership", "muser_col": at["muser_col"], "mscope_col": at["mscope_col"]})
     for _mk in at.get("mock_fns", []):   # mock the in-EXISTS fn to the seeded scope value (when it gates that same col)
@@ -369,6 +392,7 @@ def _atom_rbac(at, st):
 
 def _atom_folder_owner(at, st):
     uid = CV[st["idx"] % len(CV)]; st["claims"]["sub"] = uid; st["rowseed"][at["col"]] = f"'{uid}/x'"; st["scalar_link"] = at["col"]
+    _ident_link(st, at["col"], "folder_owner")
 
 def _atom_auth_role(at, st):
     pass
@@ -405,7 +429,7 @@ ATOM_HANDLERS = {
 def build_class(min_term, idx, col_dom=None):
     st = {"idx": idx, "col_dom": col_dom,
           "claims": {"sub": CV[idx % len(CV)], "role": "authenticated"},
-          "rowseed": {}, "aux": [], "scalar_link": None, "fk_val": None, "handled": True,
+          "rowseed": {}, "aux": [], "scalar_link": None, "scalar_links": [], "fk_val": None, "handled": True,
           "reason": None, "has_temporal": False, "tenant_keys": [], "fn_mocks": []}
     for at in min_term:
         h = ATOM_HANDLERS.get(at["kind"])
@@ -418,7 +442,8 @@ def build_class(min_term, idx, col_dom=None):
     # identity instead of RAISE'ing invalid_jwt (P0001) when the real policy is probed.
     st["claims"].setdefault("exp", FUTURE_EXP)
     return IdentityClass(idx=idx, claims=st["claims"], rowseed=st["rowseed"], aux=st["aux"],
-                         scalar_link=st["scalar_link"], fk_val=st["fk_val"], rowlinked=bool(st["rowseed"]),
+                         scalar_link=st["scalar_link"], scalar_links=st["scalar_links"],
+                         fk_val=st["fk_val"], rowlinked=bool(st["rowseed"]),
                          handled=st["handled"], reason=st["reason"], has_temporal=st["has_temporal"],
                          kinds=[a["kind"] for a in min_term], tenant_keys=st["tenant_keys"],
                          fn_mocks=st["fn_mocks"])
