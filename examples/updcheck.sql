@@ -2,8 +2,10 @@
 -- row", the probe does `UPDATE … SET <col>=<value>`; that only measures the UPDATE *grant* if the column
 -- is policy-neutral and the value is constraint-valid. Three tables stress the three failure modes:
 --   t1  a neutral column with a value-set CHECK  -> the SET value must satisfy the CHECK -> UPDATE GREEN
---   t2  a neutral column with a CHECK the filler can't satisfy -> the SET raises 23514 (a constraint error,
---       NOT the RLS denial 42501) -> the UPDATE cell is UNRELIABLE (loud), never a baked "denied"
+--   t2  a neutral column with a CHECK the filler CAN'T satisfy (a back-reference: four identical digits) ->
+--       the SET raises 23514 (a constraint error, NOT the RLS denial 42501) -> the UPDATE cell is UNRELIABLE
+--       (loud), never a baked "denied". NB: a plain format CHECK (e.g. `^[0-9]{4}$`) is now satisfied by the
+--       CHECK-aware filler (see examples/checkfmt.sql); this needs a back-reference to still fail the SET.
 --   t3  no policy-neutral column, but the policy column is plain (non-unique) -> the SELF-ASSIGNMENT
 --       fallback (SET owner_id = owner_id) still proves the UPDATE permission + policy re-check -> GREEN
 --   t4  nothing self-assignable either (identity PK + UNIQUE policy column) -> UPDATE is an
@@ -19,7 +21,7 @@ create table updcheck.t1 (id bigint generated always as identity primary key,
 
 create table updcheck.t2 (id bigint generated always as identity primary key,
   owner_id uuid not null references auth.users(id),
-  code text check (code ~ '^[0-9]{4}$'));
+  code text check (code ~ '^([0-9])\1{3}$'));
 
 create table updcheck.t3 (id bigint generated always as identity primary key,
   owner_id uuid not null references auth.users(id));

@@ -10,6 +10,7 @@ import re
 from .astutil import _CMDS4, _HOME, _TAGLINE, _TAGLINE2, _qi, _qt, _split_statements
 from .bypass import finding_type
 from .emit import _emit_both, _load_ctx
+from .colsec import cell_facts
 
 
 
@@ -282,6 +283,56 @@ def _table_status(r):
 
 
 
+# ── Column-level security cells (grant intent vs effective; green = granted (scope holds), red = leaked past the grant) ──
+def _role_of(key):
+    """The Postgres role behind a report identity row (both authenticated,* rows share the role)."""
+    if key == "service_role": return "service_role"
+    if key in ("authorized", "other"): return "authenticated"
+    if key == "anon": return "anon"
+    if isinstance(key, str) and key.startswith("role:"): return key[5:]
+    return None
+
+
+def _cls_cell(rep, key, cmd):
+    """One identity x command column-security cell -> (kind, granted, leaked). Same principle as the
+    row-level leak: flag a column grant that a BROADER grant bypasses, and nothing else.
+    kind: na (DELETE / no column data) . none (no row-level access) . unscoped (can act but no column
+    grant -> silent) . scoped (column grant intact; `granted` = the permission given) . leak (a broader
+    grant reaches columns beyond the column grant; `leaked` = the columns that slipped past the scope)."""
+    if cmd == "DELETE":
+        return ("na", [], [])
+    if _id_cell(rep, key, cmd)[0] != "✓":            # can act? only then is there a column story
+        return ("none", [], [])
+    cs = rep.get("column_security"); role = _role_of(key)
+    cell = (((cs or {}).get("cells", {}) or {}).get(role) or {}).get(cmd) if role else None
+    if not cell:
+        return ("na", [], [])
+    return (cell.get("kind", "unscoped"), cell.get("granted", []), cell.get("leaked", []))
+
+
+def _cls_text(kind, granted, leaked, cap=2, width=30):
+    """Compact text rendering of a CLS cell (capped + hard-truncated to width; full lists in --report-json / HTML)."""
+    def _cap(xs):
+        return ", ".join(xs[:cap]) + (f" +{len(xs) - cap}" if len(xs) > cap else "")
+    if kind == "na":                    return "n/a"
+    if kind in ("none", "unscoped"):    return "·"
+    txt = ("granted: " + _cap(granted)) if kind == "scoped" else ("⚠ leaks: " + _cap(leaked))
+    return txt if len(txt) <= width else txt[:width - 2] + ".."
+
+
+def _cls_html_td(kind, granted, leaked, first, esc):
+    cls = {"na": "clsna", "none": "clsnone", "unscoped": "clsnone",
+           "scoped": "clsok", "leak": "clsleak"}[kind]
+    if first:
+        cls += " clsstart"
+    if kind == "na":                    return f'<td class="{cls}">n/a</td>'
+    if kind in ("none", "unscoped"):    return f'<td class="{cls}">·</td>'
+    if kind == "scoped":
+        return f'<td class="{cls}" title="columns this role may act on -- column grant intact">granted: {esc(", ".join(granted))}</td>'
+    ctx = f'<span class="gr">granted: {esc(", ".join(granted))}</span> ' if granted else ""
+    return f'<td class="{cls}" title="a broader grant reaches columns beyond the column grant (leak)">{ctx}<span class="lk">⚠ leaks: {esc(", ".join(leaked))}</span></td>'
+
+
 def render_report_text(reps):
     out = []
     exposed = [r["table"] for r in reps if not r["rls_enabled"] and r.get("exposed")]
@@ -291,7 +342,9 @@ def render_report_text(reps):
     for r in reps:
         st, _ = _table_status(r)
         out.append(f"{r['table']}  [{st}]")
-        out.append(f"  {'identity':<31}" + "".join(f"{c:<9}" for c in _CMDS4))
+        _CW = 30   # column-security cell width
+        out.append(f"  {'':<31}" + f"{'row level: can act?':<36}" + "  " + "column level security: granted columns (green) / leaks past the grant (red)")
+        out.append(f"  {'identity':<31}" + "".join(f"{c:<9}" for c in _CMDS4) + "  " + "".join(f"{c:<{_CW}}" for c in _CMDS4))
         _rows = _ID_ROWS + [(k, f"{k[5:]} (custom role)") for k in sorted(
             {i for cm in r.get("idgrid", {}).values() for i in cm if isinstance(i, str) and i.startswith("role:")})]
         for key, lbl in _rows:
@@ -300,13 +353,18 @@ def render_report_text(reps):
                 g, cls, _ = _id_cell(r, key, c)
                 glyph = g + ("!" if cls == "danger" else "")   # ! = behaves wrong (hole)
                 line += f"{glyph:<9}"
-            out.append(line)
+            line += "  "
+            for c in _CMDS4:
+                _k, _bl, _rk = _cls_cell(r, key, c)
+                line += f"{_cls_text(_k, _bl, _rk, width=_CW):<{_CW}}"
+            out.append(line.rstrip())
         for fn in r["footguns"]:
             out.append(f"    ! footgun: {fn}")
         out.append("")
     out.append("legend: ✓ can · blocked/none ✗ should-be-allowed-but-blocked  ✓! = should be blocked but CAN (security hole)  ‼ UNRELIABLE (seed/precondition failed — not trustworthy)  – not tested")
     out.append("service_role bypasses RLS by design (always full access).")
     out.append("note: 'authenticated, authorized' and 'authenticated, not authorized' are the SAME Postgres role (authenticated) under different JWT identities/claims — NOT separate DB roles. Only service_role, authenticated and anon are real Postgres roles; 'authorized' vs 'not authorized' is the policy outcome for that identity.")
+    out.append("column level security: 'granted: ...' = columns the role may act on (its column grant holds); '⚠ leaks: ...' = columns a BROADER grant reaches beyond that column grant (review); n/a = DELETE has no column-level privilege; · = no column-level grant in force.")
     out.append("")
     out.append(_TAGLINE + " " + _TAGLINE2)
     return "\n".join(out)
@@ -335,14 +393,21 @@ def render_report_html(reps, schema, bypass=None):
             for c in _CMDS4:
                 g, cls, title = _id_cell(r, key, c)
                 tds.append(f'<td class="c {cls}" title="{esc(title)}">{g}</td>')
+            for i, c in enumerate(_CMDS4):
+                _k, _bl, _rk = _cls_cell(r, key, c)
+                tds.append(_cls_html_td(_k, _bl, _rk, i == 0, esc))
             note = ' <span class="rolenote">bypasses RLS</span>' if key == "service_role" else ""
             grid_rows.append(f'<tr><td class="idn">{esc(lbl)}{note}</td>{"".join(tds)}</tr>')
         flags = "".join(f'<li>{esc(f)}</li>' for f in r.get("footguns", []))
         flags_html = f'<ul class="flags">{flags}</ul>' if flags else ""
         blocks.append(
             f'<section class="tbl"><h2>{esc(r["table"])} <span class="chip {stcls}">{esc(st)}</span></h2>'
-            f'<table class="grid"><thead><tr><th>identity</th>'
-            + "".join(f"<th>{c}</th>" for c in _CMDS4) + "</tr></thead><tbody>"
+            f'<table class="grid"><thead>'
+            f'<tr><th rowspan="2">identity</th><th colspan="4">Row level (can act?)</th>'
+            f'<th colspan="4" class="clsstart">Column level security (granted / leaks)</th></tr><tr>'
+            + "".join(f"<th>{c}</th>" for c in _CMDS4)
+            + "".join(f'<th class="{"clsstart" if i == 0 else ""}">{c}</th>' for i, c in enumerate(_CMDS4))
+            + "</tr></thead><tbody>"
             + "".join(grid_rows) + f"</tbody></table>{flags_html}</section>")
     banner = ""
     if exposed:
@@ -398,6 +463,11 @@ def render_report_html(reps, schema, bypass=None):
  .svc{{background:#f1f5f9;color:#475569}}
  .danger{{background:#dc2626;color:#fff;font-weight:700}} .fail{{background:#fee2e2;color:#b91c1c;font-weight:700}}
  .unrel{{background:#fde68a;color:#92400e;font-weight:700}}
+ .grid td.clsok{{color:#15803d;font-size:.78rem;text-align:left;white-space:normal;max-width:16rem}}
+ .grid td.clsleak{{background:#fee2e2;color:#b91c1c;font-size:.78rem;text-align:left;white-space:normal;max-width:16rem}}
+ .grid td.clsleak .lk{{font-weight:700}} .grid td.clsleak .gr{{color:#166534;opacity:.7}}
+ .grid td.clsna,.grid td.clsnone{{color:#cbd5e1;text-align:center}}
+ .grid .clsstart{{border-left:2px solid #94a3b8}}
  ul.flags{{margin:.4rem 0 0;padding-left:1.1rem;color:#92400e;font-size:.85rem}}
  .legend{{color:#666;font-size:.85rem;margin-top:1.5rem;max-width:48rem}}
  section.bypass{{margin:1.6rem 0}} section.bypass h2{{font-size:1.05rem;margin:0 0 .3rem}}

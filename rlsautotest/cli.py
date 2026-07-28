@@ -151,6 +151,9 @@ def main():
                 rep["has_policy"] = has_pol
                 rep["exposed"] = (not rls_on) and _exposed(cr, a.schema, t)
                 rep["grants"] = _effective_grants(cr, a.schema, t)   # per-command grants for ALL roles (incl service_role) — every cell is grant-gated
+                from .colsec import column_security
+                _cust = sorted({i[5:] for cm in rep.get("idgrid", {}).values() for i in cm if isinstance(i, str) and i.startswith("role:")})
+                rep["column_security"] = column_security(cr, a.schema, t, ["service_role", "authenticated", "anon"] + _cust)
                 return rep
 
             n_parallel = max(1, getattr(a, "parallel", 1))

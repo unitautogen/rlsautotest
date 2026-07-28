@@ -37,6 +37,8 @@ GREEN = [
     ("witness_cardinality.sql", "wcard"), ("recursion.sql", "recursion"),
     ("exotic_types.sql", "xtypes"), ("zeroarg.sql", "za"), ("regexfree.sql", "rxf"),
     ("customrole.sql", "crole"), ("quoted_idents.sql", "qident"),
+    ("colsec.sql", "colsec"),
+    ("checkfmt.sql", "checkfmt"),
 ]
 # fixture, schema, required marker(s) in the failing report
 NEGATIVE = [

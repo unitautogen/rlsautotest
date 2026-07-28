@@ -7,6 +7,7 @@ Split out of the original single-module cli.py; behavior-preserving.
 from __future__ import annotations
 import re
 from .astutil import _CMDS4, _and_conjuncts, _array_consts, _colname, _const, _list_consts, _names, _t, _unwrap, _v, _where
+from .checkwitness import _fmt_check_witness
 
 
 
@@ -107,6 +108,13 @@ def _constraint_meta(cur, schema, table):
                 checks[ck[0]] = "'" + str(ck[1]).replace("'", "''") + "'"
             elif rel:
                 relchecks.append(rel)
+            else:
+                # A single-column format/length CHECK (regex ~/~*, LIKE ~~, char_length/length range):
+                # construct a satisfying seed value so the column is testable instead of UNRELIABLE. The seed
+                # probe stays the judge — a wrong value just re-fails the INSERT (UNRELIABLE), never a false pass.
+                fw = _fmt_check_witness(cdef)
+                if fw and fw[0] not in checks:
+                    checks[fw[0]] = "'" + str(fw[1]).replace("'", "''") + "'"
         elif contype in ('u', 'p') and cols and len(cols) > 1:
             cuniques.append(list(cols))
         elif contype == 'f' and cols and len(cols) > 1 and parent and fcols:

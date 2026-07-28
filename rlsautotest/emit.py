@@ -426,6 +426,20 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                         mut_test(cj0, role, f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' (implicit deny) must affect 0 rows — no policy means deny')} );")
                     else:
                         mut_test(cj0, role, f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' (implicit deny) affects 0 rows')} );")
+    # -- Column-level security (parity with the report grid): one assertion per column-scoped cell.
+    # A column grant a BROADER grant bypasses (leak) FAILS here; an intact scope passes. Pure
+    # has_column_privilege vs the column-grant set -> deterministic, and it reads the SAME fact the
+    # report's CLS cell uses, so report and suite can never disagree. Appended LAST and NOT recorded as an
+    # Observation, so the report replay's row-level indexing is untouched (a 'CLS:' label matches no
+    # command, so the matrix parser ignores these lines).
+    try:
+        from .colsec import column_security as _cls_colsec, cls_assertions as _cls_asserts
+        _cls_cells = _cls_colsec(conn.cursor(), schema, table, ["service_role", "authenticated", "anon"]).get("cells", {})
+        for _ca in _cls_asserts(schema, table, _cls_cells):
+            n[0] += 1
+            body.append(_ca["sql"])
+    except Exception:
+        pass   # CLS is strictly additive -- never break the core battery
     body_text = "\n".join(body)
     if helpers:
         creates = "\n".join(
