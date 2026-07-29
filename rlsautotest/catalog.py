@@ -109,9 +109,11 @@ def _constraint_meta(cur, schema, table):
             elif rel:
                 relchecks.append(rel)
             else:
-                # A single-column format/length CHECK (regex ~/~*, LIKE ~~, char_length/length range):
-                # construct a satisfying seed value so the column is testable instead of UNRELIABLE. The seed
-                # probe stays the judge — a wrong value just re-fails the INSERT (UNRELIABLE), never a false pass.
+                # Single-column FORMAT / LENGTH CHECK (regex `~`/`~*`, LIKE, or a length bound): construct
+                # ONE conforming value (checkwitness) so the column seeds instead of failing its own CHECK
+                # and dragging the row to UNRELIABLE. The seed probe still verifies it downstream, so a value
+                # that does not actually satisfy the CHECK just re-fails and the cell stays honestly
+                # UNRELIABLE -- this can only ever turn an UNRELIABLE cell into a real, probe-baked green.
                 fw = _fmt_check_witness(cdef)
                 if fw and fw[0] not in checks:
                     checks[fw[0]] = "'" + str(fw[1]).replace("'", "''") + "'"

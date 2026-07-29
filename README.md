@@ -73,6 +73,7 @@ It verifies the access-control safeguard, not your whole HIPAA or SOC 2 program.
 - **Native, ownable output.** Standard pgTAP into `supabase/tests/database/rls/`, runnable by `supabase test db`, `pg_prove`, or plain `psql`. Uses the [basejump test helpers](https://github.com/usebasejump/supabase-test-helpers) when present, or ships a tiny offline shim when they aren't, so it runs online or air-gapped.
 - **Static checks too.** It flags open `USING (true)` reads, `WITH CHECK (true)` writes, asymmetric `USING`/`WITH CHECK`, self-referential (recursive) policies, RLS-on-but-no-policy, and policy drift via snapshot/diff.
 - **Maps the bypass surface around your policies.** Correct policies can still be undone by *how the data is reached*, so it also reports the objects and roles that sidestep RLS: owner-rights (`SECURITY DEFINER`) views and functions a client can reach, materialized views, `BYPASSRLS`/superuser roles, and RLS-on-but-not-`FORCE`d tables (see [Beyond the policies: bypass surfaces](#beyond-the-policies-bypass-surfaces)).
+- **Flags a column-scoped grant that a broader grant defeats.** `GRANT UPDATE (display_name, bio)` says "only these columns," but a leftover table-wide grant (or one inherited from another role) reaches every other column again, so the scope you wrote never actually held. rlsautotest compares each role's column grant against its *effective* column reach and flags exactly that contradiction - the column-level analogue of the cross-policy `WITH CHECK` leak (see [Column-level security](#column-level-security)).
 
 ## What it generates
 
@@ -128,6 +129,24 @@ A correct set of table policies can still be undone by *how the data is reached*
 - **Tables** with RLS enabled but not `FORCE`d whose owner isn't a superuser.
 
 These are **review flags, not pass/fail**: a `SECURITY DEFINER` view is often exactly what you intended. They appear in `rlsautotest lint` and in a **Bypass surfaces** section of the `--report` / `--html` output (and in `--report-json`), so a reviewer sees, in one place, every way RLS could be sidestepped and can confirm each is deliberate. Reachability is judged by *effective* privilege (`has_table_privilege` / `has_function_privilege`, which include grants to `PUBLIC`), so a function a client can call only through Postgres's default `PUBLIC` `EXECUTE` grant is surfaced even when you never granted it explicitly.
+
+## Column-level security
+
+Postgres lets you scope a grant to specific columns: `GRANT UPDATE (display_name, bio) ON profiles TO authenticated` says a user may edit those two columns and nothing else. That scoping is real security - it is how you keep `role`, `is_admin`, or `tenant_id` out of a user's reach - but it is silently undone the moment a *broader* grant is also in force. A leftover table-wide `GRANT UPDATE ON profiles`, or a privilege inherited from another role, reaches every column again. The column list you wrote still sits in the catalog looking like a boundary, while the effective privilege runs straight past it.
+
+This is the exact column-level analogue of the cross-policy `WITH CHECK` leak: a restriction expressed in one place, defeated by a wider grant that unions back in. `rlsautotest` flags that one contradiction and nothing else. It makes **no** guess about which columns are "sensitive" (there is no column-name heuristic), and it never flags a bare table-wide grant on its own - a grant with no column scoping expresses no intent to scope, so there is nothing to contradict. It compares the developer's expressed scope (`pg_attribute.attacl`, the column grant) against effective reach (`has_column_privilege`, which folds in table-wide and inherited grants); the leaked columns are simply *effective minus granted*.
+
+Each table's `--report` / `--html` grid carries a **column level security** block beside the row-level one, per role and per command (`SELECT` / `INSERT` / `UPDATE`; `DELETE` is whole-row in Postgres, so it has no column-level privilege and shows `n/a`):
+
+- **`granted: id, display_name +2`** (green) - a column grant is in force and effective reach matches it exactly: the scope holds, and the listed columns are the permission you gave.
+- **`⚠ leaks: role, is_admin +1`** (red) - a broader grant reaches past the column grant; the named columns are the ones that slipped the scope.
+- **`·`** - no column-level grant in force, so no scope was expressed and nothing is flagged.
+
+![rlsautotest column-level-security report for the colsec example schema: colsec.accounts leaks columns past its column grant (red), colsec.profiles stays scoped (green), colsec.members is a bare table-wide grant (silent)](docs/colsec-column-level-security.png)
+
+The same facts appear in `--report-json` under `column_security`, and - the part that makes this enforceable rather than merely visible - the **emitted pgTAP suite bakes it in**. For every column-scoped cell, `--emit` writes one assertion that fails if any column beyond the grant is reachable. A scope that holds today becomes a committed test that turns **red** the day someone adds a table-wide grant that widens past it; and a scope that is *already* leaking when you generate the suite is emitted as a real `not ok` that names the leaked columns, never quietly passed over. As everywhere else in rlsautotest, a detected contradiction is surfaced, not smoothed away.
+
+The usual fix is to drop the redundant table-wide grant and keep only the column grants (or, if the wide grant is genuinely what you intend, drop the column grants so there is no false boundary). `examples/colsec.sql` is the runnable illustration: three tables with identical row policies whose only difference is the column grid - one scoped (green), one leaking (red), and one bare table-wide grant that is correctly left silent.
 
 ## When something looks wrong: `rlsautotest doctor`
 

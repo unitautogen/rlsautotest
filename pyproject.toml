@@ -24,6 +24,12 @@ dependencies = [
     "pglast>=7",
 ]
 
+[project.optional-dependencies]
+# Realistic named-format seed values (email, URL, IP, MAC, UUID, hostname, slug, phone, ...) for
+# columns gated by a format CHECK. Optional: without it the built-in regex / LIKE / length
+# constructors handle every case unchanged, so emitted SQL is byte-identical when it isn't installed.
+faker = ["faker>=20"]
+
 [project.urls]
 Homepage = "https://github.com/unitautogen/rlsautotest"
 Issues = "https://github.com/unitautogen/rlsautotest/issues"
@@ -36,3 +42,7 @@ rlsautotest = "rlsautotest.cli:main"
 # The old hardcoded `packages = ["rlsautotest"]` silently dropped the strategies/ subpackage from the
 # built wheel (0.2.0 shipped uninstallable). find + the wildcard ships all current and future subpackages.
 include = ["rlsautotest*"]
+
+[tool.pytest.ini_options]
+# only the real suite; never collect stray test_*.py under temp/ or build dirs
+testpaths = ["tests"]

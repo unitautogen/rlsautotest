@@ -10,7 +10,7 @@ from .astutil import _CMDS4, _TAGLINE, _TAGLINE2, _expr_cols, _qi, _split_statem
 from .values import CV, FOREIGN, FUTURE_EXP, INS, MV, NOBODY, RIVAL_SUB
 from .catalog import _FK_SQL, _columns, _constraint_meta, _effective_grants, _exposed, all_tables
 from .atoms import _check_value_set, analyze
-from .probe import ProbeBaker, _probe
+from .probe import ProbeBaker, _probe, _update_selfassign_retry
 from .seeding import _seed_plan, _synthesize_row, _wrap_seed
 from .structs import EmitContext, Observation
 from .strategies import AUGMENT, HANDLED, REGISTRY
@@ -362,7 +362,10 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                         continue
                 else:
                     action = f"DELETE FROM {q}"
-                o = _probe(conn, arrange_stmts, pident(_wcj, role), "write", action)
+                _pid = pident(_wcj, role)
+                o = _probe(conn, arrange_stmts, _pid, "write", action)
+                if cmd == "UPDATE" and upd_col:   # a fresh-value SET that trips the neutral column's own CHECK (23514, not the 42501 denial) is the probe's value failing -> self-assign that column instead of conceding UNRELIABLE
+                    action, o = _update_selfassign_retry(conn, arrange_stmts, _pid, o, action, upd_col[0], q)
                 # sqlstate triage (42501 vs constraint vs UNRELIABLE) lives in ProbeBaker.write_assert.
                 mut_test(_wcj, role, baker.write_assert(o, cmd, action, who, ident=_oid, mocked=_seed_fn_mock))
                 # TRANSITION AUDIT (cross-policy WITH CHECK leak): an authorized identity that CAN update

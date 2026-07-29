@@ -11,6 +11,7 @@ import psycopg
 from .astutil import _split_statements, _sq, _qi, _qt
 from .values import FOREIGN, FUTURE_EXP, INS, RIVAL_ORG, RIVAL_SUB, _bump_lit, _castable_lit, _fill_lit, _nonempty_array_lit, _pick_lit, _verified_lit
 from .catalog import _FK_SQL, _check_bool_udfs, _columns, _constraint_meta, _fk_by_name
+from .checkwitness import _fmt_check_witness
 from .atoms import _set_claim
 
 
@@ -362,7 +363,7 @@ def _synthesize_row(conn, schema, table, fixed=None, _depth=0, budget=24):
         if nn and not hd: row[n] = _castable_lit(conn, t)
     for k, v in (fixed or {}).items():
         row[k] = v
-    parents, mocks, salt = [], [], [0]
+    parents, mocks, salt, fmt_tried = [], [], [0], set()
     def mock_create(sig): return f"CREATE OR REPLACE FUNCTION {sig} RETURNS boolean LANGUAGE sql AS $$ SELECT true $$;"
     def ins_sql():
         base = (f"INSERT INTO {_qt(q)} ({', '.join(_qi(c) for c in row)}) VALUES ({', '.join(row.values())})" if row else f"INSERT INTO {_qt(q)} DEFAULT VALUES")
@@ -411,12 +412,21 @@ def _synthesize_row(conn, schema, table, fixed=None, _depth=0, budget=24):
                 cur.execute("""SELECT pg_get_constraintdef(oid) FROM pg_constraint
                                WHERE conname=%s AND conrelid = format('%%I.%%I', %s::text, %s::text)::regclass""", (cname, schema, table))
                 _cd = cur.fetchone()
-                _m = re.search(r'(?:cardinality|array_length)\s*\(\s*"?([a-zA-Z_]\w*)"?', (_cd[0] if _cd else "") or "")
+                _cdef = (_cd[0] if _cd else "") or ""
+                _m = re.search(r'(?:cardinality|array_length)\s*\(\s*"?([a-zA-Z_]\w*)"?', _cdef)
                 _ac = _m.group(1) if _m else None
                 if _ac and coltypes.get(_ac, "").endswith("[]") and row.get(_ac) is None:
                     row[_ac] = _nonempty_array_lit(coltypes[_ac])   # e.g. roles text[] -> '{x}'
                 else:
-                    return None, None, None                          # non-array / other non-function CHECK -> not repairable here
+                    # single-column FORMAT / LENGTH CHECK (regex ~ / LIKE / length): construct a conforming
+                    # value (checkwitness) and retry. The INSERT re-probe still verifies it, so a wrong
+                    # candidate just re-fails within budget -> None -> NOT_TESTABLE (never a false pass).
+                    fw = None if cname in fmt_tried else _fmt_check_witness(_cdef)
+                    if fw and fw[0] in coltypes:
+                        fmt_tried.add(cname)
+                        row[fw[0]] = "'" + str(fw[1]).replace("'", "''") + "'"
+                    else:
+                        return None, None, None                      # not a repairable single-column CHECK
         elif ss == "23505" and cname:                               # UNIQUE -> vary a column
             cur.execute("SELECT array_agg(a.attname) FROM pg_constraint c JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=ANY(c.conkey) WHERE c.conname=%s", (cname,))
             ur = cur.fetchone(); tgt = next((u for u in (list(ur[0]) if ur and ur[0] else []) if u in row), None)

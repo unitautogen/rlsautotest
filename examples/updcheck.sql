@@ -1,16 +1,23 @@
--- updcheck.sql — exercises the UPDATE probe's correctness guards. To prove "identity X can UPDATE its
--- row", the probe does `UPDATE … SET <col>=<value>`; that only measures the UPDATE *grant* if the column
--- is policy-neutral and the value is constraint-valid. Three tables stress the three failure modes:
---   t1  a neutral column with a value-set CHECK  -> the SET value must satisfy the CHECK -> UPDATE GREEN
---   t2  a neutral column with a CHECK the filler CAN'T satisfy (a back-reference: four identical digits) ->
---       the SET raises 23514 (a constraint error, NOT the RLS denial 42501) -> the UPDATE cell is UNRELIABLE
---       (loud), never a baked "denied". NB: a plain format CHECK (e.g. `^[0-9]{4}$`) is now satisfied by the
---       CHECK-aware filler (see examples/checkfmt.sql); this needs a back-reference to still fail the SET.
---   t3  no policy-neutral column, but the policy column is plain (non-unique) -> the SELF-ASSIGNMENT
---       fallback (SET owner_id = owner_id) still proves the UPDATE permission + policy re-check -> GREEN
---   t4  nothing self-assignable either (identity PK + UNIQUE policy column) -> UPDATE is an
---       EXPLAINED "–", never silent
--- A *negative* example (like seedfail.sql): the gate MUST flag it (t2 is UNRELIABLE -> exit non-zero).
+-- updcheck.sql -- exercises the full UPDATE-probe ladder end to end; every cell resolves cleanly, so this
+-- is a POSITIVE (green) fixture. To prove "identity X can UPDATE its row" the probe runs
+--   UPDATE ... SET <col> = <value>
+-- which only measures the UPDATE *grant* when the column is policy-neutral AND the value is constraint-valid.
+-- Four tables walk the four rungs of the ladder the probe climbs:
+--   t1  neutral column, value-set CHECK the filler satisfies -> SET <fresh valid value> -> UPDATE GREEN
+--   t2  neutral column with a CHECK the filler CANNOT construct (a look-ahead regex) -> the fresh-value SET
+--       would raise 23514 (a constraint error, NOT the RLS denial 42501), so the probe FALLS BACK to
+--       SET code = DEFAULT: a no-read literal write of the value seeding left in the row (the column is
+--       omitted from the seed, so it holds its default, NULL), which is constraint-valid, so no 23514, and
+--       the UPDATE privilege + USING/WITH CHECK re-check are still measured -> UPDATE GREEN. Because the RHS
+--       is a literal (not `code = code`), an identity holding UPDATE but not SELECT on the column is measured
+--       correctly too, not reported as a false deny. (Before this fallback t2 was UNRELIABLE; the guard that
+--       a genuine seeding failure still cannot masquerade as a pass now lives in examples/seedfail.sql, whose
+--       NOT NULL look-ahead column blocks seeding entirely, so even SET code = DEFAULT has no row to touch.)
+--   t3  no policy-neutral column, but the policy column is plain (non-unique) -> self-assign the policy
+--       column (SET owner_id = owner_id) proves the UPDATE permission + policy re-check -> GREEN
+--   t4  nothing self-assignable either (identity PK + UNIQUE policy column) -> UPDATE is an explained "-",
+--       never silent (the report notes "no policy-neutral column")
+-- A GREEN example: the report gate MUST exit 0 (every cell is a real pass or an explained dash).
 drop schema if exists updcheck cascade;
 create schema updcheck;
 grant usage on schema updcheck to anon, authenticated, service_role;
@@ -21,7 +28,7 @@ create table updcheck.t1 (id bigint generated always as identity primary key,
 
 create table updcheck.t2 (id bigint generated always as identity primary key,
   owner_id uuid not null references auth.users(id),
-  code text check (code ~ '^([0-9])\1{3}$'));
+  code text check (code ~ '^(?=.*[0-9])(?=.*[a-z]).{8,}$'));   -- look-ahead CHECK the filler can't construct -> probe falls back to SET code = DEFAULT -> GREEN
 
 create table updcheck.t3 (id bigint generated always as identity primary key,
   owner_id uuid not null references auth.users(id));

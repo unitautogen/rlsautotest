@@ -24,9 +24,11 @@ def test_regex_alternation_takes_first_branch():
     v = _regex_witness(r"^(foo|bar)$")
     assert v is not None and re.search(r"^(foo|bar)$", v)
 
-def test_regex_backreference_is_unsupported():
-    assert _regex_witness(r"^(.)\1$") is None
-    assert _regex_witness(r"^([0-9])\1{9}$") is None
+def test_regex_backreference_is_supported():
+    v = _regex_witness(r"^(.)\1$")
+    assert v is not None and re.search(r"^(.)\1$", v)
+    v = _regex_witness(r"^([0-9])\1{9}$")
+    assert v is not None and re.search(r"^([0-9])\1{9}$", v) and len(v) == 10
 
 def test_regex_lookaround_is_unsupported():
     assert _regex_witness(r"^(?=.*[0-9]).{8,}$") is None
@@ -69,8 +71,13 @@ def test_fmt_witness_length_cdef():
     w = _fmt_check_witness("CHECK (((char_length(note) >= 5) AND (char_length(note) <= 40)))")
     assert w and w[0] == "note" and 5 <= len(w[1]) <= 40
 
-def test_fmt_witness_backreference_returns_none():
-    assert _fmt_check_witness(r"CHECK ((code ~ '^([0-9])\1{9}$'::text))") is None
+def test_fmt_witness_backreference_now_constructs():
+    w = _fmt_check_witness(r"CHECK ((code ~ '^([0-9])\1{9}$'::text))")
+    assert w and w[0] == "code" and re.search(r"^([0-9])\1{9}$", w[1])
+
+
+def test_fmt_witness_lookaround_returns_none():
+    assert _fmt_check_witness(r"CHECK ((code ~ '^(?=.*[0-9]).{8,}$'::text))") is None
 
 def test_fmt_witness_valueset_is_deferred():
     # a value-set CHECK (col = ANY(...)) is handled by _check_seed_meta, not the format witness path
@@ -79,3 +86,17 @@ def test_fmt_witness_valueset_is_deferred():
 def test_fmt_witness_multicolumn_or_unknown_returns_none():
     # cross-column comparison is not a single-column format/length shape -> None here
     assert _fmt_check_witness("CHECK ((lo < hi))") is None
+
+def test_register_custom_format_generator():
+    from rlsautotest import checkwitness as _cw
+    saved = list(_cw._GENERATORS)
+    def _pw(ctx):
+        if ctx.kind == "regex" and ctx.pattern and "(?=" in ctx.pattern:
+            return "abcdefg1"
+        return None
+    try:
+        _cw.register_format_generator(_pw, front=True)
+        w = _cw._fmt_check_witness(r"CHECK ((code ~ '^(?=.*[0-9])(?=.*[a-z]).{8,}$'::text))")
+        assert w == ("code", "abcdefg1")
+    finally:
+        _cw._GENERATORS[:] = saved

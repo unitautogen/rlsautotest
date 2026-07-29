@@ -7,6 +7,7 @@ Split out of the original single-module cli.py; behavior-preserving.
 from __future__ import annotations
 import re
 from .catalog import _action_table
+from .astutil import _qi
 
 
 _DDL_RE = re.compile(r"^\s*(CREATE|ALTER|DROP)\b", re.I)   # arrange statements that install mocks/helpers
@@ -87,6 +88,35 @@ def _probe(conn, arrange, ident_sqls, kind, action_sql):
         cur.execute(action_sql); return _done("rows", cur.rowcount, unreliable)
     except Exception as e:
         return _done("err", getattr(e, "sqlstate", None) or "XX000", unreliable)
+
+
+
+def _update_selfassign_retry(conn, arrange, ident_sqls, o, action, setcol, q):
+    """Recover an UPDATE probe whose OWN synthesized SET value tripped a constraint instead of
+    measuring the policy. The CHECK-aware filler cannot construct a satisfying value for every CHECK
+    (back-references, look-around, function-delegated), so `SET <neutral> = <literal>` can raise
+    23514 check_violation (or a length/format error) -- the probe's own value failing, NOT the RLS
+    denial 42501, which write_assert would (correctly) route to UNRELIABLE. Before conceding, RETRY
+    with `SET col = DEFAULT`: the neutral column is one the policy never reads, so we are free to
+    re-write the value seeding already left in the row (the column was OMITTED from the seed INSERT,
+    so it holds its DEFAULT / NULL, valid by construction). Crucially the DEFAULT keyword is a RHS
+    that needs NO read of the column, unlike `col = col`, so an identity holding UPDATE but not SELECT
+    on the column is measured correctly instead of a false 42501-on-read deny. Postgres still enforces
+    the UPDATE privilege and re-evaluates USING / WITH CHECK. Returns the (action, observation) to bake.
+
+    Sound-by-construction: the retry is adopted ONLY when it resolves cleanly (not unreliable, no
+    non-42501 error). If the DEFAULT write also fails, or the original outcome was already a clean
+    result / denial / unreliable-precondition, the ORIGINAL observation is returned unchanged -- so
+    this can turn an UNRELIABLE into a real pass or deny, but never a genuine failure into a false
+    pass. (seedfail, whose row cannot be seeded at all, keeps o[2] set and so is left UNRELIABLE
+    here -- the regression guard that this fallback masks nothing.)"""
+    if not (setcol and not o[2] and o[0] == "err" and o[1] != "42501"):
+        return action, o
+    selfact = f"UPDATE {q} SET {_qi(setcol)}=DEFAULT"
+    o2 = _probe(conn, arrange, ident_sqls, "write", selfact)
+    if o2[2] or (o2[0] == "err" and o2[1] != "42501"):
+        return action, o
+    return selfact, o2
 
 
 

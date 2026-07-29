@@ -8,7 +8,7 @@ as its own row in the report — the policy stops vanishing. Runs additively (CO
 client battery still runs after it."""
 from __future__ import annotations
 
-from ..probe import _probe
+from ..probe import _probe, _update_selfassign_retry
 from ..seeding import _mock_valid_row, _synthesize_row
 from .base import CONTINUE
 from .mock import _ins_sql
@@ -72,6 +72,8 @@ def run(ctx, baker, cmd):
                 act = f"DELETE FROM {q}"
             arrange = pre[:-1] if (cmd == "INSERT" and pre and pre[-1].startswith("INSERT")) else pre
             o = _probe(conn, arrange, pid, "write", act)
+            if cmd == "UPDATE" and ctx.upd_col:   # neutral-column CHECK the filler cannot satisfy -> self-assign it rather than UNRELIABLE (probe._update_selfassign_retry)
+                act, o = _update_selfassign_retry(conn, arrange, pid, o, act, ctx.upd_col[0], q)
             asrt = baker.write_assert(o, cmd, act, who, ident=ident_key)
         n[0] += 1
         body.append("RESET ROLE;")

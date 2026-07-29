@@ -39,12 +39,12 @@ GREEN = [
     ("customrole.sql", "crole"), ("quoted_idents.sql", "qident"),
     ("colsec.sql", "colsec"),
     ("checkfmt.sql", "checkfmt"),
+    ("updcheck.sql", "updcheck"), ("seedfail.sql", "seedfail"),
 ]
 # fixture, schema, required marker(s) in the failing report
 NEGATIVE = [
     ("transitions.sql", "transitions", ["cross-policy WITH CHECK leak"]),
-    ("seedfail.sql", "seedfail", ["UNRELIABLE"]),
-    ("updcheck.sql", "updcheck", ["UNRELIABLE", "no policy-neutral column"]),
+    ("seedimpossible.sql", "seedimpossible", ["UNRELIABLE"]),
 ]
 # exotic.sql is deliberately NOT loaded: it contains a broken-by-design 42P17 policy.
 

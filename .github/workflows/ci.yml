@@ -8,7 +8,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install -e . pytest
+      - run: pip install -e ".[faker]" pytest
       - run: pytest -q
 
   package:
@@ -77,8 +77,9 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/regexfree.sql # F6: a policy whose WITH CHECK contains a column NAME inside a string literal -> the AST (not a text regex) decides which columns the policy references, so the real neutral column stays SETtable and UPDATE is tested, must stay green
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/customrole.sql # F5: policies granted TO a custom role (reporter) -> probed via SET ROLE and shown as their own report row instead of silently vanishing from the client DNF, must stay green
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/quoted_idents.sql # #357 GUARD: PascalCase (quoted) table + columns with GUC tenancy -> the generator must QUOTE every identifier it emits, else seeds die 42703/undefined_table and every cell goes UNRELIABLE. Must stay green.
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/seedfail.sql # seedfail is now GREEN: the checkwitness feature seeds its ten-digit format CHECK by construction (the stable un-seedable negative moved to seedimpossible.sql)
           rc=0
-          for schema in public tenancy rbac rbt clearance synth adversarial mockforce wm wa wf2 wsq wn wj wcard recursion xtypes za rxf crole qident; do
+          for schema in public tenancy rbac rbt clearance synth adversarial mockforce wm wa wf2 wsq wn wj wcard recursion xtypes za rxf crole qident seedfail; do
             echo "===== schema: $schema ====="
             rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --emit "out_$schema"
             for f in "out_$schema"/tests/database/rls/*.sql; do
@@ -112,21 +113,22 @@ jobs:
             exit 1
           fi
           echo "OK: cross-policy WITH CHECK leak detected (gate exited non-zero) as expected"
-      - name: Flag an un-seedable table as UNRELIABLE, never a silent pass (examples/seedfail.sql)
+      - name: Flag an un-seedable table as UNRELIABLE, never a silent pass (examples/seedimpossible.sql)
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost/app
         run: |
-          # seedfail.sql is DELIBERATELY un-seedable (a 10-digit CHECK the generic filler can't satisfy).
+          # seedimpossible.sql is DELIBERATELY un-seedable (a CHECK (false) contradiction no value can EVER
+          # satisfy, so it can never "solve itself" as the value constructor improves).
           # The engine must mark those cells UNRELIABLE and FAIL the gate (exit non-zero) rather than print
           # "– not tested" or bake the seed error as a policy denial. Failing to is a regression in the
           # probe's arrange/act split or the post-arrange invariant.
-          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/seedfail.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/seedimpossible.sql
           # Capture the gate's REAL exit code without a pipe (a `... | tee file` pipeline reports tee's
           # exit 0 and MASKS the gate's non-zero exit) AND without tripping `set -e` (a bare
           # `cmd; rc=$?` aborts the step on the gate's expected exit 1 before rc is read). `|| rc=$?` is
           # exempt from set -e and records the real code; works under sh -e and bash -eo pipefail.
           rc=0
-          rlsautotest --db-url "$DATABASE_URL" --schema seedfail --report > /tmp/sf.txt 2>&1 || rc=$?
+          rlsautotest --db-url "$DATABASE_URL" --schema seedimpossible --report > /tmp/sf.txt 2>&1 || rc=$?
           cat /tmp/sf.txt
           if [ "$rc" -eq 0 ]; then
             echo "FAIL: an un-seedable table did NOT fail the gate"
