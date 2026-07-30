@@ -61,6 +61,36 @@ _SUBCMDS = {
 
 
 
+
+def pick_local_db_url(status_output):
+    """From `supabase status -o env` text, pick the LOCAL host Postgres URL. Prefer a 127.0.0.1/localhost
+    URL over the docker-internal @db:5432 one (only reachable inside the container network); fall back to
+    the first postgres URL if none is host-local. Returns None when the text has no postgres URL. Pure, so
+    it is unit-tested without a database or the supabase CLI."""
+    import re
+    urls = [u.strip('"') for u in re.findall(r"postgres(?:ql)?://\S+", status_output or "")]
+    return next((u for u in urls if "127.0.0.1" in u or "localhost" in u), (urls[0] if urls else None))
+
+
+def supabase_keep_set(hook, ext, has_guard, tables):
+    """Filenames THIS --supabase run owns: the hook (always), the RLS-enabled guard (when emitted), and one
+    file per table (NNN-rls-<t><ext>, NNN = 100 + sorted index). Reconcile uses it to tell current from
+    orphaned. Pure."""
+    keep = {hook}
+    if has_guard:
+        keep.add("010-rls-enabled" + ext)
+    for i, t in enumerate(sorted(tables), start=1):
+        keep.add(f"{100 + i:03d}-rls-{t}" + ext)
+    return keep
+
+
+def orphans_to_prune(dir_listing, keep):
+    """Generated files to prune on reconcile: ONLY names ending in _rlsautotest.sql that are not in keep.
+    A hand-written test never carries that suffix, so it is never returned here -- the safety property,
+    made unit-testable. Pure."""
+    keep = set(keep)
+    return [f for f in dir_listing if f.endswith("_rlsautotest.sql") and f not in keep]
+
 def main():
     import os, pathlib
     # ── subcommand dispatch (lint / snapshot / diff / users / coverage / init) ──
@@ -68,7 +98,7 @@ def main():
         return _SUBCMDS[sys.argv[1]]()
 
     ap = argparse.ArgumentParser(prog="rlsautotest", description="Generate native pgTAP RLS tests for Supabase/Postgres.")
-    ap.add_argument("--schema", required=True)
+    ap.add_argument("--schema", help="target schema (required unless --supabase, which defaults it to public)")
     ap.add_argument("--table", help="single table; omit (with --emit) to do every RLS table in the schema")
     ap.add_argument("--emit", metavar="DIR", help="write the Supabase suite layout under DIR: native pgTAP into DIR/tests/database/rls/")
     ap.add_argument("--label", help="emit into a named subfolder rls/<label>/ — give each database its own label when generating for several")
@@ -81,6 +111,7 @@ def main():
     ap.add_argument("--no-helpers", action="store_true", help="emit fully self-contained tests (no tests.* helpers / no 000-hook)")
     ap.add_argument("--implicit-deny", action="store_true", help="DEFAULT (kept for compatibility): emit deny tests for commands a table has NO policy for (RLS-on deny-by-default), so CI governs the FULL command matrix and a future too-broad grant/policy fails the suite")
     ap.add_argument("--no-implicit-deny", action="store_true", help="do NOT emit the deny-by-default tests for no-policy commands")
+    ap.add_argument("--supabase", action="store_true", help="Supabase project mode: detect the project via supabase/config.toml, default --schema to public, use the LOCAL supabase DB, and write tests straight into supabase/tests/rls/ with a _rlsautotest.sql suffix (runs under supabase test db; never collides with hand-written tests; re-running prunes its own stale generated output and leaves your hand-written tests untouched)")
     ap.add_argument("--db-url", help="Postgres connection string (else uses PG* env)")
     ap.add_argument("--report", action="store_true", help="run the suite and print the grant/deny coverage matrix")
     ap.add_argument("--report-json", help="write the matrix as JSON to this path")
@@ -97,7 +128,37 @@ def main():
     try: sys.stdout.reconfigure(encoding="utf-8")   # render matrix glyphs on Windows too
     except Exception: pass
     helpers = not a.no_helpers
-    if a.report or a.html or a.emit:
+    # -- Supabase project mode (issue #3): zero-config emit into supabase/tests/rls/ --
+    a._sb_root = None
+    if a.supabase:
+        for _p in [pathlib.Path.cwd(), *pathlib.Path.cwd().parents]:
+            if (_p / "supabase" / "config.toml").is_file():
+                a._sb_root = str(_p); break
+        if a._sb_root is None:
+            ap.error("--supabase: no supabase/config.toml found from the current directory upward; run this from inside your Supabase project")
+        if not a.schema:
+            a.schema = "public"
+        if not a.db_url:
+            # Ask the Supabase CLI for the real local connection string; never hand-build one.
+            # `supabase status -o env` reports the host URL (127.0.0.1:<port>); we skip the
+            # docker-internal db:5432 URL that only resolves inside the container network.
+            import subprocess as _sp, shutil as _sh
+            if not _sh.which("supabase"):
+                ap.error("--supabase: the `supabase` CLI is not on PATH. Install it and run `supabase start`, or pass --db-url with a disposable database copy.")
+            try:
+                _st = _sp.run("supabase status -o env", shell=True, cwd=a._sb_root, capture_output=True, text=True, timeout=60)
+            except Exception as _e:
+                ap.error("--supabase: could not run `supabase status` (%s). Start the local stack with `supabase start`, or pass --db-url." % _e)
+            if _st.returncode != 0:
+                _tail = ((_st.stderr or _st.stdout or "").strip().splitlines() or ["non-zero exit"])[-1]
+                ap.error("--supabase: `supabase status` failed (%s). Start `supabase start`, or pass --db-url with a disposable copy." % _tail)
+            _pick = pick_local_db_url(_st.stdout)
+            if not _pick:
+                ap.error("--supabase: `supabase status` did not report a local database URL. Pass --db-url with a disposable database copy.")
+            a.db_url = _pick   # the LOCAL host URL supabase itself reports; never a linked/remote project
+    if not a.schema:
+        ap.error("--schema is required (use --supabase to default it to public)")
+    if (a.report or a.html or a.emit) and not a.supabase:
         sys.stderr.write(
             "\nWARNING: rlsautotest runs statements against the database in --db-url to probe\n"
             "each policy -- it seeds rows and executes SELECT/INSERT/UPDATE/DELETE. Each probe is\n"
@@ -275,35 +336,58 @@ def main():
                     else:
                         raise
 
-            if not (a.emit or (a.table and (a.flat or a.out or a.setup))):
+            if not (a.emit or a.supabase or (a.table and (a.flat or a.out or a.setup))):
                 # fall through when test files were ALSO requested (--emit, or single-table --flat/--out/--setup
                 # combined with --report/--html: one command produces both, and the gate still exits at the end)
                 sys.exit(report_gate)
-        if a.emit:
-            tdir = os.path.join(a.emit, "tests", "database", "rls", *( [a.label] if a.label else [] ))
-            ddir = os.path.join(a.emit, ".rlsautotest", "debug", *( [a.label] if a.label else [] ))
+        if a.emit or a.supabase:
+            if a.supabase:
+                tdir = os.path.join(a._sb_root, "supabase", "tests", "rls", *( [a.label] if a.label else [] ))
+                ddir = os.path.join(a._sb_root, "supabase", ".rlsautotest", "debug", *( [a.label] if a.label else [] ))
+                _ext = "_rlsautotest.sql"
+                _hook = "000-setup-tests-hooks_rlsautotest.sql"
+            else:
+                tdir = os.path.join(a.emit, "tests", "database", "rls", *( [a.label] if a.label else [] ))
+                ddir = os.path.join(a.emit, ".rlsautotest", "debug", *( [a.label] if a.label else [] ))
+                _ext = ".test.sql"
+                _hook = "000-setup-tests-hooks.sql"
             os.makedirs(tdir, exist_ok=True)
             if a.debug_emitter: os.makedirs(ddir, exist_ok=True)
             if helpers:
-                hookpath = os.path.join(tdir, "000-setup-tests-hooks.sql")
+                hookpath = os.path.join(tdir, _hook)
                 if not os.path.exists(hookpath):   # non-destructive: never clobber an existing hook
                     open(hookpath, "w", encoding="utf-8").write(setup_hook_sql(_basejump_present(cur)))
             guard = emit_rls_guard(cur, a.schema)   # schema-wide "RLS must be enabled" guard
             if guard:
-                open(os.path.join(tdir, "010-rls-enabled.test.sql"), "w", encoding="utf-8").write(guard)
+                open(os.path.join(tdir, "010-rls-enabled" + _ext), "w", encoding="utf-8").write(guard)
             tables = [a.table] if a.table else rls_tables(cur, a.schema)
             for i, t in enumerate(sorted(tables), start=1):
                 ctx = _load_ctx(cur, a.schema, t)
                 flat, nested = _emit_both(a.schema, t, ctx, helpers, conn=conn, implicit_deny=not a.no_implicit_deny, debug=a.debug_emitter)
                 num = f"{100 + i:03d}"
-                open(os.path.join(tdir, f"{num}-rls-{t}.test.sql"), "w", encoding="utf-8").write(flat)
+                open(os.path.join(tdir, f"{num}-rls-{t}" + _ext), "w", encoding="utf-8").write(flat)
                 if nested is not None:
                     open(os.path.join(ddir, f"{t}.debug.sql"), "w", encoding="utf-8").write(nested)
-                print(f"  {a.schema}.{t}: coverage={ctx['cov']}/{ctx['tot']} -> {num}-rls-{t}.test.sql")
+                print(f"  {a.schema}.{t}: coverage={ctx['cov']}/{ctx['tot']} -> {num}-rls-{t}{_ext}")
+            if a.supabase:
+                # Reconcile: this folder holds exactly THIS run's generated files, plus your
+                # hand-written tests (which never carry the suffix). Prune any orphaned
+                # *_rlsautotest.sql a previous run left -- a dropped table, a renumber, an old
+                # schema. Runs AFTER a successful write, so a failed probe never deletes your
+                # suite. The hook is infrastructure the tests depend on, so it is always kept.
+                _keep = supabase_keep_set(_hook, _ext, bool(guard), tables)
+                _pruned = 0
+                for _name in orphans_to_prune(os.listdir(tdir), _keep):
+                    try:
+                        os.remove(os.path.join(tdir, _name)); _pruned += 1
+                    except OSError:
+                        pass
+                if _pruned:
+                    print(f"  reconciled: removed {_pruned} stale generated file(s) no longer part of this run")
             print(f"emitted {len(tables)} test file(s) into:\n  {os.path.abspath(tdir)}")
             if guard:
-                print("  + 010-rls-enabled.test.sql (guard: fails if a reachable table has RLS off)")
-            print(f"run them with:\n  pg_prove -d \"<your copy>\" {os.path.join(tdir, '*.sql')}")
+                print(f"  + 010-rls-enabled{_ext} (guard: fails if a reachable table has RLS off)")
+            print("run them with:\n  supabase test db") if a.supabase else print(f"run them with:\n  pg_prove -d \"<your copy>\" {os.path.join(tdir, '*.sql')}")
             print(f"\n{_TAGLINE} {_TAGLINE2}")
             sys.exit(report_gate)
         if not a.table:

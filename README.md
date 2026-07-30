@@ -101,6 +101,26 @@ Each test is Arrange-Act-Assert: seed as a privileged role (RLS bypassed), act a
 | `--describe` | show the identity classes the generator derived for a table |
 | `doctor` | subcommand: verify the probe environment (role privileges, pgTAP, policy-function ownership); writes `doctor.json` to attach to bug reports |
 
+## Supabase
+
+Working inside a Supabase project? `--supabase` is a zero-config path built for the Supabase CLI:
+
+```bash
+# run from anywhere in your project, with the local stack up:
+supabase start
+rlsautotest --supabase
+supabase test db
+```
+
+In this mode rlsautotest:
+
+- **Finds the project** by walking up for `supabase/config.toml` (so it runs from any subdirectory) and **defaults `--schema` to `public`**.
+- **Reads the database URL from `supabase status`**, the CLI's own reported connection string: the host `127.0.0.1` URL, never the container-internal `db:5432` one. `--db-url` overrides it, and if the local stack isn't running it stops with a clear message.
+- **Writes straight into `supabase/tests/rls/`** (no copy or rename step), one file per table suffixed `_rlsautotest.sql` so they never collide with your hand-written tests. `supabase test db` picks up the nested folder on its own.
+- **Reconciles on every run:** after a successful write it removes only its own stale `*_rlsautotest.sql` files (a dropped or renamed table, an old run) and never a file without that suffix, so regenerating stays clean and your hand-written tests are untouched.
+
+Because it binds to the local, disposable Supabase database, this mode stays quiet: it skips the "point at a disposable copy" warning the general `--db-url` path prints. To target a specific copy instead of the local stack, pass `--db-url`.
+
 ## The report
 
 One grid per table (rows are identities, columns are commands), so it reads like a permissions table:

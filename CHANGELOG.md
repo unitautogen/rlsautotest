@@ -4,6 +4,11 @@ All notable changes to **rlsautotest** are documented here. The format is based 
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and versions
 roughly follow semantic versioning.
 
+## [0.5.0] - 2026-07-30
+
+### Added
+- **`--supabase`: a zero-config mode that emits an RLS suite straight into a Supabase project and runs under `supabase test db`.** rlsautotest finds the project by walking up for `supabase/config.toml` (so it runs from any subdirectory), defaults `--schema` to `public`, and resolves the database URL from the Supabase CLI itself (`supabase status -o env`) instead of assuming one -- it takes the host `127.0.0.1` connection string and never the container-internal `db:5432` one, with `--db-url` still overriding and a clear error if the local stack is not running. Tests are written directly into `supabase/tests/rls/` (no copy or rename step) with a `_rlsautotest.sql` suffix so they never collide with hand-written tests, and `supabase test db` discovers the nested folder on its own. Re-running reconciles by default: after a successful write it removes only its own stale `*_rlsautotest.sql` output (a dropped or renamed table, an old run) and never a file without that suffix, so regeneration stays clean and hand-written tests are untouched. Because the mode binds to the local, disposable Supabase database, it suppresses the "point at a disposable copy" probe warning that the general `--db-url` path prints. (Requested in #3.)
+
 ## [0.4.0] - 2026-07-28
 
 ### Added

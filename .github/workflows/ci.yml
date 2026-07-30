@@ -199,3 +199,35 @@ jobs:
             jq -e --arg t "$safe" 'any(.[]; .table==$t)' "$j" >/dev/null && { echo "FAIL: safe object $safe wrongly flagged"; exit 1; } || true
           done
           echo "OK: bypass-surface lint flagged the doors with correct severity and left the safe objects alone (codes hidden)"
+      - name: Supabase mode - nested layout, reconcile, no probe warning (issue #3)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/app
+        run: |
+          # --supabase writes into <root>/supabase/tests/rls with a _rlsautotest.sql suffix, prunes its own
+          # stale output on re-run, never touches hand-written tests, and prints no probe warning (it binds
+          # to the local disposable stack). Driven with --db-url so no supabase CLI/stack is needed; the
+          # `public` schema (examples/schema.sql) was loaded above and persists in the job's Postgres.
+          proj=$(mktemp -d)
+          mkdir -p "$proj/supabase/tests/rls"
+          printf 'project_id = "ci-test"\n[db]\nport = 54322\n' > "$proj/supabase/config.toml"
+          echo '-- hand-written, must survive'      > "$proj/supabase/tests/rls/keepme.test.sql"
+          echo '-- stale generated, must be pruned'  > "$proj/supabase/tests/rls/999-rls-ghost_rlsautotest.sql"
+          cd "$proj"
+          rlsautotest --supabase --schema public --db-url "$DATABASE_URL" >/tmp/sb.out 2>/tmp/sb.err \
+            || { echo "FAIL: --supabase exited non-zero"; cat /tmp/sb.err; exit 1; }
+          cat /tmp/sb.out
+          if grep -q "WARNING: rlsautotest runs statements" /tmp/sb.err; then
+            echo "FAIL: probe warning printed in --supabase mode"; exit 1; fi
+          ls supabase/tests/rls/*_rlsautotest.sql >/dev/null 2>&1 \
+            || { echo "FAIL: no *_rlsautotest.sql emitted into supabase/tests/rls"; exit 1; }
+          if [ -f supabase/tests/rls/999-rls-ghost_rlsautotest.sql ]; then
+            echo "FAIL: stale orphan not pruned"; exit 1; fi
+          [ -f supabase/tests/rls/keepme.test.sql ] \
+            || { echo "FAIL: hand-written test removed by reconcile"; exit 1; }
+          rc=0
+          for f in supabase/tests/rls/*_rlsautotest.sql; do
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=0 -f "$f" > /tmp/sbtap.txt 2>&1 || true
+            grep -q '^ *not ok' /tmp/sbtap.txt && rc=1 || true
+          done
+          [ "$rc" -eq 0 ] || { echo "FAIL: an emitted --supabase test failed"; exit 1; }
+          echo "OK: --supabase nested layout + reconcile + no-warning all verified"
