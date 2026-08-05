@@ -18,6 +18,9 @@ rlsautotest --db-url "$DATABASE_URL" --schema public --html rls-report.html
 
 # Or: generate a native pgTAP suite to commit and run in CI (pg_prove / supabase test db / psql)
 rlsautotest --db-url "$DATABASE_URL" --schema public --emit supabase/
+
+# Or: audit EVERY RLS schema at once into one interactive dashboard (pick a schema left, its full report right)
+rlsautotest --db-url "$DATABASE_URL" --all-schemas --html rls-report.html
 ```
 
 > âš ï¸ **Point `--db-url` at a disposable copy of your database, never production.** rlsautotest probes each policy by seeding rows and running real `SELECT`/`INSERT`/`UPDATE`/`DELETE`. Every probe is wrapped in a transaction and rolled back (nothing is committed), but the statements do run (table locks, triggers, sequences fire). `--emit`, `--report`, and `--html` all connect and probe; only `--describe` and the static checks (`lint`/`snapshot`/`diff`) just read the catalog.
@@ -96,6 +99,7 @@ Each test is Arrange-Act-Assert: seed as a privileged role (RLS bypassed), act a
 | `--no-helpers` | fully self-contained tests (inline `set_config`/`SET ROLE`, no helper/000 dependency) |
 | `--report` | run the suite and print the per-identity access matrix (`--report-json` for CI) |
 | `--html FILE` | run the suite and write the access matrix as an HTML report |
+| `--all-schemas` | with `--report`/`--html`: scan **every** RLS-bearing schema at once; `--html` writes one combined dashboard (schema picker left, full report right) |
 | `--no-fail` | with `--report`/`--html`: don't exit non-zero on problems (default **does**, for CI gating) |
 | `--table T` | a single table instead of the whole schema |
 | `--describe` | show the identity classes the generator derived for a table |
@@ -119,7 +123,7 @@ In this mode rlsautotest:
 - **Writes straight into `supabase/tests/rls/`** (no copy or rename step), one file per table suffixed `_rlsautotest.sql` so they never collide with your hand-written tests. `supabase test db` picks up the nested folder on its own.
 - **Reconciles on every run:** after a successful write it removes only its own stale `*_rlsautotest.sql` files (a dropped or renamed table, an old run) and never a file without that suffix, so regenerating stays clean and your hand-written tests are untouched.
 
-Because it binds to the local, disposable Supabase database, this mode stays quiet: it skips the "point at a disposable copy" warning the general `--db-url` path prints. To target a specific copy instead of the local stack, pass `--db-url`.
+Because it binds to the local, disposable Supabase database, this mode stays quiet: it skips the "point at a disposable copy" warning the general `--db-url` path prints. To target a specific copy instead of the local stack, pass `--db-url`. For a read-only dashboard across **every** RLS schema in the project (not just `public`), add `--all-schemas --html`: it binds to the same local database and writes the combined report without emitting any test files.
 
 ## The report
 
@@ -136,6 +140,17 @@ anon                             Â·       Â·       Â·       Â·
 `âœ“` = can, `Â·` = blocked. The one thing that lights up red is a `âœ“` where it should be `Â·`: an *authenticated-but-not-authorized* user or *anon* that can act (a security hole). It jumps out without decoding anything. `service_role` is shown for completeness; it bypasses RLS by design. A table with **RLS off** is flagged loud (it has no row-level protection at all).
 
 The identity rows are deliberately worded so they aren't mistaken for database roles: `authenticated, authorized` and `authenticated, not authorized` are the **same Postgres role** (`authenticated`) under different JWT identities/claims. Only `service_role`, `authenticated`, and `anon` are actual Postgres roles. "Authorized" vs "not authorized" is simply whether that identity passes the table's policies (owns the row, is in the right tenant/org, or has the required role).
+
+## Every schema at once
+
+Most runs target one schema (`--schema`). To audit the **whole database** in a single pass, add `--all-schemas`: it discovers every schema that has at least one RLS-enabled table and reports on each exactly as a single-schema run would, so an exposed or RLS-off table in any of them is still caught.
+
+```bash
+# one interactive dashboard for the entire database: pick a schema on the left, its full report on the right
+rlsautotest --db-url "$DATABASE_URL" --all-schemas --html rls-report.html
+```
+
+With `--html` it writes one self-contained page: a schema picker on the left, the selected schema's full report on the right, with each embedded report byte-identical to that schema's own `--html` output. With `--report` it prints each schema's text matrix under a header. The CI exit gate is **aggregated across every schema** (table names schema-qualified), so one leaking or unprotected table anywhere fails the run. Inside a Supabase project, add `--supabase` to bind to the local stack and get the same whole-database dashboard without writing any test files.
 
 ## Beyond the policies: bypass surfaces
 

@@ -455,7 +455,7 @@ def _cmd_dnf(pols, cmd, clause, cur):
     # A policy granted only to service_role (or authenticator / supabase_auth_admin) must NOT create an
     # authenticated/anon class: service_role bypasses RLS and is reported separately, and folding its
     # `USING (true)` in would spawn a bogus "open" branch that a client identity cannot actually use.
-    _client = {"public", "authenticated", "anon"}
+    _client = {"public", "authenticated", "anon", "anonymous"}
     apps = [p for p in pols if p[2].upper() in (cmd, "ALL") and ((not p[3]) or any(r in _client for r in p[3]))]
     perm = [p for p in apps if p[1] == "PERMISSIVE"]
     restr = [p for p in apps if p[1] == "RESTRICTIVE"]
@@ -521,7 +521,7 @@ def analyze(cur, schema, table):
             classes.append(cc)
         per[cmd] = {"classes": classes, "open": is_open, "has_pol": has_pol}
         if cmd == "SELECT":
-            per[cmd]["anon_open"] = any(("public" in (p[3] or []) or "anon" in (p[3] or [])) and _is_true_clause(p[4])
+            per[cmd]["anon_open"] = any(("public" in (p[3] or []) or "anon" in (p[3] or []) or "anonymous" in (p[3] or [])) and _is_true_clause(p[4])
                                         for p in pols if p[2].upper() in ("SELECT", "ALL") and p[1] == "PERMISSIVE")
     notes = []
     for p in pols:

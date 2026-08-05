@@ -48,11 +48,14 @@ def _construct_witness(ctx, expr):
         if o[1] >= 1 and not got_g: grant_v, got_g = cand, True
         elif o[1] == 0 and not got_d: deny_v, got_d = cand, True
         if got_g and got_d: break
-    if not (got_g and got_d):
+    if not (got_g or got_d):
         return None
-    sat = _wv_ctx(); sat["sub"] = _WV_UID; sat["row"][col] = grant_v
-    fal = _wv_ctx(); fal["sub"] = _WV_UID; fal["row"][col] = deny_v
-    return (sat, fal)
+    sat = fal = None
+    if got_g:
+        sat = _wv_ctx(); sat["sub"] = _WV_UID; sat["row"][col] = grant_v
+    if got_d:
+        fal = _wv_ctx(); fal["sub"] = _WV_UID; fal["row"][col] = deny_v
+    return (sat, fal)   # either side may be None: a tautology yields grant-only, an unsatisfiable one deny-only
 
 
 def _search_witness(ctx, expr):
@@ -99,14 +102,111 @@ def _search_witness(ctx, expr):
             elif o[1] == 0 and fal is None: fal = (sub, claimset, combo)
             if sat and fal: break
         if sat and fal: break
-    if not (sat and fal):
+    if not (sat or fal):
         return None
     def _ctx(sub, claimset, combo):
         wctx = _wv_ctx(); wctx["sub"] = sub
         wctx["claims"].extend(claimset)
         for c, v in combo.items(): wctx["row"][c] = v
         return wctx
-    return (_ctx(*sat), _ctx(*fal))
+    return (_ctx(*sat) if sat else None, _ctx(*fal) if fal else None)
+
+
+def _emit_positive_only(ctx, cmd, node, sat):
+    """Satisfy-only floor: a valid row that SATISFIES `node` exists, but no VIOLATING row is constructible
+    (e.g. `owner IS NOT NULL` on a NOT NULL column -> a tautology; the only falsifier, NULL, breaks the
+    constraint). Rather than drop the whole cell to NT, seed the satisfy row and OBSERVE every identity's
+    REAL outcome, baking each (probe-and-bake -> never a guess, never a false pass). SOUND but PARTIAL: the
+    policy's FILTERING boundary is not exercised (we could not construct a row it must hide), so every baked
+    cell is flagged partial=True and the report adds a COVERAGE note. Requires the authorized positive to be
+    DB-confirmed (>=1 / row affected); otherwise bakes nothing and the cell stays NT. Returns True if baked."""
+    conn, q = ctx.conn, ctx.q
+    schema, table = ctx.schema, ctx.table
+    coltypes, enums = ctx.coltypes, ctx.enums
+    fkmap, colsmap, checks, relchecks, compfks = ctx.fkmap, ctx.colsmap, ctx.checks, ctx.relchecks, ctx.compfks
+    body, n, reseed, desc = ctx.body, ctx.n, ctx.reseed, ctx.desc
+    upd_col, _upd_val = ctx.upd_col, ctx.upd_val
+    _BND = " [solver: positive verified; filtering boundary not exercised]"
+    parents, base_row = _mock_valid_row(schema, table, fkmap, colsmap, enums, checks, relchecks, compfks, conn)
+    def rowins(over):
+        rr = dict(base_row); rr.update(over)
+        if not rr:
+            return f"INSERT INTO {q} DEFAULT VALUES"
+        return f"INSERT INTO {q}({', '.join(_qi(c) for c in rr)}) VALUES ({', '.join(rr.values())})"
+    def idsql(claims, gucs):
+        return list(gucs) + [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true)", "SET LOCAL ROLE authenticated"]
+    # materialize the satisfy witness (session claims + row values + aux rows) exactly like solve_emit's ctx_sql
+    base = {"role": sat.get("role", "authenticated")}
+    if sat.get("sub"):
+        base["sub"] = sat["sub"]
+    for keys, val in sat["claims"]:
+        _set_claim(base, keys, val)
+    s_aux = []
+    for a in sat["aux"]:
+        _ensure_table_loaded(conn, a["table"], fkmap, colsmap)
+        s_aux += _aux_row_stmts(conn, a, fkmap, colsmap, enums)
+    s_row = {cc: _wv_lit(coltypes.get(cc, "text"), vv) for cc, vv in sat["row"].items()}
+    s_id = idsql(json.dumps(base), [f"SELECT set_config('{k}', '{v}', true)" for k, v in sat["guc"].items()])
+    other_id = idsql(ctx.NB, [])                                              # a generic DIFFERENT authenticated user
+    anon_id = ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"]
+    def emit(arrange, idsqls, assertion):
+        n[0] += 1
+        body.append("RESET ROLE;")
+        body.extend(s + ";" for s in arrange)
+        body.extend(s + ";" for s in idsqls)
+        body.append(assertion)
+        body.append("RESET ROLE;")
+    if cmd == "SELECT":
+        arr = [f"DELETE FROM {q}"] + parents + s_aux + [rowins(s_row)]
+        ot = _probe(conn, arr, s_id, "read", f"SELECT count(*) FROM {q}")
+        if ot[2] or ot[0] != "count" or ot[1] < 1:
+            return False                                                     # positive not confirmed -> stay NT
+        ctx.observations.append(Observation(cmd="SELECT", ident="authorized", exp=True, partial=True))
+        emit(arr, s_id, f"SELECT is( (SELECT count(*) FROM {q})::int, {ot[1]}, {desc('SELECT: authenticated, authorized sees its row(s)' + _BND)} );")
+        for ident, idsqls in (("other", other_id), ("anon", anon_id)):
+            o = _probe(conn, arr, idsqls, "read", f"SELECT count(*) FROM {q}")
+            if o[2]:
+                continue
+            if o[0] == "count":
+                ctx.observations.append(Observation(cmd="SELECT", ident=ident, exp=(o[1] >= 1), partial=True))
+                emit(arr, idsqls, f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + ident + ' sees ' + str(o[1]) + ' row(s) [solver: positive-only]')} );")
+            else:
+                ctx.observations.append(Observation(cmd="SELECT", ident=ident, exp=False, partial=True))
+                emit(arr, idsqls, f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + ident + ' denied (' + o[1] + ') [solver: positive-only]')} );")
+        body.append(reseed)
+        return True
+    # writes: INSERT / UPDATE / DELETE
+    if cmd == "INSERT":
+        act = rowins(s_row)
+        arr = [f"DELETE FROM {q}"] + parents + s_aux                          # do NOT pre-seed the row the INSERT creates
+    elif cmd == "UPDATE":
+        if not upd_col:
+            return False
+        act = f"UPDATE {q} SET {_qi(upd_col[0])}={_upd_val(upd_col[0], upd_col[1])}"
+        arr = [f"DELETE FROM {q}"] + parents + s_aux + [rowins(s_row)]
+    else:
+        act = f"DELETE FROM {q}"
+        arr = [f"DELETE FROM {q}"] + parents + s_aux + [rowins(s_row)]
+    ot = _probe(conn, arr, s_id, "write", act)
+    if ot[2] or ot[0] != "rows" or ot[1] < 1:
+        return False                                                         # positive not confirmed -> stay NT
+    ctx.observations.append(Observation(cmd=cmd, ident="authorized", exp=True, partial=True))
+    emit(arr, s_id, f"SELECT {'lives_ok' if cmd == 'INSERT' else 'isnt_empty'}( $$ {act}{'' if cmd == 'INSERT' else ' RETURNING 1'} $$, {desc(cmd + ': authenticated, authorized may act' + _BND)} );")
+    for ident, idsqls in (("other", other_id), ("anon", anon_id)):
+        o = _probe(conn, arr, idsqls, "write", act)
+        if o[2]:
+            continue
+        if o[0] == "err":
+            ctx.observations.append(Observation(cmd=cmd, ident=ident, exp=False, partial=True))
+            emit(arr, idsqls, f"SELECT throws_ok( $$ {act} $$, '{o[1]}', NULL, {desc(cmd + ': ' + ident + ' denied (' + o[1] + ') [solver: positive-only]')} );")
+        elif o[0] == "rows" and o[1] >= 1:
+            ctx.observations.append(Observation(cmd=cmd, ident=ident, exp=True, partial=True))
+            emit(arr, idsqls, f"SELECT isnt_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + ident + ' affected ' + str(o[1]) + ' row(s) [solver: positive-only]')} );")
+        else:
+            ctx.observations.append(Observation(cmd=cmd, ident=ident, exp=False, partial=True))
+            emit(arr, idsqls, f"SELECT is_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + ident + ' affects 0 rows [solver: positive-only]')} );")
+    body.append(reseed)
+    return True
 
 
 def solve_emit(ctx, baker, cmd, node=None):
@@ -133,14 +233,28 @@ def solve_emit(ctx, baker, cmd, node=None):
     for expr_node in _cands:
         if expr_node is None:
             continue
-        plan = _solve_predicate(expr_node, coltypes, enums)
-        if not plan or plan[0] is None or plan[1] is None:   # no specific-leaf witness ...
-            plan = _construct_witness(ctx, expr_node)        # ... BL-6 floor: DB-oracle search over a single column ...
-        if not plan or plan[0] is None or plan[1] is None:
-            plan = _search_witness(ctx, expr_node)           # ... BL-11: joint search over (session x multi-column) candidates
-        if not plan or plan[0] is None or plan[1] is None:   # need BOTH a true and a false witness for a grant/deny pair
+        # Try each finder in the old cascade order. The FIRST one that yields a COMPLETE grant/deny pair wins
+        # (verbatim old behavior -> paired cells are byte-identical). If none yields a pair, keep the first
+        # SATISFY-only witness for the positive-only floor below (a tautology / constraint-blocked negation is
+        # still soundly testable on the positive side) instead of dropping the whole cell to NT.
+        sat = fal = None
+        for _mk in (lambda: _solve_predicate(expr_node, coltypes, enums),
+                    lambda: _construct_witness(ctx, expr_node),
+                    lambda: _search_witness(ctx, expr_node)):
+            _r = _mk()
+            if not _r:
+                continue
+            if _r[0] is not None and _r[1] is not None:
+                sat, fal = _r                                # first complete pair -> exactly the old cascade result
+                break
+            if sat is None and _r[0] is not None:
+                sat = _r[0]                                  # remember a satisfy-only witness for the floor
+        if sat is None and fal is None:
             continue
-        sat, fal = plan
+        if fal is None:   # only the positive is constructible -> observe every identity on the satisfy row (sound, partial)
+            if _emit_positive_only(ctx, cmd, expr_node, sat):
+                return True
+            continue
         def ctx_sql(wctx):
             base = {"role": wctx.get("role", "authenticated")}
             if wctx.get("sub"): base["sub"] = wctx["sub"]
@@ -168,6 +282,12 @@ def solve_emit(ctx, baker, cmd, node=None):
             ot = _probe(conn, arr_t, idsql(s_claims, s_gucs), "read", f"SELECT count(*) FROM {q}")
             of = _probe(conn, arr_f, idsql(f_claims, f_gucs), "read", f"SELECT count(*) FROM {q}")
             if ot[2] or of[2] or not (ot[0] == "count" and ot[1] >= 1 and of[0] == "count" and of[1] == 0):
+                # pair not confirmed. If the GRANT side is solid but the DENY side could not be ESTABLISHED
+                # (the falsifier violates a NOT NULL / constraint -> the predicate is a tautology, e.g.
+                # `owner IS NOT NULL` on a NOT NULL column), degrade to the sound positive-only floor
+                # rather than dropping the whole cell to NT.
+                if (not ot[2]) and ot[0] == "count" and ot[1] >= 1 and _emit_positive_only(ctx, cmd, expr_node, sat):
+                    return True
                 continue   # DB didn't confirm the witness (or precondition unreliable) -> try the next policy, else stay NT
             ctx.observations.append(Observation(cmd="SELECT", ident="authorized", exp=True))
             n[0] += 1
@@ -205,6 +325,9 @@ def solve_emit(ctx, baker, cmd, node=None):
         ot = _probe(conn, arr_t, idsql(s_claims, s_gucs), "write", act_t)
         of = _probe(conn, arr_f, idsql(f_claims, f_gucs), "write", act_f)
         if ot[2] or of[2] or not ((ot[0] == "rows" and ot[1] >= 1) and (of[0] == "err" or (of[0] == "rows" and of[1] == 0))):
+            # grant side solid but deny side unestablished (tautological WITH CHECK) -> positive-only floor
+            if (not ot[2]) and ot[0] == "rows" and ot[1] >= 1 and _emit_positive_only(ctx, cmd, expr_node, sat):
+                return True
             continue
         ctx.observations.append(Observation(cmd=cmd, ident="authorized", exp=True))
         n[0] += 1

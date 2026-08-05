@@ -30,7 +30,7 @@ jobs:
           # cd OUTSIDE the source tree so the INSTALLED package is imported, not ./rlsautotest
           cd /tmp
           /tmp/clean/bin/rlsautotest --help
-          /tmp/clean/bin/python -c "import rlsautotest.cli, rlsautotest.emit, rlsautotest.strategies; print('clean-install import OK')"
+          /tmp/clean/bin/python -c "import rlsautotest.cli, rlsautotest.emit, rlsautotest.strategies, rlsautotest.multi; print('clean-install import OK')"
 
   integration:
     runs-on: ubuntu-latest
@@ -231,3 +231,44 @@ jobs:
           done
           [ "$rc" -eq 0 ] || { echo "FAIL: an emitted --supabase test failed"; exit 1; }
           echo "OK: --supabase nested layout + reconcile + no-warning all verified"
+          # --all-schemas composes with --supabase: bind to the local Supabase DB, write the combined
+          # dashboard, and emit NO test files (it is the read-only report path, not the emit path).
+          before=$(ls supabase/tests/rls | wc -l)
+          rlsautotest --supabase --all-schemas --html /tmp/sb_all.html --db-url "$DATABASE_URL" --no-fail > /tmp/sball.out 2>&1 \
+            || { echo "FAIL: --supabase --all-schemas exited non-zero"; cat /tmp/sball.out; exit 1; }
+          grep -q 'const REPORTS' /tmp/sb_all.html || { echo "FAIL: --supabase --all-schemas wrote no dashboard"; exit 1; }
+          if grep -q "WARNING: rlsautotest runs statements" /tmp/sball.out; then echo "FAIL: probe warning printed in --supabase --all-schemas mode"; exit 1; fi
+          after=$(ls supabase/tests/rls | wc -l)
+          [ "$before" -eq "$after" ] || { echo "FAIL: --all-schemas dashboard emitted test files into the project"; exit 1; }
+          echo "OK: --supabase --all-schemas built the combined dashboard from the local DB and wrote no test files"
+      - name: --all-schemas builds one combined dashboard and aggregates the gate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/app
+        run: |
+          # By now the job's app DB holds the whole example corpus: the ~22 green schemas PLUS the
+          # deliberately-bad ones earlier steps loaded (transitions = cross-policy WITH CHECK leak,
+          # seedimpossible = un-seedable / UNRELIABLE). --all-schemas must (a) discover every RLS-bearing
+          # schema and embed each one's EXACT single-schema report into ONE combined HTML, and (b) aggregate
+          # the CI gate across all of them: with bad schemas present the gate MUST fail, --no-fail suppresses it.
+          rlsautotest --db-url "$DATABASE_URL" --all-schemas --html /tmp/all.html --no-fail > /tmp/all.out 2>&1 \
+            || { echo "FAIL: --all-schemas --no-fail should exit 0"; cat /tmp/all.out; exit 1; }
+          cat /tmp/all.out
+          grep -q 'const REPORTS' /tmp/all.html || { echo "FAIL: combined HTML embedded no reports"; exit 1; }
+          buttons=$(grep -o 'class="item"' /tmp/all.html | wc -l)
+          echo "discovered schemas (picker buttons): $buttons"
+          [ "$buttons" -ge 20 ] || { echo "FAIL: expected >=20 schemas in the dashboard, got $buttons"; exit 1; }
+          grep -q 'data-s="rbac"' /tmp/all.html || { echo "FAIL: green schema rbac missing from the dashboard"; exit 1; }
+          grep -q 'data-s="transitions"' /tmp/all.html || { echo "FAIL: leaking schema transitions missing from the dashboard"; exit 1; }
+          python -c "import sys; sys.exit(1 if '\u2014' in open('/tmp/all.html', encoding='utf-8').read() else 0)" \
+            || { echo "FAIL: an em-dash leaked into the combined report"; exit 1; }
+          # The embedded per-schema report must be BYTE-IDENTICAL to a standalone single-schema run: the
+          # dashboard is a faithful container, it never alters the report it wraps.
+          rlsautotest --db-url "$DATABASE_URL" --schema rbac --html /tmp/rbac_single.html --no-fail > /dev/null 2>&1
+          python -c "import base64,json,re,sys; d=open('/tmp/all.html',encoding='utf-8').read(); r=json.loads(re.search(r'const REPORTS = (\{.*\});',d).group(1)); emb=base64.b64decode(r['rbac']).decode('utf-8'); s=open('/tmp/rbac_single.html',encoding='utf-8').read(); print('OK: embedded rbac == standalone rbac' if emb==s else 'FAIL: embedded rbac differs from standalone'); sys.exit(0 if emb==s else 1)"
+          # Without --no-fail the aggregate gate MUST fail because transitions leaks and seedimpossible is UNRELIABLE.
+          rc=0
+          rlsautotest --db-url "$DATABASE_URL" --all-schemas --report > /tmp/allg.txt 2>&1 || rc=$?
+          cat /tmp/allg.txt
+          [ "$rc" -ne 0 ] || { echo "FAIL: aggregate gate did not fail with known-bad schemas present"; exit 1; }
+          grep -q 'transitions\.' /tmp/allg.txt || { echo "FAIL: aggregate gate did not name the leaking transitions table"; exit 1; }
+          echo "OK: --all-schemas combined dashboard + aggregate gate verified (suppressed by --no-fail, fails without it)"

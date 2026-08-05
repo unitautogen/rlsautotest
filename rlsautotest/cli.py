@@ -24,7 +24,7 @@ import psycopg
 # `from rlsautotest.cli import X` keeps working for tests and downstream users.
 from .astutil import ORDER, _CMDS4, _HOME, _TAGLINE, _TAGLINE2, _and_conjuncts, _array_consts, _bool_extra, _claim_paths, _colname, _colqual, _const, _eq_pairs, _expr_cols, _expr_consts, _find_queries, _is_func, _is_true_clause, _is_uuid, _jwt_anywhere, _jwt_keys, _list_consts, _names, _not, _qlit, _split_statements, _sq, _t, _unwrap, _v, _where  # noqa: F401
 from .values import CV, FOREIGN, FUTURE_EXP, INS, MV, NOBODY, RIVAL_ORG, RIVAL_SUB, _CASTABLE_CACHE, _bump_lit, _castable_lit, _lit, _nonempty_array_lit  # noqa: F401
-from .catalog import _FK_SQL, _action_table, _basejump_present, _check_bool_udfs, _columns, _constraint_meta, _effective_grants, _exposed, _fk_by_name, _fk_of, all_tables, rls_tables  # noqa: F401
+from .catalog import _FK_SQL, _action_table, _basejump_present, _check_bool_udfs, _columns, _constraint_meta, _effective_grants, _exposed, _fk_by_name, _fk_of, all_tables, auth_profile, rls_tables  # noqa: F401
 from .bypass import find_bypass, finding_type  # noqa: F401
 from .atoms import _DNF_BUDGET, _check_value_set, _classify_aexpr, _cmd_dnf, _dnf_ast, _folder_owner, _func_selects, _introspect_claim_fn, _introspect_rbac, _membership, _scalar_lookup, _set_claim, analyze, build_class, classify_node  # noqa: F401
 from .witness import _WV_UID, _array_elem_type, _candidate_sessions, _candidate_values, _class_pick, _col_textfn, _flip_first, _flip_last, _fn_preimage, _like_match, _pg_array_literal, _range_witness, _regex_match, _side_role, _solve_array, _solve_between, _solve_eq, _solve_fncol_eq, _solve_fncol_preimage, _solve_ineq, _solve_jsonb, _solve_leaf, _solve_node, _solve_pattern, _solve_predicate, _solve_subquery, _subquery_tables, _wv_ctx, _wv_lit, _wv_merge, _wv_other, _wv_some  # noqa: F401
@@ -99,6 +99,7 @@ def main():
 
     ap = argparse.ArgumentParser(prog="rlsautotest", description="Generate native pgTAP RLS tests for Supabase/Postgres.")
     ap.add_argument("--schema", help="target schema (required unless --supabase, which defaults it to public)")
+    ap.add_argument("--all-schemas", action="store_true", help="scan EVERY RLS-bearing schema and (with --html) write ONE combined dashboard: pick a schema on the left, its full report shows on the right. Use with --report and/or --html (optionally with --supabase to bind to the local Supabase database); not combined with --table/--emit/--as-user/--report-json.")
     ap.add_argument("--table", help="single table; omit (with --emit) to do every RLS table in the schema")
     ap.add_argument("--emit", metavar="DIR", help="write the Supabase suite layout under DIR: native pgTAP into DIR/tests/database/rls/")
     ap.add_argument("--label", help="emit into a named subfolder rls/<label>/ — give each database its own label when generating for several")
@@ -156,8 +157,14 @@ def main():
             if not _pick:
                 ap.error("--supabase: `supabase status` did not report a local database URL. Pass --db-url with a disposable database copy.")
             a.db_url = _pick   # the LOCAL host URL supabase itself reports; never a linked/remote project
-    if not a.schema:
-        ap.error("--schema is required (use --supabase to default it to public)")
+    if not a.schema and not a.all_schemas:
+        ap.error("--schema is required (use --supabase to default it to public, or --all-schemas to scan every RLS-bearing schema)")
+    if a.all_schemas:
+        _bad = [nm for nm, on in (("--table", a.table), ("--emit", a.emit), ("--as-user", a.as_user), ("--report-json", a.report_json)) if on]
+        if _bad:
+            ap.error("--all-schemas cannot be combined with " + ", ".join(_bad) + " (it scans the whole database and writes one combined report)")
+        if not (a.report or a.html):
+            ap.error("--all-schemas needs --html PATH (combined dashboard) and/or --report (per-schema text)")
     if (a.report or a.html or a.emit) and not a.supabase:
         sys.stderr.write(
             "\nWARNING: rlsautotest runs statements against the database in --db-url to probe\n"
@@ -190,6 +197,9 @@ def main():
                 print("DB-verified grant/deny for them at --report/--emit time; run --report to see which stay '-'.")
             return
         if a.report or a.html:
+            if a.all_schemas:
+                from .multi import run_all_schemas
+                run_all_schemas(conn, cur, a, helpers)   # discovers every RLS schema, renders, sys.exit()s
             if a.table:
                 cur.execute("""SELECT c.relrowsecurity, EXISTS(SELECT 1 FROM pg_policy p WHERE p.polrelid=c.oid)
                     FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relname=%s""",
@@ -202,6 +212,7 @@ def main():
             def _probe_one(t_tuple, conn_=None, cur_=None):
                 cn, cr = (conn_ or conn), (cur_ or cur)
                 t, rls_on, has_pol = t_tuple
+                prof = auth_profile(cr, a.schema)
                 if rls_on and has_pol:
                     rep = _table_report(cr, cn, a.schema, t, helpers)
                 else:
@@ -209,12 +220,14 @@ def main():
                     if rls_on and not has_pol:   # RLS on, zero policies = deny-all to client roles (safe if intentional, else unintentionally inaccessible)
                         fg.append("RLS is ENABLED but NO POLICY is defined -> every client role (anon/authenticated) is denied ALL access. Safe if intentional (deny-all); otherwise the table is unintentionally inaccessible -> add a policy.")
                     rep = {"table": t, "rls_enabled": rls_on, "policied": [], "cells": {}, "footguns": fg, "coverage": [0, 0]}
+                rep["auth"] = prof
                 rep["has_policy"] = has_pol
                 rep["exposed"] = (not rls_on) and _exposed(cr, a.schema, t)
                 rep["grants"] = _effective_grants(cr, a.schema, t)   # per-command grants for ALL roles (incl service_role) — every cell is grant-gated
                 from .colsec import column_security
                 _cust = sorted({i[5:] for cm in rep.get("idgrid", {}).values() for i in cm if isinstance(i, str) and i.startswith("role:")})
-                rep["column_security"] = column_security(cr, a.schema, t, ["service_role", "authenticated", "anon"] + _cust)
+                _cls_roles = ([prof["service_role"]] if prof["service_role"] else []) + ["authenticated", prof["unauth"]]
+                rep["column_security"] = column_security(cr, a.schema, t, _cls_roles + _cust)
                 return rep
 
             n_parallel = max(1, getattr(a, "parallel", 1))
@@ -283,7 +296,11 @@ def main():
                     for (c, s, o, _d, m) in bypass_findings]}
                 open(a.report_json, "w", encoding="utf-8").write(json.dumps(_jsonable(_payload), indent=2))
             if a.html:
-                open(a.html, "w", encoding="utf-8").write(render_report_html(reps_display, a.schema, bypass_findings))
+                try:
+                    cur.execute("SELECT current_database()"); _dbname = cur.fetchone()[0]
+                except Exception:
+                    _dbname = None
+                open(a.html, "w", encoding="utf-8").write(render_report_html(reps_display, a.schema, bypass_findings, db=_dbname))
                 _abs = os.path.abspath(a.html)
                 print(f"HTML report for {len(reps_display)} table(s) written to:\n  {_abs}")
                 try:    # clickable file:// URL in most terminals
@@ -304,7 +321,7 @@ def main():
                 if exposed_any: bits.append(f"{len(exposed_any)} exposed table(s): {', '.join(exposed_any)}")
                 if holes_any:   bits.append(f"{len(holes_any)} table(s) with policy holes/failures: {', '.join(holes_any)}")
                 if broken_any:  bits.append(f"{len(broken_any)} broken/unreadable table(s): {', '.join(broken_any)}")
-                if leak_any:    bits.append(f"{len(leak_any)} table(s) with cross-policy WITH CHECK leaks: {', '.join(leak_any)}")
+                if leak_any:    bits.append(f"{len(leak_any)} table(s) with cross-policy RLS leaks (read and/or WITH CHECK write): {', '.join(leak_any)}")
                 if unreliable_any: bits.append(f"{len(unreliable_any)} table(s) with UNRELIABLE tests (seed/precondition failed): {', '.join(unreliable_any)}")
                 print("\nFAIL: " + "; ".join(bits) + ("" if a.no_fail else "  (exit 1 — CI gate; pass --no-fail to suppress)"))
                 report_gate = 0 if a.no_fail else 1

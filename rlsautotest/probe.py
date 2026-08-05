@@ -154,7 +154,7 @@ class ProbeBaker:
         c = self.ctx
         sx = c.deny_stmt.get(cmd)
         if not sx: return
-        c.observations.append(Observation(cmd=cmd, ident=("anon" if role == "anon" else "authorized"), exp=False))
+        c.observations.append(Observation(cmd=cmd, ident=("anon" if role in ("anon", "anonymous") else "authorized"), exp=False))
         a = f"SELECT throws_ok( $$ {sx} $$, '42501', NULL, {c.desc(cmd + ': ' + who + ' has no grant - denied')} );"
         (self.read_test if cmd == "SELECT" else self.mut_test)(cjson, role, a)
 

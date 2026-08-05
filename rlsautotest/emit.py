@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from .astutil import _CMDS4, _TAGLINE, _TAGLINE2, _expr_cols, _qi, _split_statements, _sq, _where
 from .values import CV, FOREIGN, FUTURE_EXP, INS, MV, NOBODY, RIVAL_SUB
-from .catalog import _FK_SQL, _columns, _constraint_meta, _effective_grants, _exposed, all_tables
+from .catalog import _FK_SQL, _columns, _constraint_meta, _effective_grants, _exposed, all_tables, auth_profile
 from .atoms import _check_value_set, analyze
 from .probe import ProbeBaker, _probe, _update_selfassign_retry
 from .seeding import _seed_plan, _synthesize_row, _wrap_seed
@@ -113,6 +113,7 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
         # every emitted assertion is observed against the real database first — never fabricated.
         raise ValueError("emit_flat requires a live database connection (--db-url or PG* env): "
                          "tests are probe-and-baked, not guessed")
+    _authp = auth_profile(conn.cursor(), schema)   # catalog-discovered client-role model (authenticated / unauth / optional bypass)
     S = _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks, cuniques, relchecks, compfks, conn=conn)
     q = S["q"]; seed = S["seed"]; total_rows = S["total_rows"]
     insert_plan = S["insert_plan"]; nobody_ins = S["nobody_ins"]; fill = S["fill"]
@@ -162,6 +163,8 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                       colsmap=colsmap, enums=enums, unique_cols=unique_cols, checks=checks,
                       cuniques=cuniques, relchecks=relchecks, compfks=compfks, helpers=helpers,
                       gmap=grants_map or {}, conn=conn, q=q, S=S, seed=seed, total_rows=total_rows,
+                      unauth_role=_authp["unauth"], emit_service_role=(_authp["service_role"] is not None),
+                      service_role_name=(_authp["service_role"] or "service_role"),
                       insert_plan=insert_plan, nobody_ins=nobody_ins, fill=fill, rowlinked=rowlinked,
                       seed_fn_mock=_seed_fn_mock, NB=NB, body=body, n=n,
                       observations=(obs_out if obs_out is not None else []))
@@ -288,7 +291,7 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
             if not handled and not classes and not udfs and not per.get(cmd, {}).get("classes"):
                 _ncur = conn.cursor()
                 _ncur.execute("""SELECT count(*) FROM pg_policies WHERE schemaname=%s AND tablename=%s
-                    AND cmd IN (%s,'ALL') AND roles && ARRAY['public','authenticated','anon']::name[]""",
+                    AND cmd IN (%s,'ALL') AND roles && ARRAY['public','authenticated','anon','anonymous']::name[]""",
                               (schema, table, cmd))
                 if _ncur.fetchone()[0] == 0:
                     _nwho = "authenticated, authorized (no policy for this command grants any client)"
@@ -311,7 +314,7 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                             if not o[2] and _deny:
                                 mut_test(NB, "authenticated", baker.write_assert(o, cmd, _nact, _nwho, ident="authorized"))
             for who, cjson, role, c in identities(classes):
-                _oid = role if role in ("anon", "service_role") else ("authorized" if c is not None else "other")
+                _oid = "anon" if role in ("anon", "anonymous", _authp["unauth"]) else ("service_role" if role == (_authp["service_role"] or "service_role") else ("authorized" if c is not None else "other"))
                 _wcj = cjson   # the identity that performs the WRITE (a fresh identity for unique-owner INSERTs)
                 if cmd == "SELECT":
                     o = _probe(conn, arrange_stmts, pident(cjson, role), "read", f"SELECT count(*) FROM {q}")
@@ -396,8 +399,8 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
         # constraint error (our own malformed action) is skipped, never asserted.
         if implicit_deny:
             for cmd in [c for c in _CMDS4 if c not in (set(cmds) | _pol)]:
-                for who, role, cj0 in [("authenticated, no policy", "authenticated", NB), ("anon, no policy", "anon", "")]:
-                    _iid = "anon" if role == "anon" else "authorized"
+                for who, role, cj0 in [("authenticated, no policy", "authenticated", NB), (_authp["unauth"] + ", no policy", _authp["unauth"], "")]:
+                    _iid = "anon" if role in ("anon", "anonymous") else "authorized"
                     if cmd == "SELECT":
                         o = _probe(conn, arrange_stmts, pident(cj0, role), "read", f"SELECT count(*) FROM {q}")
                         if o[2]:
@@ -437,7 +440,8 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
     # command, so the matrix parser ignores these lines).
     try:
         from .colsec import column_security as _cls_colsec, cls_assertions as _cls_asserts
-        _cls_cells = _cls_colsec(conn.cursor(), schema, table, ["service_role", "authenticated", "anon"]).get("cells", {})
+        _cls_roles = ([_authp["service_role"]] if _authp["service_role"] else []) + ["authenticated", _authp["unauth"]]
+        _cls_cells = _cls_colsec(conn.cursor(), schema, table, _cls_roles).get("cells", {})
         for _ca in _cls_asserts(schema, table, _cls_cells):
             n[0] += 1
             body.append(_ca["sql"])

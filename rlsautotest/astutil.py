@@ -46,9 +46,23 @@ def _unwrap(n):
 
 
 
+_FN_ALIASES = {
+    # identity + claims accessors that mean the SAME THING across auth providers, so the whole
+    # classifier recognizes both without any per-call-site changes:
+    #   Supabase auth.uid()  == Neon auth.user_id()  (the caller's identity)
+    #   Supabase auth.jwt()  == Neon auth.session()  (the verified claims object; pg_session_jwt)
+    "auth.uid": ("auth.uid", "auth.user_id"),
+    "auth.jwt": ("auth.jwt", "auth.session"),
+}
+
+
 def _is_func(n, fq):
     n = _unwrap(n)
-    return _t(n) == "FuncCall" and _names(_v(n).get("funcname")) == fq
+    if _t(n) != "FuncCall":
+        return False
+    name = _names(_v(n).get("funcname"))
+    alias = _FN_ALIASES.get(fq)
+    return (name in alias) if alias else (name == fq)
 
 
 

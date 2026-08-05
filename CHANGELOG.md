@@ -4,6 +4,11 @@ All notable changes to **rlsautotest** are documented here. The format is based 
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and versions
 roughly follow semantic versioning.
 
+## [0.6.0] - 2026-08-05
+
+### Added
+- **`--all-schemas`: audit every RLS-bearing schema in the database in one run and, with `--html`, produce a single combined dashboard.** rlsautotest normally targets one schema per run (`--schema`); `--all-schemas` discovers every schema that owns at least one RLS-enabled table (sorted, system schemas excluded) and probes each exactly as a single-schema run does, so an exposed or RLS-off table inside any of those schemas is still caught. With `--html` it stitches the per-schema reports into one interactive page: a schema picker on the left, the selected schema's full report on the right. Each embedded report is byte-identical to that schema's own `--schema <s> --html` output -- the dashboard is a faithful container, never a re-render. The CI exit gate is aggregated across every scanned schema (table names schema-qualified), and `--report` prints each schema's text report under a header. With `--supabase` it binds to the local Supabase database (resolved the same way `--supabase` resolves it) and produces the whole-database dashboard without writing any test files. The mode is read-only orchestration over the existing probe and report; it does not combine with `--table` / `--emit` / `--as-user` / `--report-json`, and needs `--report` and/or `--html`.
+
 ## [0.5.0] - 2026-07-30
 
 ### Added

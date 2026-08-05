@@ -30,6 +30,8 @@ class Observation:
     exp: bool = True         # the OBSERVED outcome baked into the assertion (can=True / blocked=False)
     kind: str = "cell"
     mocked: bool = False
+    partial: bool = False    # positive-only cell: access was OBSERVED, but the policy's FILTERING boundary was
+                             # not exercised (no violating row could be constructed) -> report adds a coverage note
 
 
 @dataclass
@@ -52,6 +54,9 @@ class EmitContext:
     relchecks: dict = None
     compfks: dict = None
     helpers: bool = True
+    unauth_role: str = "anon"          # the unauthenticated client role, catalog-discovered ('anon' | 'anonymous' | custom)
+    emit_service_role: bool = True     # emit the RLS-bypass identity row (only when the DB actually has a rolbypassrls client role)
+    service_role_name: str = "service_role"   # the discovered bypass role's name (Supabase 'service_role'; a generic DB's may differ)
     gmap: dict = None                  # real effective grants {(role, cmd): bool}
     conn: Any = None
     # ---- seed plan (from _seed_plan) ----
@@ -88,10 +93,10 @@ class EmitContext:
         return self.umap[sub]
 
     def ident(self, cjson, role):
-        if role == "service_role":
-            return ["SELECT tests.authenticate_as_service_role();"] if self.helpers else ["SELECT set_config('request.jwt.claims', '', true);", "SET LOCAL ROLE service_role;"]
-        if role == "anon" or cjson == "":
-            return ["SELECT tests.clear_authentication();"] if self.helpers else ["SELECT set_config('request.jwt.claims', '', true);", "SET LOCAL ROLE anon;"]
+        if role == self.service_role_name:
+            return ["SELECT tests.authenticate_as_service_role();"] if self.helpers else ["SELECT set_config('request.jwt.claims', '', true);", f"SET LOCAL ROLE {role};"]
+        if role == "anon" or role == "anonymous" or cjson == "":
+            return ["SELECT tests.clear_authentication();"] if self.helpers else ["SELECT set_config('request.jwt.claims', '', true);", f"SET LOCAL ROLE {role};"]
         if self.helpers:
             d = json.loads(cjson)
             if set(d) <= {"sub", "role"} and d.get("role") == "authenticated" and d.get("sub") and _is_uuid(d["sub"]):
@@ -121,7 +126,7 @@ class EmitContext:
         # 'authenticated, authorized/not authorized' = same `authenticated` role, different JWT claims.
         # service_role FIRST: the report's top row becomes a TESTED observation (probe-and-baked
         # like every other row), not a grants-map inference — every report cell has a test behind it.
-        out = [("service_role", "", "service_role", None)]
+        out = [(self.service_role_name, "", self.service_role_name, None)] if self.emit_service_role else []
         out += [(f"authenticated, authorized (branch {c['idx']})", self.cj(c), "authenticated", c) for c in classes]
         # negative control: a legitimate user of a DIFFERENT tenant when the table is tenant/membership-scoped,
         # else a generic other authenticated user (NOBODY).
@@ -129,7 +134,7 @@ class EmitContext:
             out.append(("authenticated, not authorized (other tenant)", self.S["rival"]["claims"], "authenticated", None))
         else:
             out.append(("authenticated, not authorized", self.NB, "authenticated", None))
-        out.append(("anon", "", "anon", None))
+        out.append((self.unauth_role, "", self.unauth_role, None))
         return out
 
     @staticmethod

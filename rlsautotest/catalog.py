@@ -183,6 +183,65 @@ def _basejump_present(cur):
 
 
 
+def auth_profile(cur, schema):
+    """DISCOVER this schema's client-role model from the catalog -- provider-agnostic, no brand switch.
+
+    The engine needs three role slots: the authenticated client, the unauthenticated (public) client, and
+    an OPTIONAL RLS-bypass role. Instead of branching on "is this Supabase/Neon", it discovers them:
+
+      * client roles = non-superuser roles that are NOLOGIN (assumed via SET ROLE, the PostgREST model) OR
+        referenced by a policy here, AND are actually GRANTED table access in THIS schema. Schema-scoped, so
+        a role that merely EXISTS on a shared cluster (an unrelated database's anon/service_role) is ignored;
+        connection/owner login roles are excluded.
+      * bypass role   = the client role carrying rolbypassrls (Supabase's service_role has it; Neon has none;
+        a generic database has one only if it defined one). Emitted as the top row IFF present.
+      * authenticated = the conventional `authenticated` role (Supabase/Neon/PostgREST/pg_session_jwt all use
+        it), else a policy-referenced client role, else the sole client role.
+      * unauth        = the conventional `anon`/`anonymous`, else a granted client role no policy scopes to.
+
+    Yields Supabase's (service_role, authenticated, anon) and Neon's (authenticated, anonymous) with zero
+    brand logic, and understands an unknown provider on its own terms. `flavor` is derived from the identity/
+    claims function VOCABULARY and is ADVISORY only (for provider quirks like the helper shim), never a gate.
+    Returns role NAMES; `service_role` is None when no bypass role is reachable here."""
+    cur.execute("""
+        WITH sc AS (SELECT oid FROM pg_namespace WHERE nspname = %s),
+        polr AS (
+            SELECT DISTINCT t.roid AS roid
+            FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid,
+                 LATERAL unnest(p.polroles) AS t(roid)
+            WHERE c.relnamespace = (SELECT oid FROM sc)
+        )
+        SELECT r.rolname, r.rolbypassrls, (r.oid IN (SELECT roid FROM polr)) AS in_policy
+        FROM pg_roles r
+        WHERE NOT r.rolsuper AND left(r.rolname, 3) <> 'pg_'
+          AND has_schema_privilege(r.oid, (SELECT oid FROM sc), 'USAGE')
+          AND (NOT r.rolcanlogin OR r.oid IN (SELECT roid FROM polr))
+          AND EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM sc) AND c.relkind = 'r'
+                        AND (has_table_privilege(r.oid, c.oid, 'SELECT') OR has_table_privilege(r.oid, c.oid, 'INSERT')
+                             OR has_table_privilege(r.oid, c.oid, 'UPDATE') OR has_table_privilege(r.oid, c.oid, 'DELETE')))
+        ORDER BY r.rolname
+    """, (schema,))
+    client = cur.fetchall()                                   # [(rolname, rolbypassrls, in_policy)]
+    bypass = next((n for (n, b, _ip) in client if b), None)   # rolbypassrls role (Supabase service_role); else None
+    rest = [(n, ip) for (n, b, ip) in client if n != bypass]
+    names = [n for (n, _ip) in rest]
+    if "authenticated" in names:
+        authed = "authenticated"
+    else:
+        authed = next((n for (n, ip) in rest if ip), None) or (names[0] if names else "authenticated")
+    unauth = next((n for n in ("anon", "anonymous") if n in names), None)
+    if unauth is None:
+        unauth = next((n for (n, ip) in rest if n != authed and not ip), None)
+    if unauth is None:
+        unauth = next((n for n in names if n != authed), "anon")
+    cur.execute("SELECT (to_regprocedure('auth.user_id()') IS NOT NULL OR to_regprocedure('auth.session()') IS NOT NULL), "
+                "(to_regprocedure('auth.uid()') IS NOT NULL OR to_regprocedure('auth.jwt()') IS NOT NULL)")
+    neon_fns, sb_fns = cur.fetchone()
+    flavor = "neon" if (neon_fns and not sb_fns) else ("supabase" if sb_fns else "generic")
+    return {"flavor": flavor, "authenticated": authed, "unauth": unauth, "service_role": bypass}
+
+
+
 def rls_tables(cur, schema):
     """Every RLS-enabled table in the schema that has at least one policy (test-generation targets)."""
     cur.execute("""SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -205,7 +264,7 @@ def all_tables(cur, schema):
 
 def _exposed(cur, schema, table):
     """True if anon/authenticated holds any table privilege (i.e. RLS-off here = readable/writable via API)."""
-    cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('anon','authenticated')")
+    cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('anon','anonymous','authenticated')")
     roles = [r[0] for r in cur.fetchall()]
     for role in roles:
         cur.execute("SELECT bool_or(has_table_privilege(%s, format('%%I.%%I', %s::text, %s::text), priv)) FROM unnest(ARRAY['SELECT','INSERT','UPDATE','DELETE']) AS priv",
@@ -219,10 +278,10 @@ def _exposed(cur, schema, table):
 def _effective_grants(cur, schema, table):
     """Real effective table access for the client roles: schema USAGE AND the per-command table privilege.
     Reads the catalog (no mutation). A missing grant => that command is denied regardless of RLS."""
-    cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('authenticated','anon','service_role')")
+    cur.execute("SELECT rolname FROM pg_roles WHERE rolname IN ('authenticated','anon','anonymous','service_role')")
     present = {r[0] for r in cur.fetchall()}
     g = {}
-    for role in ("authenticated", "anon", "service_role"):
+    for role in ("authenticated", "anon", "anonymous", "service_role"):
         if role not in present:
             for cmd in _CMDS4: g[(role, cmd)] = False
             continue
