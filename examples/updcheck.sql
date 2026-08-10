@@ -15,9 +15,10 @@
 --       NOT NULL look-ahead column blocks seeding entirely, so even SET code = DEFAULT has no row to touch.)
 --   t3  no policy-neutral column, but the policy column is plain (non-unique) -> self-assign the policy
 --       column (SET owner_id = owner_id) proves the UPDATE permission + policy re-check -> GREEN
---   t4  nothing self-assignable either (identity PK + UNIQUE policy column) -> UPDATE is an explained "-",
---       never silent (the report notes "no policy-neutral column")
--- A GREEN example: the report gate MUST exit 0 (every cell is a real pass or an explained dash).
+--   t4  identity PK + a UNIQUE policy column -> self-assign the unique column (SET owner_id = owner_id cannot
+--       collide with another row, so it is safe) -> UPDATE is probed GREEN too (0.7.0). Before 0.7.0 the
+--       self-assign fallback excluded unique columns, so this was an explained "no policy-neutral column" dash.
+-- A GREEN example: the report gate MUST exit 0 (every cell is a real pass).
 drop schema if exists updcheck cascade;
 create schema updcheck;
 grant usage on schema updcheck to anon, authenticated, service_role;

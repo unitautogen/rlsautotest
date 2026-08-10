@@ -143,9 +143,10 @@ jobs:
           # updcheck stresses the UPDATE probe's SET-a-neutral-column path: t1 (value-set CHECK -> valid value
           # -> green), t2 (a format CHECK the checkwitness seeder now satisfies BY CONSTRUCTION, so the UPDATE is
           # really probed and is GREEN -- same story as seedfail; the stable un-seedable negative lives in
-          # seedimpossible.sql / CHECK(false)), t3 (self-assign fallback -> green), t4 (no neutral column AND
-          # nothing self-assignable -> explained '-' coverage gap, never a silent pass). So the gate stays GREEN
-          # (exit 0) and the t4 no-neutral-column note must still appear.
+          # seedimpossible.sql / CHECK(false)), t3 (self-assign fallback -> green), t4 (identity PK + a UNIQUE
+          # policy column -> self-assign the unique column, which cannot collide with another row, so the UPDATE
+          # is now probed GREEN too, 0.7.0). So the gate stays GREEN (exit 0) and the old t4 no-neutral-column
+          # dash must NO LONGER appear.
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/updcheck.sql
           rc=0
           rlsautotest --db-url "$DATABASE_URL" --schema updcheck --report > /tmp/uc.txt 2>&1 || rc=$?
@@ -154,8 +155,8 @@ jobs:
             echo "FAIL: updcheck should be GREEN (checkwitness seeds t2's format CHECK by construction) but the gate exited $rc"
             exit 1
           fi
-          grep -q "no policy-neutral column" /tmp/uc.txt || { echo "FAIL: expected the explained '-' note (t4: no policy-neutral column to modify)"; exit 1; }
-          echo "OK: UPDATE probe correctness held (t1/t2/t3 green with valid SET values, t4 no-neutral-column dash explained)"
+          if grep -q "no policy-neutral column" /tmp/uc.txt; then echo "FAIL: t4 should now be probed via unique-column self-assign (0.7.0), not left as a no-neutral-column dash"; exit 1; fi
+          echo "OK: UPDATE probe correctness held (t1/t2/t3 green; t4's unique policy column self-assigned and probed, no dash)"
       - name: Implicit-deny (--implicit-deny) governs the full command matrix (examples/witness_himed.sql)
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost/app
