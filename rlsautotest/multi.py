@@ -62,13 +62,14 @@ def _probe_schema(conn, cur, a, schema, helpers):
     single-schema run would produce for this schema.
     """
     tabs = all_tables(cur, schema)
+    from .cli import _sanctioned_cmds_for   # MB-25: resolve sanctioned UNRELIABLE cells (lazy import avoids a cli<->multi cycle)
 
     def _probe_one(t_tuple, conn_=None, cur_=None):
         cn, cr = (conn_ or conn), (cur_ or cur)
         t, rls_on, has_pol = t_tuple
         prof = auth_profile(cr, schema)
         if rls_on and has_pol:
-            rep = _table_report(cr, cn, schema, t, helpers)
+            rep = _table_report(cr, cn, schema, t, helpers, sanctioned=_sanctioned_cmds_for(getattr(a, "_sanctions", None), schema, t))
         else:
             fg = []
             if rls_on and not has_pol:
@@ -316,7 +317,10 @@ def run_all_schemas(conn, cur, a, helpers):
                       if any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _ID_ROWS for c in _CMDS4)]
         broken_any += [q(s, r["table"]) for r in reps if any("BROKEN POLICY" in f for f in r.get("footguns", []))]
         leak_any += [q(s, r["table"]) for r in reps if r.get("transition_leaks")]
-        unreliable_any += [q(s, r["table"]) for r in reps if r.get("unreliable")]
+        unreliable_any += [q(s, r["table"]) for r in reps
+                           if r.get("unreliable")
+                           and ((set(r.get("unreliable_cells") or ()) - set(r.get("sanctioned_cells") or ()))
+                                or not r.get("unreliable_cells"))]
 
     gate = 0
     if exposed_any or holes_any or broken_any or leak_any or unreliable_any:
@@ -330,7 +334,7 @@ def run_all_schemas(conn, cur, a, helpers):
         if leak_any:
             bits.append("%d table(s) with cross-policy RLS leaks (read and/or WITH CHECK write): %s" % (len(leak_any), ", ".join(leak_any)))
         if unreliable_any:
-            bits.append("%d table(s) with UNRELIABLE tests (seed/precondition failed): %s" % (len(unreliable_any), ", ".join(unreliable_any)))
+            bits.append("%d table(s) with UNRELIABLE tests (result not trustworthy): %s" % (len(unreliable_any), ", ".join(unreliable_any)))
         print("\nFAIL: " + "; ".join(bits) + ("" if a.no_fail else "  (exit 1 -- CI gate; pass --no-fail to suppress)"))
         gate = 0 if a.no_fail else 1
 

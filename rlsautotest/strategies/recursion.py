@@ -12,9 +12,11 @@ from ..seeding import _synth_required_cols
 from .base import HANDLED, PASS
 
 
-def _synth_recursion_gate(conn, schema, table, fkmap):
-    """A SELECT policy that walks a self-referential hierarchy (WITH RECURSIVE over this table) from an
-    owner=auth.uid() base. Returns {owner, self_fk, pk} to seed an ancestor chain, or None."""
+def _synth_recursion_gate(conn, schema, table, fkmap, cmd="SELECT"):
+    """A policy that walks a self-referential hierarchy (WITH RECURSIVE over this table) from an
+    owner=auth.uid() base. Returns {owner, self_fk, pk} to seed an ancestor chain, or None. MB-4: the
+    policy must actually COVER the command being emitted (cmd or ALL) -- a FOR SELECT recursive policy
+    must NOT drive an UPDATE/DELETE battery (that command is deny-by-default, not hierarchy-gated)."""
     fks = fkmap.get(f"{schema}.{table}", {})
     self_fk = pk = None
     for col, (parent, pcol) in fks.items():
@@ -23,7 +25,7 @@ def _synth_recursion_gate(conn, schema, table, fkmap):
     if not self_fk:
         return None
     cur = conn.cursor()
-    cur.execute("SELECT qual FROM pg_policies WHERE schemaname=%s AND tablename=%s AND cmd IN ('SELECT','ALL')", (schema, table))
+    cur.execute("SELECT qual FROM pg_policies WHERE schemaname=%s AND tablename=%s AND cmd IN (%s,'ALL')", (schema, table, cmd))
     for (qy,) in cur.fetchall():
         if not qy:
             continue
@@ -73,7 +75,10 @@ def synth_recursion_emit(ctx, baker, cmd, rg):
     conn, schema, table, q = ctx.conn, ctx.schema, ctx.table, ctx.q
     body, n, reseed, fill, fkmap = ctx.body, ctx.n, ctx.reseed, ctx.fill, ctx.fkmap
     desc = ctx.desc
-    if cmd != "SELECT": return False
+    if cmd not in ("SELECT", "UPDATE", "DELETE"):
+        return False                 # MB-4: INSERT under a recursive WITH CHECK can't be seeded soundly (the new row's parent must already be in-tree) -> honest NT
+    if cmd == "UPDATE" and not ctx.upd_col:
+        return False                 # no neutral column to SET -> honest NT
     owner, sfk, pk = rg["owner"], rg["self_fk"], rg["pk"]
     req, _ = _synth_required_cols(conn, schema, table, fkmap)
     fkc = set(fkmap.get(f"{schema}.{table}", {}))
@@ -89,12 +94,24 @@ def synth_recursion_emit(ctx, baker, cmd, rg):
                f"INSERT INTO auth.users(id) VALUES ('{U}') ON CONFLICT DO NOTHING",
                f"INSERT INTO {q}({_qi(owner)}{xc}) VALUES ('{U}'{xv})",                                   # root owned by U
                f"INSERT INTO {q}({_qi(sfk)}{xc}) VALUES ((SELECT {_qi(pk)} FROM {q} WHERE {_qi(owner)}='{U}' ORDER BY {_qi(pk)} LIMIT 1){xv})"]  # descendant under root
+    # MB-4: the action + oracle depend on the command. SELECT counts visible rows; UPDATE/DELETE act on
+    # the visible tree (USING gates them the same way) and bake the observed rows-affected / denial pair.
+    if cmd == "UPDATE":
+        _act = f"UPDATE {q} SET {_qi(ctx.upd_col[0])}={ctx.upd_val(ctx.upd_col[0], ctx.upd_col[1])}"
+    elif cmd == "DELETE":
+        _act = f"DELETE FROM {q}"
+    else:
+        _act = None
     def one(who, sub, role, ident):
         claims = None if role == "anon" else json.dumps({"sub": sub, "role": "authenticated"})
         pidl = (["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"] if role == "anon"
                 else [f"SELECT set_config('request.jwt.claims', {_qlit(claims)}, true)", "SET LOCAL ROLE authenticated"])
-        o = _probe(conn, arrange, pidl, "read", f"SELECT count(*) FROM {q}")
-        asrt = baker.read_assert(o, who, sees_suffix=" (recursive hierarchy)", ident=ident)
+        if _act is None:
+            o = _probe(conn, arrange, pidl, "read", f"SELECT count(*) FROM {q}")
+            asrt = baker.read_assert(o, who, sees_suffix=" (recursive hierarchy)", ident=ident)
+        else:
+            o = _probe(conn, arrange, pidl, "write", _act)
+            asrt = baker.write_assert(o, cmd, _act, who + " (recursive hierarchy)", ident=ident)
         n[0] += 1
         body.append("RESET ROLE;")
         body.extend(a + ";" for a in arrange)
@@ -109,7 +126,7 @@ def synth_recursion_emit(ctx, baker, cmd, rg):
 def run(ctx, baker, cmd):
     if ctx.classes:   # a classified branch owns this command; these strategies serve the unclassified case
         return PASS
-    rg = _synth_recursion_gate(ctx.conn, ctx.schema, ctx.table, ctx.fkmap)   # self-referential hierarchy -> SEED an ancestor chain
+    rg = _synth_recursion_gate(ctx.conn, ctx.schema, ctx.table, ctx.fkmap, cmd)   # self-referential hierarchy -> SEED an ancestor chain (cmd-scoped, MB-4)
     if rg and synth_recursion_emit(ctx, baker, cmd, rg):
         return HANDLED
     return PASS

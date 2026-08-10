@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from .astutil import _qlit, _is_uuid
+from .astutil import _qi, _qlit, _is_uuid
 from .values import NOBODY, _nonempty_array_lit
 
 
@@ -32,6 +32,8 @@ class Observation:
     mocked: bool = False
     partial: bool = False    # positive-only cell: access was OBSERVED, but the policy's FILTERING boundary was
                              # not exercised (no violating row could be constructed) -> report adds a coverage note
+    detail: str = None       # kind="multi_bad" direction: "error" | "under" | "over" (issue #4 member-of-2-tenants probe)
+    sanctioned: bool = False # MB-25: this UNRELIABLE cell was reviewed + accepted (--allow-unreliable / .rlsautotestignore) -> report marks it "sanctioned" and the gate exempts it (still shown, never a green pass)
 
 
 @dataclass
@@ -54,9 +56,12 @@ class EmitContext:
     relchecks: dict = None
     compfks: dict = None
     helpers: bool = True
+    claim_style: str = "json"          # MB-23: 'flat' -> also drive request.jwt.claim.<key> GUCs
     unauth_role: str = "anon"          # the unauthenticated client role, catalog-discovered ('anon' | 'anonymous' | custom)
     emit_service_role: bool = True     # emit the RLS-bypass identity row (only when the DB actually has a rolbypassrls client role)
     service_role_name: str = "service_role"   # the discovered bypass role's name (Supabase 'service_role'; a generic DB's may differ)
+    bypass_probed: set = None          # MB-9b: PROBED client roles (authenticated/unauth) that carry BYPASSRLS -> their matrix cells bake UNRELIABLE, never green
+    sanctioned_unreliable: set = None  # MB-25: UPPERCASE command names on THIS table whose UNRELIABLE cells are sanctioned (--allow-unreliable / .rlsautotestignore) -> emit `SELECT skip()` not `fail()` and exempt from the gate. None/empty = none, so the emit is byte-identical by default.
     gmap: dict = None                  # real effective grants {(role, cmd): bool}
     conn: Any = None
     # ---- seed plan (from _seed_plan) ----
@@ -79,6 +84,7 @@ class EmitContext:
     deny_stmt: dict = None             # cmd -> denial statement (no-grant proof)
     classes: list = None               # the CURRENT command's handled identity classes (set per command)
     # ---- output ----
+    branch_nt: list = field(default_factory=list)   # (cmd, policy, reason) per policy branch left unwitnessed -> report's PARTIALLY TESTED note
     body: list = field(default_factory=list)
     n: list = field(default_factory=lambda: [0])   # pgTAP plan counter (mutable cell)
     umap: dict = field(default_factory=dict)       # sub-uuid -> helper test-user name
@@ -92,21 +98,49 @@ class EmitContext:
         if sub not in self.umap: self.umap[sub] = f"u_{len(self.umap)}"
         return self.umap[sub]
 
+    def _flat(self, cjson, term):
+        """MB-23: when the schema's auth.uid()/auth.jwt() reads the flat per-claim GUC
+        request.jwt.claim.<key> (claim_style='flat'), emit set_config for each scalar top-level claim
+        (and clear sub/role when de-authenticating). Returns [] for JSON-shape schemas -> the emitted
+        SQL is byte-identical for the existing corpus. `term` is ';' (ident) or '' (pident/probe)."""
+        if self.claim_style != "flat":
+            return []
+        out = []
+        if cjson:
+            try:
+                d = json.loads(cjson)
+            except Exception:
+                d = {}
+            for k, v in d.items():
+                if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+                    continue
+                out.append(f"SELECT set_config('request.jwt.claim.{k}', '{v}', true){term}")
+        else:
+            out.append(f"SELECT set_config('request.jwt.claim.sub', '', true){term}")
+            out.append(f"SELECT set_config('request.jwt.claim.role', '', true){term}")
+        return out
+
     def ident(self, cjson, role):
         if role == self.service_role_name:
-            return ["SELECT tests.authenticate_as_service_role();"] if self.helpers else ["SELECT set_config('request.jwt.claims', '', true);", f"SET LOCAL ROLE {role};"]
+            return ["SELECT tests.authenticate_as_service_role();"] if self.helpers else ["SELECT set_config('request.jwt.claims', '', true);", f"SET LOCAL ROLE {_qi(role)};"]
         if role == "anon" or role == "anonymous" or cjson == "":
-            return ["SELECT tests.clear_authentication();"] if self.helpers else ["SELECT set_config('request.jwt.claims', '', true);", f"SET LOCAL ROLE {role};"]
+            # tests.clear_authentication() sets role 'anon' LITERALLY (setup hook), so the helper is
+            # only correct when the unauthenticated role IS anon. A generic provider's unauth role
+            # (RA-8: pto_visitor) or Neon's 'anonymous' gets the explicit path -- the emitted identity
+            # must match the probed one, or the replay runs as the wrong role.
+            if self.helpers and role == "anon":
+                return ["SELECT tests.clear_authentication();"] + self._flat("", ";")
+            return ["SELECT set_config('request.jwt.claims', '', true);"] + self._flat("", ";") + [f"SET LOCAL ROLE {_qi(role)};"]
         if self.helpers:
             d = json.loads(cjson)
             if set(d) <= {"sub", "role"} and d.get("role") == "authenticated" and d.get("sub") and _is_uuid(d["sub"]):
-                return [f"SELECT tests.authenticate_as('{self.user_for(d['sub'])}');"]
-        return [f"SELECT set_config('request.jwt.claims', {_qlit(cjson)}, true);", f"SET LOCAL ROLE {role};"]
+                return [f"SELECT tests.authenticate_as('{self.user_for(d['sub'])}');"] + self._flat(cjson, ";")
+        return [f"SELECT set_config('request.jwt.claims', {_qlit(cjson)}, true);"] + self._flat(cjson, ";") + [f"SET LOCAL ROLE {_qi(role)};"]
 
     def pident(self, cjson, role):
         if role == "anon" or cjson == "":
-            return ["SELECT set_config('request.jwt.claims', '', true)", f"SET LOCAL ROLE {role if cjson == '' else 'anon'}"]
-        return [f"SELECT set_config('request.jwt.claims', {_qlit(cjson)}, true)", f"SET LOCAL ROLE {role}"]
+            return ["SELECT set_config('request.jwt.claims', '', true)"] + self._flat("", "") + [f"SET LOCAL ROLE {_qi(role) if cjson == '' else 'anon'}"]
+        return [f"SELECT set_config('request.jwt.claims', {_qlit(cjson)}, true)"] + self._flat(cjson, "") + [f"SET LOCAL ROLE {_qi(role)}"]
 
     def desc(self, d):
         return _qlit(d)

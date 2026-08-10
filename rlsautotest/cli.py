@@ -38,11 +38,72 @@ from .strategies.recursion import _synth_recursion_gate, synth_recursion_emit  #
 from .strategies.mockforce import _force_atom_plan, _force_sentinels, mock_force_emit  # noqa: F401
 from .strategies.solver import solve_emit  # noqa: F401
 from .strategies.relstate import relstate_emit  # noqa: F401
-from .report import _DENY_WORDS, _ID_ROWS, _REPORT_SKIP, _as_user_report, _explain_dashes, _id_cell, _table_report, _table_status, render_report_html, render_report_text  # noqa: F401
+from .report import _DENY_WORDS, _ID_ROWS, _REPORT_SKIP, _as_user_report, _explain_dashes, _id_cell, _id_rows, _table_report, _table_status, render_report_html, render_report_text  # noqa: F401
 from .lint import _SEV_ICON, _SEV_ORDER, _lint_table, cmd_lint  # noqa: F401
 from .snapshot import cmd_diff, cmd_snapshot  # noqa: F401
 from .commands import cmd_coverage, cmd_init, cmd_users  # noqa: F401
 from .doctor import cmd_doctor  # noqa: F401
+
+
+# ── MB-25: --allow-unreliable / .rlsautotestignore -- sanction a reviewed, genuinely-unprobeable UNRELIABLE
+# cell so CI passes while the cell stays visible (emitted as a pgTAP SKIP, exempt from the gate, never a
+# green pass). Mirrors the --allow-bypass sanctioning pattern. All pure + no-DB (unit-tested).
+_CMDS_ALL_MB25 = ("SELECT", "INSERT", "UPDATE", "DELETE")
+
+
+def _parse_allow_unreliable(entries, ignore_lines=()):
+    """Parse --allow-unreliable entries + .rlsautotestignore lines into {(schema_or_None, table): {UPPERCASE cmds}}.
+    Grammar: [schema.]table[:CMD]; a bare table -> all four commands. `#` comments and blanks are ignored.
+    Raises ValueError naming a bad command (so main() can turn it into an argparse error)."""
+    out = {}
+    for raw in list(entries or ()) + list(ignore_lines or ()):
+        s = (raw or "").strip()
+        if not s or s.startswith("#"):
+            continue
+        tbl, sep, cmd = s.partition(":")
+        tbl = tbl.strip()
+        if not tbl:
+            continue
+        head, dot, tail = tbl.rpartition(".")
+        key = (head or None, tail) if dot else (None, tbl)
+        if sep and cmd.strip():
+            c = cmd.strip().upper()
+            if c not in _CMDS_ALL_MB25:
+                raise ValueError("--allow-unreliable / .rlsautotestignore: '%s' is not a command (use SELECT/INSERT/UPDATE/DELETE, or a bare table for all four)" % cmd.strip())
+            cmds = {c}
+        else:
+            cmds = set(_CMDS_ALL_MB25)
+        out.setdefault(key, set()).update(cmds)
+    return out
+
+
+def _sanctioned_cmds_for(sanctions, schema, table):
+    """The set of UPPERCASE commands sanctioned for (schema, table); a None-schema entry matches any schema.
+    Returns None when nothing matches (the byte-identical default -> emit/report unchanged)."""
+    if not sanctions:
+        return None
+    out = set()
+    for (s, t), cmds in sanctions.items():
+        if t == table and (s is None or s == schema):
+            out |= cmds
+    return out or None
+
+
+def _load_rlsautotestignore(a):
+    """Read entry lines from the first existing .rlsautotestignore (cwd, then the Supabase project root)."""
+    import os   # module-local: cli.py imports os only inside main(), so keep this helper self-contained
+    paths = [os.path.join(os.getcwd(), ".rlsautotestignore")]
+    _root = getattr(a, "_sb_root", None)
+    if _root:
+        paths.append(os.path.join(_root, ".rlsautotestignore"))
+    for p in paths:
+        try:
+            if os.path.isfile(p):
+                with open(p, encoding="utf-8") as _fh:
+                    return _fh.read().splitlines()
+        except Exception:
+            pass
+    return []
 
 
 
@@ -112,12 +173,19 @@ def main():
     ap.add_argument("--no-helpers", action="store_true", help="emit fully self-contained tests (no tests.* helpers / no 000-hook)")
     ap.add_argument("--implicit-deny", action="store_true", help="DEFAULT (kept for compatibility): emit deny tests for commands a table has NO policy for (RLS-on deny-by-default), so CI governs the FULL command matrix and a future too-broad grant/policy fails the suite")
     ap.add_argument("--no-implicit-deny", action="store_true", help="do NOT emit the deny-by-default tests for no-policy commands")
+    ap.add_argument("--no-probe", "--structural-only", action="store_true", dest="no_probe", help="STRUCTURAL-ONLY: run ZERO live probes (no INSERT/UPDATE/DELETE, no row synthesis) against the target, so it is safe to point at a production replica. Emits only the tests that need no probing -- the RLS-enabled guard and the column-level-security assertions -- and leaves the row-level matrix NOT tested (partial coverage, honest). Row-level coverage needs a disposable copy without this flag.")
     ap.add_argument("--supabase", action="store_true", help="Supabase project mode: detect the project via supabase/config.toml, default --schema to public, use the LOCAL supabase DB, and write tests straight into supabase/tests/rls/ with a _rlsautotest.sql suffix (runs under supabase test db; never collides with hand-written tests; re-running prunes its own stale generated output and leaves your hand-written tests untouched)")
     ap.add_argument("--db-url", help="Postgres connection string (else uses PG* env)")
     ap.add_argument("--report", action="store_true", help="run the suite and print the grant/deny coverage matrix")
     ap.add_argument("--report-json", help="write the matrix as JSON to this path")
     ap.add_argument("--html", help="run the suite and write an HTML report to this path (the single-command routine)")
     ap.add_argument("--no-fail", action="store_true", help="with --report/--html: do NOT exit non-zero on problems (default: exit 1 if any table is exposed or any check fails — for CI gating)")
+    ap.add_argument("--fail-on-bypass", nargs="?", const="CRITICAL", default=None, metavar="SEVERITY",
+                    help="OPT-IN (with --report/--html): also fail the CI gate on bypass surfaces (views / SECURITY DEFINER fns / RLS-bypassing roles) at or above SEVERITY (bare flag = CRITICAL). Off by default -- a bypass surface is a review flag unless you opt in; sanction reviewed ones with --allow-bypass so only NEW surfaces fail.")
+    ap.add_argument("--allow-bypass", action="append", default=None, metavar="CODE:OBJECT",
+                    help="sanction a bypass surface so --fail-on-bypass ignores it: CODE:OBJECT (e.g. L012:recursion.descendants_of(uuid)) or a bare CODE to allow every finding of that code. Repeatable.")
+    ap.add_argument("--allow-unreliable", action="append", default=None, metavar="TABLE[:CMD]",
+                    help="MB-25: sanction a reviewed, genuinely-unprobeable UNRELIABLE cell so CI passes: [schema.]table[:CMD] (CMD = SELECT/INSERT/UPDATE/DELETE; a bare table sanctions all four). Repeatable. The cell stays visible as UNRELIABLE in the report but is EXEMPT from the exit gate and emitted as a pgTAP SKIP (never a green pass); any UNRELIABLE cell you did not list still fails. The same entries can live in a checked-in .rlsautotestignore at the repo root.")
     ap.add_argument("--quiet", action="store_true", help="with --report/--html: only show tables with issues (suppress clean tables)")
     ap.add_argument("--parallel", type=int, default=1, metavar="N",
                     help="run N tables in parallel for --report/--html (default: 1 = sequential)")
@@ -173,8 +241,15 @@ def main():
             "run (table locks, triggers, sequences fire). Point --db-url at a DISPOSABLE COPY of\n"
             "your database, NEVER production.\n\n"
         )
+    # MB-25: resolve the sanctioned-UNRELIABLE set once (--allow-unreliable entries + .rlsautotestignore),
+    # validated here so a bad command is an argparse error. Empty by default -> emit/report byte-identical.
+    try:
+        a._sanctions = _parse_allow_unreliable(getattr(a, "allow_unreliable", None), _load_rlsautotestignore(a))
+    except ValueError as _e:
+        ap.error(str(_e))
     report_gate = 0   # exit code for the report/emit paths (1 if CI-gating problems found)
     with psycopg.connect(a.db_url or "") as conn, conn.cursor() as cur:
+        conn._rlsa_no_probe = bool(getattr(a, "no_probe", False))   # MB-10: structural-only -> the probe + row-synth paths short-circuit
         if a.debug_unhandled:   # read-only triage: which policy branches does the classifier drop to NOT_TESTABLE?
             tabs2 = [a.table] if a.table else rls_tables(cur, a.schema)
             rows_out = []
@@ -214,7 +289,7 @@ def main():
                 t, rls_on, has_pol = t_tuple
                 prof = auth_profile(cr, a.schema)
                 if rls_on and has_pol:
-                    rep = _table_report(cr, cn, a.schema, t, helpers)
+                    rep = _table_report(cr, cn, a.schema, t, helpers, sanctioned=_sanctioned_cmds_for(a._sanctions, a.schema, t))
                 else:
                     fg = []
                     if rls_on and not has_pol:   # RLS on, zero policies = deny-all to client roles (safe if intentional, else unintentionally inaccessible)
@@ -245,6 +320,7 @@ def main():
                     c = getattr(_tls, "conn", None)
                     if c is None:
                         c = psycopg.connect(a.db_url or "")
+                        c._rlsa_no_probe = bool(getattr(a, "no_probe", False))   # MB-10: propagate to worker connections
                         _tls.conn = c
                         with _plock:
                             _pconns.append(c)
@@ -265,7 +341,7 @@ def main():
                 def _has_issues(r):
                     if r.get("exposed"): return True
                     if r.get("footguns"): return True
-                    if any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _ID_ROWS for c in _CMDS4):
+                    if any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _id_rows(r) for c in _CMDS4):
                         return True
                     return False
                 reps_display = [r for r in reps if _has_issues(r)]
@@ -279,6 +355,19 @@ def main():
             # bypass surfaces (views / SECURITY DEFINER fns / roles that sidestep RLS) — shown in HTML + JSON.
             with conn.cursor() as _bcur:
                 bypass_findings = find_bypass(_bcur, a.schema)
+            # MB-9: OPT-IN CRITICAL-bypass gate. Default OFF -> the bypass surface stays a review flag and every
+            # existing suite + gate is byte-identical. With --fail-on-bypass, a finding at or above the chosen
+            # severity fails the gate UNLESS its CODE:OBJECT (or a bare CODE) is sanctioned via --allow-bypass --
+            # so a reviewed, intentional definer helper is not a false-fail, but a NEW unsanctioned CRITICAL
+            # surface is caught in CI. (The 4 corpus definer schemas rbt/recursion/dw/rcw gate only when opted in.)
+            bypass_gate = []
+            if getattr(a, "fail_on_bypass", None):
+                _sevrank = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+                _minsev = _sevrank.get(str(a.fail_on_bypass).upper(), 4)
+                _allowb = set(getattr(a, "allow_bypass", None) or [])
+                for (_bc, _bs, _bo, _bd, _bm) in bypass_findings:
+                    if _sevrank.get(_bs, 0) >= _minsev and f"{_bc}:{_bo}" not in _allowb and _bc not in _allowb:
+                        bypass_gate.append(f"{_bc} {_bo}")
             if a.report_json:
                 # the in-memory report holds sets (unreliable_cells) and tuple-keyed dicts (grants),
                 # neither JSON-serializable: render sets as sorted lists and tuple keys as "a:b".
@@ -308,21 +397,30 @@ def main():
                 except Exception: pass
                 print(f"\n{_TAGLINE} {_TAGLINE2}")
             if a.report or not a.html:
-                print(render_report_text(reps_display))
+                print(render_report_text(reps_display, bypass_findings))   # MB-9: text report shows the bypass surfaces too (HTML/JSON already did)
             # CI gate: fail on any exposed table (RLS off + reachable), any failing/leaking check, or a broken policy
             exposed_any = [r["table"] for r in reps if r.get("exposed")]
             holes_any = [r["table"] for r in reps
-                         if any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _ID_ROWS for c in _CMDS4)]
+                         if any(_id_cell(r, k, c)[1] in ("danger", "fail") for k, _ in _id_rows(r) for c in _CMDS4)]
             broken_any = [r["table"] for r in reps if any("BROKEN POLICY" in f for f in r.get("footguns", []))]
             leak_any = [r["table"] for r in reps if r.get("transition_leaks")]
-            unreliable_any = [r["table"] for r in reps if r.get("unreliable")]
-            if exposed_any or holes_any or broken_any or leak_any or unreliable_any:
+            multi_any = [r["table"] for r in reps if r.get("multi_findings")]
+            # MB-25: an UNRELIABLE table still gates UNLESS every UNRELIABLE cell is sanctioned
+            # (--allow-unreliable / .rlsautotestignore). This reduces EXACTLY to the old `r["unreliable"]`
+            # test when nothing is sanctioned; a non-cell unreliable condition (e.g. no pgTAP output) always gates.
+            unreliable_any = [r["table"] for r in reps
+                              if r.get("unreliable")
+                              and ((set(r.get("unreliable_cells") or ()) - set(r.get("sanctioned_cells") or ()))
+                                   or not r.get("unreliable_cells"))]
+            if exposed_any or holes_any or broken_any or leak_any or multi_any or unreliable_any or bypass_gate:
                 bits = []
                 if exposed_any: bits.append(f"{len(exposed_any)} exposed table(s): {', '.join(exposed_any)}")
                 if holes_any:   bits.append(f"{len(holes_any)} table(s) with policy holes/failures: {', '.join(holes_any)}")
                 if broken_any:  bits.append(f"{len(broken_any)} broken/unreadable table(s): {', '.join(broken_any)}")
                 if leak_any:    bits.append(f"{len(leak_any)} table(s) with cross-policy RLS leaks (read and/or WITH CHECK write): {', '.join(leak_any)}")
-                if unreliable_any: bits.append(f"{len(unreliable_any)} table(s) with UNRELIABLE tests (seed/precondition failed): {', '.join(unreliable_any)}")
+                if multi_any:   bits.append(f"{len(multi_any)} table(s) mis-serving users who belong to 2 tenants: {', '.join(multi_any)}")
+                if unreliable_any: bits.append(f"{len(unreliable_any)} table(s) with UNRELIABLE tests (result not trustworthy): {', '.join(unreliable_any)}")
+                if bypass_gate: bits.append(f"{len(bypass_gate)} unsanctioned bypass surface(s) [--fail-on-bypass]: {', '.join(bypass_gate)}")
                 print("\nFAIL: " + "; ".join(bits) + ("" if a.no_fail else "  (exit 1 — CI gate; pass --no-fail to suppress)"))
                 report_gate = 0 if a.no_fail else 1
             # ── --as-user: probe from a real auth.users identity ──────────────
@@ -373,14 +471,14 @@ def main():
             if helpers:
                 hookpath = os.path.join(tdir, _hook)
                 if not os.path.exists(hookpath):   # non-destructive: never clobber an existing hook
-                    open(hookpath, "w", encoding="utf-8").write(setup_hook_sql(_basejump_present(cur)))
+                    open(hookpath, "w", encoding="utf-8").write(setup_hook_sql(_basejump_present(cur), auth_profile(cur, a.schema)))   # MB-11: shim role vocabulary matches the schema's discovered model
             guard = emit_rls_guard(cur, a.schema)   # schema-wide "RLS must be enabled" guard
             if guard:
                 open(os.path.join(tdir, "010-rls-enabled" + _ext), "w", encoding="utf-8").write(guard)
             tables = [a.table] if a.table else rls_tables(cur, a.schema)
             for i, t in enumerate(sorted(tables), start=1):
                 ctx = _load_ctx(cur, a.schema, t)
-                flat, nested = _emit_both(a.schema, t, ctx, helpers, conn=conn, implicit_deny=not a.no_implicit_deny, debug=a.debug_emitter)
+                flat, nested = _emit_both(a.schema, t, ctx, helpers, conn=conn, implicit_deny=not a.no_implicit_deny, debug=a.debug_emitter, sanctioned=_sanctioned_cmds_for(a._sanctions, a.schema, t))
                 num = f"{100 + i:03d}"
                 open(os.path.join(tdir, f"{num}-rls-{t}" + _ext), "w", encoding="utf-8").write(flat)
                 if nested is not None:
@@ -419,8 +517,8 @@ def main():
             for x in ctx["notes"]: print(f"  NOTE: {x}")
             print(f"  coverage: {ctx['cov']}/{ctx['tot']}")
             return
-        flat, nested = _emit_both(a.schema, a.table, ctx, helpers, conn=conn, implicit_deny=not a.no_implicit_deny, debug=bool(a.out) or a.debug_emitter)
-        hook = setup_hook_sql(_basejump_present(cur)) if (a.setup and helpers) else None
+        flat, nested = _emit_both(a.schema, a.table, ctx, helpers, conn=conn, implicit_deny=not a.no_implicit_deny, debug=bool(a.out) or a.debug_emitter, sanctioned=_sanctioned_cmds_for(a._sanctions, a.schema, a.table))
+        hook = setup_hook_sql(_basejump_present(cur), auth_profile(cur, a.schema)) if (a.setup and helpers) else None   # MB-11: flavor-aware shim roles
     if a.out: open(a.out, "w", encoding="utf-8").write(nested)
     if a.flat: open(a.flat, "w", encoding="utf-8").write(flat)
     if a.setup and hook: open(a.setup, "w", encoding="utf-8").write(hook)

@@ -21,7 +21,7 @@ _DENY_WORDS = ("unauthorized", "anon", "nothing", "cannot", "affects 0", "out of
 
 
 
-def _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, leak_cells, unreliable_msgs, unreliable_cells, partial_msgs=None):
+def _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, leak_cells, unreliable_msgs, unreliable_cells, partial_msgs=None, multi_msgs=None, multi_cells=None):
     """F4 structural filing: match each numbered TAP line to the emitter's own Observation (by the
     pgTAP test number == plan-order index) and file the matrix cell from the Observation — the
     English label is display-only, so a strategy's wording can no longer misfile a cell. Returns
@@ -51,6 +51,11 @@ def _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, leak_cells, unrelia
                 leak_msgs.append(label.replace(" [transition-leak]", ""))
                 leak_cells.add((ob.cmd, ob.ident or "authorized"))
             continue
+        if ob.kind == "multi_bad":   # issue #4: the member-of-2-tenants probe found a mismatch/error
+            if not passed and multi_msgs is not None:
+                multi_msgs.append(label.replace(" [member-of-2-tenants]", ""))
+                multi_cells[(ob.cmd, "multi")] = getattr(ob, "detail", None) or "under"
+            continue
         d = cells.setdefault(ob.cmd, {})
         side = "grant" if ob.exp else "deny"
         d[side] = d.get(side, True) and passed
@@ -63,13 +68,18 @@ def _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, leak_cells, unrelia
 
 
 
-def _table_report(cur, conn, schema, table, helpers):
+def _table_report(cur, conn, schema, table, helpers, sanctioned=None):
     """Run the SELF-CONTAINED flat battery (robust: seeds as the connection role, no service_role /
     shim dependency) statement-by-statement, collect each pgTAP assertion's returned line, and parse
-    its descriptive label into a grant/deny matrix. Rolled back so nothing persists."""
+    its descriptive label into a grant/deny matrix. Rolled back so nothing persists.
+
+    MB-25: `sanctioned` is the set of UPPERCASE commands on THIS table accepted via --allow-unreliable /
+    .rlsautotestignore -> their UNRELIABLE cells bake as SKIP (not fail) and are exempt from the gate.
+    None = none (byte-identical default)."""
     ctx = _load_ctx(cur, schema, table)
     obs = []   # F4: one Observation per emitted test, in plan order — the structural report contract
-    flat = _emit_both(schema, table, ctx, helpers=False, conn=conn, obs_out=obs)[0]
+    bnt = []   # (cmd, policy, reason) branches the emitter could not witness -> PARTIALLY TESTED note
+    flat = _emit_both(schema, table, ctx, helpers=False, conn=conn, obs_out=obs, notes_out=bnt, sanctioned=sanctioned)[0]
     taplines = []
     try:
         for st in _split_statements(flat):
@@ -97,18 +107,25 @@ def _table_report(cur, conn, schema, table, helpers):
     leak_cells = set()   # (cmd, identity) cells where a cross-policy leak (read or write) actually fired -> mark the grid cell ✓! danger
     unreliable_msgs = []   # tests whose precondition (seed) could not be established -> not trustworthy
     unreliable_cells = set()
+    sanctioned_cells = set()   # MB-25: the subset of unreliable_cells reviewed + accepted (--allow-unreliable / .rlsautotestignore) -> exempt gate, emitted as SKIP
     partial_msgs = []   # positive-only floor cells: access OBSERVED but the filtering boundary was not exercised
+    multi_msgs = []     # issue #4: member-of-2-tenants probe findings (error / hidden data / over-grant)
+    multi_cells = {}    # (cmd, "multi") -> "error" | "under" | "over"
     # UNRELIABLE is a GENERATION-TIME fact (the probe's precondition failed), not a replay outcome:
     # file those cells straight from the Observations so they show ‼ even when the replay itself could
     # not produce TAP output (e.g. the connection role cannot create the pgTAP shim -- issue #2).
     for ob in obs:
         if getattr(ob, "kind", None) == "unreliable":
-            unreliable_cells.add((ob.cmd, ob.ident or "authorized"))
-    _filed = _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, leak_cells, unreliable_msgs, unreliable_cells, partial_msgs)
+            _uc = (ob.cmd, ob.ident or "authorized")
+            unreliable_cells.add(_uc)
+            if getattr(ob, "sanctioned", False):
+                sanctioned_cells.add(_uc)   # MB-25: reviewed + accepted -> exempt gate, emit SKIP
+    _filed = _file_tap_lines(taplines, obs, cells, idgrid, leak_msgs, leak_cells, unreliable_msgs, unreliable_cells, partial_msgs, multi_msgs, multi_cells)
     if obs and not taplines:
         unreliable_msgs.append("the report battery produced NO pgTAP output when replayed (pgTAP is not "
-                               "installed and the fallback shim could not be created by this connection role); "
-                               "run `rlsautotest doctor` to diagnose the probe environment")
+                               "installed and the fallback shim could not be created by this connection role). "
+                               "Fix: install pgTAP (CREATE EXTENSION pgtap) or connect as a role that can create "
+                               "the shim, then re-run; `rlsautotest doctor` diagnoses the probe environment")
     for ln, label, passed in _filed:   # lines with NO matching Observation -> legacy label-keyword parsing
         if "UNRELIABLE" in label:                              # precondition (seed) failed -> not a grant/deny cell; flag it
             unreliable_msgs.append(label)
@@ -169,17 +186,31 @@ def _table_report(cur, conn, schema, table, helpers):
             notes.append("SECURITY HOLE - cross-policy read leak (Postgres OR-combines every permissive policy, so a broader permissive SELECT policy such as USING (true) lets a role read rows its OWN policy's filter intended to hide): " + "; ".join(_read_leaks))
         if _write_leaks:
             notes.append("SECURITY HOLE - cross-policy WITH CHECK leak (Postgres OR-combines every permissive policy's WITH CHECK, so an authorized identity can write a value only a DIFFERENT policy intended): " + "; ".join(_write_leaks))
+    if multi_msgs:
+        notes.append("MEMBER OF 2 TENANTS - a user holding membership in TWO tenants is mis-served by this policy (probed with a seeded two-membership identity; single-membership test users can NEVER surface this class of bug): " + "; ".join(sorted(set(multi_msgs))))
     if unreliable_msgs:
-        notes.append("UNRELIABLE TEST(S) - the test precondition (seed) could not be established for some identity/command, so the result is NOT trustworthy and the suite fails loudly rather than asserting a possibly-wrong outcome (investigate seeding): " + "; ".join(sorted(set(s.replace("UNRELIABLE - ", "") for s in unreliable_msgs))))
+        notes.append("UNRELIABLE TEST(S) - the probe could not produce a trustworthy result for some identity/command, so the suite fails loudly here rather than asserting a possibly-wrong outcome. Each finding below names its cause and a `Fix:` for how to get ahead of it: " + "; ".join(sorted(set(s.replace("UNRELIABLE - ", "") for s in unreliable_msgs))))
+    if sanctioned_cells:
+        notes.append("SANCTIONED UNRELIABLE - " + str(len(sanctioned_cells)) + " cell(s) here were reviewed and accepted as un-probeable via --allow-unreliable / .rlsautotestignore: still shown as UNRELIABLE (never a green pass), but EXEMPT from the CI gate and emitted as a pgTAP SKIP instead of a failing test. Sanctioned: " + ", ".join(sorted(_c + " " + _i for (_c, _i) in sanctioned_cells)))
     if partial_msgs:
         notes.append("COVERAGE - positive verified, filtering boundary not exercised: for these cells the identity's ACCESS was confirmed against a real, policy-admitted row, but the policy's FILTERING was NOT exercised because no row VIOLATING the predicate could be constructed (often a tautology given the table's constraints, e.g. `col IS NOT NULL` on a NOT NULL column). Each cell is a real observed result, not a full grant+deny proof: " + "; ".join(sorted(set(_m.replace(" [solver: positive verified; filtering boundary not exercised]", "").replace(" [solver: positive-only]", "") for _m in partial_msgs))))
+    if bnt:
+        notes.append("PARTIALLY TESTED - policy branch(es) with NO witness: the green cells for these commands prove the OTHER branch(es) of the same policy/command, not these. Untested: "
+                     + "; ".join(sorted({f"{c} policy [{pp or '?'}] -> {rr}" for (c, pp, rr) in bnt})))
     if "UPDATE" in pol and not idgrid.get("UPDATE", {}).get("authorized") and ("UPDATE", "authorized") not in unreliable_cells:
         notes.append("UPDATE not fully tested - no policy-neutral column to modify AND nothing safely self-assignable (every column is identity/generated or unique), so the UPDATE permission could not be probed by SETting a harmless column or by SET col=col. The '-' for UPDATE is a coverage gap, not a pass; review manually.")
+    _auth = auth_profile(cur, schema)
+    _un = (_auth or {}).get("unauth", "anon")
+    if _un and _un != "anon":   # MB-26: name the real role behind the 'anonymous (unauthenticated)' row so it is never lost
+        notes.append("the 'anon, anonymous-(unauthenticated)' row is the Postgres role " + _un + " -- this schema has no 'anon' role, so " + _un + " (its discovered unauthenticated client role) stands in as the anonymous identity.")
     rep = {"table": table, "rls_enabled": rls_on, "policied": sorted(pol),
            "cells": cells, "idgrid": idgrid, "footguns": notes, "coverage": [ctx["cov"], ctx["tot"]],
            "transition_leaks": leak_msgs, "leak_cells": leak_cells, "unreliable": sorted(set(unreliable_msgs)), "unreliable_cells": unreliable_cells,
+           "sanctioned_cells": sanctioned_cells,
            "partial": sorted(set(partial_msgs)),
-           "auth": auth_profile(cur, schema)}
+           "multi_findings": sorted(set(multi_msgs)), "multi_cells": multi_cells,
+           "branch_nt": sorted({f"{c}|{pp}|{rr}" for (c, pp, rr) in bnt}),
+           "auth": _auth}
     # Explain EVERY '–' (not-tested) cell so a dash is never silent (NT-atom note + catch-all). See _explain_dashes.
     notes.extend(_explain_dashes(rep, ctx["per"], notes))
     return rep
@@ -195,25 +226,43 @@ _ID_ROWS = [("service_role", "service_role"), ("authorized", "authenticated, aut
             ("other", "authenticated, not authorized"), ("anon", "anon")]
 
 
+def _has_multi(rep):
+    """True when THIS table's battery probed the users who belong to 2 tenantship identity (issue #4) —
+    the 'authenticated, member of 2 tenants' row is rendered only then, so non-membership tables keep
+    their classic 4-row grid (and gain no unexplained '–' cells)."""
+    return (any("multi" in (rep.get("idgrid", {}).get(c) or {}) for c in _CMDS4)
+            or bool(rep.get("multi_cells"))
+            or any(i == "multi" for (_c, i) in rep.get("unreliable_cells", set())))
+
+
 def _id_rows(rep):
     """The identity rows to render, from THIS database's catalog-discovered role model (rep['auth']).
 
     One row per role SLOT the database actually has: an RLS-bypass row ONLY when a bypass role exists
     (Supabase's service_role; absent on Neon and most databases), the two authenticated identities always,
     and the unauthenticated client labelled with its real name (anon on Supabase, anonymous on Neon, or a
-    discovered custom name). Internal ROW KEYS stay stable ('service_role'/'anon') so every cell and
-    observation lookup is unchanged; only presence and display label vary. Falls back to the classic
-    Supabase grid when no profile is attached."""
+    discovered custom name). A membership-scoped table that was probed with the two-membership identity
+    additionally shows the 'authenticated, member of 2 tenants' row (issue #4). Internal ROW KEYS stay stable
+    ('service_role'/'anon') so every cell and observation lookup is unchanged; only presence and display
+    label vary. Falls back to the classic Supabase grid when no profile is attached."""
+    _multi = [("multi", "authenticated, member of 2 tenants")] if _has_multi(rep) else []
     a = rep.get("auth")
     if not a:
-        return list(_ID_ROWS)
+        rows = list(_ID_ROWS)
+        return rows[:3] + _multi + rows[3:]
     rows = []
     svc = a.get("service_role")
     if svc:
         rows.append(("service_role", svc if isinstance(svc, str) else "service_role"))
+    _un = a.get("unauth", "anon")
+    # MB-26: a discovered unauthenticated role that is NOT literally 'anon' (e.g. a custom LOGIN role like
+    # pto_visitor, or Neon's 'anonymous') used to show by its bare name, which reads like an ordinary named
+    # role and misleads. Label it for what it IS -- the anonymous/unauthenticated identity. The real role name
+    # is named in a footgun note (see _table_report) so it is not lost. Literal 'anon' stays 'anon' (clear).
+    _un_label = _un if _un == "anon" else "anon, anonymous-(unauthenticated)"
     rows += [("authorized", "authenticated, authorized"),
-             ("other", "authenticated, not authorized"),
-             ("anon", a.get("unauth", "anon"))]
+             ("other", "authenticated, not authorized")] + _multi + [
+             ("anon", _un_label)]
     return rows
 
 
@@ -227,7 +276,7 @@ def _id_cell(rep, ident, cmd):
         # PREFER the tested observation (the battery probes service_role like every other identity);
         # the grants-map inference below remains only as the fallback when no test could be constructed.
         if (cmd, "service_role") in rep.get("unreliable_cells", set()):
-            return ("‼", "unrel", "UNRELIABLE — the service_role test's precondition (seed) could not be established")
+            return ("‼", "unrel", "UNRELIABLE -- the service_role test could not produce a trustworthy result; the note names the cause and its fix")
         g0 = rep.get("idgrid", {}).get(cmd, {}).get("service_role")
         if g0:
             exp, passed = g0["exp"], g0["pass"]
@@ -259,11 +308,23 @@ def _id_cell(rep, ident, cmd):
     if cmd not in policied:
         return ("·", "none", "no policy for this command (implicit deny)")
     if (cmd, ident) in rep.get("unreliable_cells", set()):
-        return ("‼", "unrel", "UNRELIABLE — the test precondition (seed) could not be established, so this result is NOT trustworthy (the suite fails loudly here; see notes)")
+        if (cmd, ident) in rep.get("sanctioned_cells", set()):
+            return ("‼", "unrel", "UNRELIABLE (sanctioned) -- reviewed and accepted as un-probeable via --allow-unreliable / .rlsautotestignore: shown here but EXEMPT from the CI gate and emitted as a pgTAP SKIP (never a green pass); see the SANCTIONED note")
+        return ("‼", "unrel", "UNRELIABLE -- the probe could not produce a trustworthy result here, so the suite fails loudly; the note names the cause and its fix")
     if (cmd, ident) in rep.get("leak_cells", set()):
         if cmd == "SELECT":
             return ("✓", "danger", "CAN act, but this identity can also SEE rows its own policy's filter should hide (an OR-combined permissive SELECT policy widens visibility past that scope; cross-policy read leak); see the SECURITY HOLE note below")
         return ("✓", "danger", "CAN act, but this identity can also write values only another policy should allow (cross-policy WITH CHECK leak); see the SECURITY HOLE note below")
+    if ident == "multi":
+        _md = rep.get("multi_cells", {}).get((cmd, ident))
+        if _md == "error":
+            return ("✗", "fail", "the query ERRORS for a user with two memberships (a single-membership user works) — the policy breaks the moment a real user joins a second tenant; see the MEMBER OF 2 TENANTS note")
+        if _md == "under":
+            return ("✗", "fail", "a two-membership user sees FEWER rows than its memberships grant — one membership's data is silently hidden and nothing in the policy selects which; see the MEMBER OF 2 TENANTS note")
+        if _md == "over":
+            return ("✓", "danger", "a two-membership user sees MORE rows than its two memberships grant — the policy over-delivers; see the MEMBER OF 2 TENANTS note")
+        if not rep.get("idgrid", {}).get(cmd, {}).get(ident):
+            return ("·", "none", "member-of-2-tenants visibility is probed for SELECT; writes are covered by the authorized / not-authorized rows")
     g = rep.get("idgrid", {}).get(cmd, {}).get(ident)
     if not g:
         if ident == "anon" and cmd != "SELECT":
@@ -327,7 +388,7 @@ def _role_of(key, rep=None):
     """The Postgres role behind a report identity row (both authenticated,* rows share the role)."""
     a = (rep or {}).get("auth") or {}
     if key == "service_role": return a.get("service_role") or "service_role"
-    if key in ("authorized", "other"): return a.get("authenticated") or "authenticated"
+    if key in ("authorized", "other", "multi"): return a.get("authenticated") or "authenticated"
     if key == "anon": return a.get("unauth", "anon")
     if isinstance(key, str) and key.startswith("role:"): return key[5:]
     return None
@@ -373,7 +434,7 @@ def _cls_html_td(kind, granted, leaked, first, esc):
     return f'<td class="{cls}" title="a broader grant reaches columns beyond the column grant (leak)">{ctx}<span class="lk">⚠ leaks: {esc(", ".join(leaked))}</span></td>'
 
 
-def render_report_text(reps):
+def render_report_text(reps, bypass=None):
     out = []
     _neon = any((r.get("auth") or {}).get("flavor") == "neon" for r in reps)
     exposed = [r["table"] for r in reps if not r["rls_enabled"] and r.get("exposed")]
@@ -385,12 +446,12 @@ def render_report_text(reps):
         st, _ = _table_status(r)
         out.append(f"{r['table']}  [{st}]")
         _CW = 30   # column-security cell width
-        out.append(f"  {'':<31}" + f"{'row level: can act?':<36}" + "  " + "column level security: granted columns (green) / leaks past the grant (red)")
-        out.append(f"  {'identity':<31}" + "".join(f"{c:<9}" for c in _CMDS4) + "  " + "".join(f"{c:<{_CW}}" for c in _CMDS4))
+        out.append(f"  {'':<37}" + f"{'row level: can act?':<36}" + "  " + "column level security: granted columns (green) / leaks past the grant (red)")
+        out.append(f"  {'identity':<37}" + "".join(f"{c:<9}" for c in _CMDS4) + "  " + "".join(f"{c:<{_CW}}" for c in _CMDS4))
         _rows = _id_rows(r) + [(k, f"{k[5:]} (custom role)") for k in sorted(
             {i for cm in r.get("idgrid", {}).values() for i in cm if isinstance(i, str) and i.startswith("role:")})]
         for key, lbl in _rows:
-            line = f"  {lbl:<31}"
+            line = f"  {lbl:<37}"
             for c in _CMDS4:
                 g, cls, _ = _id_cell(r, key, c)
                 glyph = g + ("!" if cls == "danger" else "")   # ! = behaves wrong (hole)
@@ -403,7 +464,20 @@ def render_report_text(reps):
         for fn in r["footguns"]:
             out.append(f"    ! footgun: {fn}")
         out.append("")
-    out.append("legend: ✓ can · blocked/none ✗ should-be-allowed-but-blocked  ✓! = should be blocked but CAN (security hole)  ‼ UNRELIABLE (seed/precondition failed — not trustworthy)  – not tested")
+    # ── Bypass surfaces (MB-9): objects/roles that can sidestep RLS even when the policies are correct.
+    # Shown ONLY when found (a clean text report stays terse), and the SAME findings the HTML / --report-json
+    # already surface. INFORMATIONAL review flags, DELIBERATELY not wired into the pass/fail gate: legitimate
+    # schemas routinely expose SECURITY DEFINER helpers (recursion readers, write-rpcs, triggers), so gating
+    # on these would false-fail a correct schema -- see the MASTER_BACKLOG MB-9 corpus audit.
+    _SEVRANK = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "INFO": 3}
+    _bx = sorted(bypass or [], key=lambda f: (_SEVRANK.get(f[1], 9), f[0], f[2]))
+    if _bx:
+        out.append(f"bypass surfaces ({len(_bx)} found) - objects/roles that can sidestep RLS even when the policies are correct (review flags, NOT pass/fail):")
+        for (c, s, obj, _d, msg) in _bx:
+            out.append(f"  [{s}] {obj} ({finding_type(c, msg)}): {msg}")
+        out.append("  why listed: a view/function only when it runs with definer's rights AND a client role (anon/authenticated) can reach it AND it reaches an RLS table; a role only when it bypasses RLS and is not sanctioned. security_invoker views, unreachable objects, in-policy helpers, and service_role/platform roles are not listed.")
+        out.append("")
+    out.append("legend: ✓ can · blocked/none ✗ should-be-allowed-but-blocked  ✓! = should be blocked but CAN (security hole)  ‼ UNRELIABLE (result not trustworthy -- see the fix in the notes)  – not tested")
     if not _neon:
         out.append("service_role bypasses RLS by design (always full access).")
         out.append("note: 'authenticated, authorized' and 'authenticated, not authorized' are the SAME Postgres role (authenticated) under different JWT identities/claims — NOT separate DB roles. Only service_role, authenticated and anon are real Postgres roles; 'authorized' vs 'not authorized' is the policy outcome for that identity.")
@@ -443,7 +517,21 @@ def render_report_html(reps, schema, bypass=None, db=None):
                 tds.append(_cls_html_td(_k, _bl, _rk, i == 0, esc))
             note = ' <span class="rolenote">bypasses RLS</span>' if key == "service_role" else ""
             grid_rows.append(f'<tr><td class="idn">{esc(lbl)}{note}</td>{"".join(tds)}</tr>')
-        flags = "".join(f'<li>{esc(f)}</li>' for f in r.get("footguns", []))
+        # UNRELIABLE cells fail CI. Surface each one's own Fix as a prominent, per-cell remediation panel a
+        # reader can act on directly, instead of burying every fix in one run-on footgun note.
+        _uitems = []
+        for _m in (r.get("unreliable") or []):
+            _m2 = _m.replace("UNRELIABLE - ", "", 1)
+            if " Fix: " in _m2:
+                _ctx, _fx = _m2.split(" Fix: ", 1)
+                _uitems.append(f'<li><span class="uwhere">{esc(_ctx.strip())}</span><br><span class="ufix">Fix: {esc(_fx.strip())}</span></li>')
+            else:
+                _uitems.append(f'<li>{esc(_m2.strip())}</li>')
+        unrelfix_html = (f'<div class="unrelfix"><b>&#8252; UNRELIABLE &mdash; {len(_uitems)} test(s) here fail CI. '
+                         f'Make the change named in each Fix to get the suite passing:</b>'
+                         f'<ul>{"".join(_uitems)}</ul></div>') if _uitems else ""
+        # the combined UNRELIABLE footgun is now shown as the panel above -> drop it from the generic flags list
+        flags = "".join(f'<li>{esc(f)}</li>' for f in r.get("footguns", []) if not f.startswith("UNRELIABLE TEST(S)"))
         flags_html = f'<ul class="flags">{flags}</ul>' if flags else ""
         blocks.append(
             f'<section class="tbl"><h2>{esc(r["table"])} <span class="chip {stcls}">{esc(st)}</span></h2>'
@@ -453,7 +541,7 @@ def render_report_html(reps, schema, bypass=None, db=None):
             + "".join(f"<th>{c}</th>" for c in _CMDS4)
             + "".join(f'<th class="{"clsstart" if i == 0 else ""}">{c}</th>' for i, c in enumerate(_CMDS4))
             + "</tr></thead><tbody>"
-            + "".join(grid_rows) + f"</tbody></table>{flags_html}</section>")
+            + "".join(grid_rows) + f"</tbody></table>{unrelfix_html}{flags_html}</section>")
     banner = ""
     if exposed:
         banner += f'<div class="ban danger"><b>⛔ Exposed</b> — RLS is OFF and these tables are readable/writable by anon/authenticated: {esc(", ".join(exposed))}</div>'
@@ -516,6 +604,9 @@ def render_report_html(reps, schema, bypass=None, db=None):
  .grid td.clsna,.grid td.clsnone{{color:#cbd5e1;text-align:center}}
  .grid .clsstart{{border-left:2px solid #94a3b8}}
  ul.flags{{margin:.4rem 0 0;padding-left:1.1rem;color:#92400e;font-size:.85rem}}
+ .unrelfix{{background:#fffbeb;border:1px solid #fcd34d;border-radius:6px;padding:.55rem .8rem;margin:.55rem 0 0}}
+ .unrelfix>b{{color:#92400e;font-size:.9rem}} .unrelfix ul{{margin:.45rem 0 0;padding-left:1.1rem}}
+ .unrelfix li{{margin:.4rem 0;font-size:.84rem;line-height:1.45}} .unrelfix .uwhere{{color:#57534e}} .unrelfix .ufix{{color:#92400e;font-weight:600}}
  .legend{{color:#666;font-size:.85rem;margin-top:1.5rem;max-width:48rem}}
  section.bypass{{margin:1.6rem 0}} section.bypass h2{{font-size:1.05rem;margin:0 0 .3rem}}
  table.blist{{border-collapse:collapse;width:100%;max-width:64rem}}
@@ -525,9 +616,18 @@ def render_report_html(reps, schema, bypass=None, db=None):
  .sevbadge.crit{{background:#dc2626;color:#fff}} .sevbadge.high{{background:#fde68a;color:#92400e}} .sevbadge.med{{background:#fef9c3;color:#854d0e}}
  .footnote{{color:#666;font-size:.82rem;margin:.6rem 0 0;max-width:64rem}} .clean{{font-weight:600;margin:.5rem 0}}
  .footer{{color:#888;font-size:.8rem;margin-top:1.2rem;border-top:1px solid #eee;padding-top:.6rem}}
+ .promo{{color:#334155;background:#eef2ff;border:1px solid #c7d2fe;border-left:4px solid #4f46e5;border-radius:8px;padding:.75rem 1rem;margin:0 0 1.3rem;font-size:.86rem;max-width:64rem}}
+ .promo>b{{display:block;color:#4338ca;font-size:.98rem;margin-bottom:.35rem}}
 </style></head><body>
 <h1>RLS access report</h1>
-<p class="sub">{_db_sub}schema <code>{esc(schema)}</code> &middot; generated by <a href="{_HOME}">rlsautotest</a></p>
+<p class="sub">{_db_sub}schema <code>{esc(schema)}</code> &middot; generated by <a href="{_HOME}/rlsautotest">rlsautotest</a></p>
+<div class="promo"><b>Coming soon - UnitAutogen for PostgreSQL, Supabase &amp; Neon</b>
+<ol style="margin:.35rem 0 0;padding-left:1.25rem">
+<li>Automated pgTAP test-suite generation and coverage for functions and triggers which is ready for CI.</li>
+<li>Database security-coverage suite -  Every function and trigger exercised under every database role.</li>
+<li>Automated HIPAA compliance evidence, generated as pgTAP tests.</li>
+</ol>
+<div style="font-size:.85rem;margin-top:.9rem;"> Want early access? <a href="mailto:hello@unitautogen.com?subject=UnitAutogen%20early%20access" style="color:#4f46e5;font-weight:600;text-decoration:none;">hello@unitautogen.com →</a> </div></div>
 <div class="summary">{summary}</div>
 {banner}
 {"".join(blocks)}
@@ -536,7 +636,7 @@ def render_report_html(reps, schema, bypass=None, db=None):
  <span class="c pass">✓</span> can &middot; <span class="c none">·</span> blocked &middot;
  <span class="c danger">✓</span> can but <b>should be blocked</b> (security hole) &middot;
  <span class="c fail">✗</span> should be allowed but is blocked &middot;
- <span class="c unrel">‼</span> UNRELIABLE — seed/precondition failed, result not trustworthy &middot; – not tested.
+ <span class="c unrel">‼</span> UNRELIABLE -- result not trustworthy, see the fix in the notes &middot; – not tested.
  <b>service_role</b> bypasses RLS by design. “Enforced as declared” means the database behaves the way your
  policies say — not that the policies are what you intended.</p>
 <p class="legend"><b>About the identities:</b> <code>authenticated, authorized</code> and
@@ -544,7 +644,6 @@ def render_report_html(reps, schema, bypass=None, db=None):
  under different JWT identities/claims — they are <b>not</b> separate database roles. Only
  <code>service_role</code>, <code>authenticated</code> and <code>anon</code> are real Postgres roles;
  “authorized” vs “not authorized” is simply whether that identity passes the table’s policies.</p>
-<p class="footer">{esc(_TAGLINE)} <a href="{_HOME}">Need it for SQL Server (tSQLt), Oracle, or Azure?</a></p>
 </body></html>
 """
     return _html.replace("—", "-")   # no em-dashes in the report output (en-dash '–' not-tested glyph kept)

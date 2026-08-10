@@ -149,16 +149,38 @@ def mock_emit(ctx, baker, cmd):
     udfs, geff, _upd_val, upd_col = ctx.udfs, ctx.geff, ctx.upd_val, ctx.upd_col
     total_rows, nobody_ins = ctx.total_rows, ctx.nobody_ins
     fkmap, colsmap, enums, checks, relchecks, compfks = ctx.fkmap, ctx.colsmap, ctx.enums, ctx.checks, ctx.relchecks, ctx.compfks
-    def mock_one(val, assertion, write, preseed=None, ident=None, exp=True):
-        """Replace every policy UDF with a constant `val` (FakeFunction), act, assert, restore, re-seed."""
-        ctx.observations.append(Observation(cmd=cmd, ident=ident, exp=exp, mocked=True))
+    def mock_one(val, ident, who, kind, action, emit_preseed, write, expect_grant):
+        """MB-1 (probe-first wiring): install the policy UDF(s) as a constant `val`, PROBE the real
+        outcome at generation time, and bake the OBSERVATION via the ProbeBaker -- no more guessed
+        counts/lives/throws (the codebase's last probe-and-bake exception, retired). The emitted
+        battery reproduces the probe's arrangement exactly (install the mock, seed as the privileged
+        role, become the NB authenticated identity, assert, restore the real fn(s), re-seed), so it
+        passes on first replay and turns red only if the policy's delegation to the fn later drifts.
+          * expect_grant (the mock-TRUE call): a wiring proof needs mocking the fn true to actually
+            grant. If it does not (the policy has another gate, or the precondition row was filtered)
+            the delegation cannot be isolated -> a loud UNRELIABLE, never a misleading 'authorized
+            denied' cell. Corpus mock-true always grants, so this never fires there.
+          * a failed seed/precondition still degrades to UNRELIABLE via the baker -- never a false pass."""
+        install = [f"CREATE OR REPLACE FUNCTION {u['q']}({u['args']}) RETURNS boolean LANGUAGE sql AS $$ SELECT {val} $$" for u in udfs]
+        # Probe against the SAME pre-action state the emitted test will see: the explicit preseed when
+        # there is one, else the full seed the file header / re-seed leaves ambient (no-preseed path).
+        probe_arrange = install + list(emit_preseed if emit_preseed else (ctx.arrange_stmts or []))
+        pid = ctx.pident(NB, "authenticated")
+        o = _probe(conn, probe_arrange, pid, kind, action)
+        if expect_grant and not o[2]:
+            _granted = (o[0] == "count" and o[1] >= 1) if kind == "read" else (o[0] == "rows" and o[1] >= 1)
+            if not _granted:
+                o = (o[0], o[1], "mocking the policy function(s) TRUE did not grant this command -- the policy "
+                     "does not delegate solely to the mocked function (another gate or an unmet precondition "
+                     "applies), so the wiring cannot be isolated here; verify the function's own logic separately")
+        assertion = (baker.read_assert(o, who, ident=ident, mocked=True) if kind == "read"
+                     else baker.write_assert(o, cmd, action, who, ident=ident, mocked=True))
         n[0] += 1
-        body.extend(f"CREATE OR REPLACE FUNCTION {u['q']}({u['args']}) RETURNS boolean LANGUAGE sql AS $$ SELECT {val} $$;" for u in udfs)
-        if preseed:                                   # seed the precondition as the privileged role (RLS bypassed)
+        body.extend(s + ";" for s in install)
+        if emit_preseed:                              # seed the precondition as the privileged role (RLS bypassed)
             body.append("RESET ROLE;")
-            body.extend((s.rstrip().rstrip(';') + ";") for s in preseed)
-        body.append(f"SELECT set_config('request.jwt.claims', {_qlit(NB)}, true);")   # semicolon-terminated (script context)
-        body.append("SET LOCAL ROLE authenticated;")
+            body.extend((s.rstrip().rstrip(';') + ";") for s in emit_preseed)
+        body.extend((s.rstrip().rstrip(';') + ";") for s in pid)   # NB authenticated identity (probe used the same)
         body.append(assertion)
         body.append("RESET ROLE;")
         body.extend((u['def'].rstrip().rstrip(';') + ";") for u in udfs)   # restore the REAL functions (CREATE OR REPLACE)
@@ -173,8 +195,9 @@ def mock_emit(ctx, baker, cmd):
         # UNRELIABLE line per identity so the report shows ‼, the note names the cause, and CI gates.
         fns = ", ".join(u["q"] for u in udfs)
         reason = ("cannot CREATE OR REPLACE " + fns + " as the connection role -- mock wiring impossible in "
-                  "this environment; connect as a role that owns the function/schema (Supabase: supabase_admin) "
-                  "or run `rlsautotest doctor`")
+                  "this environment, so the delegated predicate cannot be isolated. Fix: run rlsautotest "
+                  "connected as a role that owns the policy function/schema (Supabase: supabase_admin), or run "
+                  "`rlsautotest doctor` to diagnose the probe environment")
         for _id, _who in (("authorized", "authenticated, authorized"), ("other", "authenticated, not authorized")):
             ctx.observations.append(Observation(cmd=cmd, ident=_id, kind="unreliable", mocked=True))
             n[0] += 1
@@ -217,26 +240,25 @@ def mock_emit(ctx, baker, cmd):
         if recipe is not None: return [f"DELETE FROM {q}"] + setup + [_ins_sql(q, srow)]
         if prow is not None:    return [f"DELETE FROM {q}"] + parents + [_ins_sql(q, prow)]
         return None
+    who_t = "authenticated, authorized when " + fns + " [mocked; wiring]"
+    who_f = "authenticated, not authorized when " + fns + " forced false [mocked; wiring]"
     if cmd == "SELECT":
-        pre = _exist_pre()
-        if pre:    # seed ONE real row, prove read-visibility both ways: mock TRUE -> visible (1), FALSE -> hidden (0)
-            mock_one("true",  f"SELECT is( (SELECT count(*) FROM {q})::int, 1, {desc('SELECT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True, preseed=pre, ident="authorized", exp=True)
-            mock_one("false", f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True, preseed=pre, ident="other", exp=False)
-        else:      # couldn't synthesize a row -> weaker fallback, still sound
-            mock_one("true",  f"SELECT is( (SELECT count(*) FROM {q})::int, {total_rows}, {desc('SELECT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", False, ident="authorized", exp=True)
-            mock_one("false", f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", False, ident="other", exp=False)
+        act = f"SELECT count(*) FROM {q}"
+        pre = _exist_pre()   # one seeded row -> mock TRUE sees it, FALSE hides it; else the ambient header-seeded rows
+        mock_one("true",  "authorized", who_t, "read", act, pre, bool(pre), True)
+        mock_one("false", "other",      who_f, "read", act, pre, bool(pre), False)
         return
     if cmd == "INSERT":
         icols = srow if recipe is not None else (nobody_ins or prow)
+        if icols is None: return
         # Clean the table first: without this the seeded row (from the prior reseed) can share the
         # insert-under-test's UNIQUE key (e.g. members' (group_id,user_id)) -> 23505, which would look
         # like a policy denial. Parents/CHECK-UDF neutralizers stay so the FKs still resolve.
         pre_ins = [f"DELETE FROM {q}"] + (((setup if recipe else parents)) or [])
-        if icols is None: return
         ins = _ins_sql(q, icols)
-        # mock TRUE -> WITH CHECK passes -> insert lives; mock FALSE -> WITH CHECK fails -> 42501
-        mock_one("true",  f"SELECT lives_ok( $$ {ins} $$, {desc('INSERT: authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True, preseed=pre_ins, ident="authorized", exp=True)
-        mock_one("false", f"SELECT throws_ok( $$ {ins} $$, '42501', NULL, {desc('INSERT: authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True, preseed=pre_ins, ident="other", exp=False)
+        # mock TRUE -> WITH CHECK passes -> insert lives; mock FALSE -> WITH CHECK fails -> denied (all OBSERVED)
+        mock_one("true",  "authorized", who_t, "write", ins, pre_ins, True, True)
+        mock_one("false", "other",      who_f, "write", ins, pre_ins, True, False)
         return
     if cmd == "UPDATE":
         if not upd_col: return
@@ -244,14 +266,24 @@ def mock_emit(ctx, baker, cmd):
     else:
         action = f"DELETE FROM {q}"
     preseed = _exist_pre() or []   # UPDATE/DELETE need a row present to affect
-    mock_one("true",  f"SELECT isnt_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, authorized when ' + fns + ' [mocked; wiring]')} );", True, preseed=preseed, ident="authorized", exp=True)
-    mock_one("false", f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': authenticated, not authorized blocked when ' + fns + '=false [mocked; wiring]')} );", True, preseed=preseed, ident="other", exp=False)
+    mock_one("true",  "authorized", who_t, "write", action, preseed, True, True)
+    mock_one("false", "other",      who_f, "write", action, preseed, True, False)
 
 
 def run(ctx, baker, cmd):
     if ctx.classes:   # a classified branch owns this command; these strategies serve the unclassified case
         return PASS
     if ctx.udfs:                                                  # opaque BOOLEAN function -> MOCK it (wiring)
+        # FIRST, real-input coverage where the function body is expandable (witness hints; the probe
+        # and the baked tests run the REAL function): the solver/relstate candidates substitute the
+        # parsed body predicate for the call. Emitted BEFORE the wiring block on purpose -- wiring
+        # restores the generation-time function definition mid-file, so a battery emitted after it
+        # would exercise the restored body instead of the live one and a drifted function would
+        # slip through on replay. Also covers a solvable NON-fn policy shadowed by a fn policy.
+        from .relstate import relstate_emit
+        from .solver import solve_emit
+        if not solve_emit(ctx, baker, cmd) and cmd == "SELECT":
+            relstate_emit(ctx, baker, cmd)
         mock_emit(ctx, baker, cmd)
         return AUGMENT   # falls through to the identity battery (as the old ladder did)
     return PASS

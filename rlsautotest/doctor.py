@@ -12,6 +12,7 @@ names/owners, sqlstates and per-table classification summaries — never row dat
 credentials, never policy expressions beyond what pg_policies exposes to the same role.
 """
 from __future__ import annotations
+from .astutil import _qi
 import argparse, json, platform, sys
 import psycopg
 
@@ -112,7 +113,7 @@ def cmd_doctor():
             if r not in have:
                 check(False, f"role '{r}' exists", f"create it (CREATE ROLE {r} NOLOGIN) or this identity row is untestable")
                 continue
-            ok, ss = _sp(cur, "_rlsa_doc_role", lambda r=r: (cur.execute(f"SET LOCAL ROLE {r}"), cur.execute("RESET ROLE")))
+            ok, ss = _sp(cur, "_rlsa_doc_role", lambda r=r: (cur.execute(f"SET LOCAL ROLE {_qi(r)}"), cur.execute("RESET ROLE")))
             check(ok, f"can SET ROLE {r}", None if ok else f"GRANT {r} TO {cu} (sqlstate {ss}) — the probe acts as each client role")
         bundle["client_roles"] = {r: (r in have) for r in _CLIENT_ROLES}
 

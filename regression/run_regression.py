@@ -39,12 +39,27 @@ GREEN = [
     ("customrole.sql", "crole"), ("quoted_idents.sql", "qident"),
     ("colsec.sql", "colsec"),
     ("checkfmt.sql", "checkfmt"),
+    ("multimembership.sql", "mtt"),   # issue #4: 2-tenant-member probe + scalar-subquery hazard + relstate anon 42501 denial
+    ("mixedor.sql", "mor"),           # obligation router: classified-OR-novel rescue, two permissive policies, NOT(a AND b) disjuncts
+    ("fnexpand.sql", "fnx"),          # UDF understanding: fn-body expansion -> real-input batteries; vault's dynamic-EXECUTE stays wiring
+    ("publicto.sql", "pto"),          # RA-8: no-TO (PUBLIC) audience + LOGIN client roles + group inheritance; L001 CRITICAL + L017 fire
+    ("writescope.sql", "wsc"),        # MB-20: L018 unconstrained-scope-column-on-write (docs fires, safe does not); --report stays green
+    ("joinsub.sql", "jsq"),           # MB-2: membership-through-a-2-table-join subquery -> DB-verified solver battery (was NT)
+    ("joinsub3.sql", "jsq3"),         # MB-2b: 3-table INNER-join membership CHAIN (memberships->roles->role_types) -> N-table solver battery (was NT)
+    ("orsubquery.sql", "orsub"),      # MB-2b: OR inside a subquery WHERE -> DNF-split to the identity arm -> DB-verified solver battery (was NT)
+    ("neon.sql", "neon"),             # MB-11: Neon pg_session_jwt vocabulary (auth.user_id/auth.session) + discovered roles (authenticated/anonymous, no service_role); flavor-aware shim
+    ("clscustom.sql", "clsc"),        # MB-12: custom role (clsc_auditor) with a column-scoped SELECT grant -> report AND emitted suite both carry its CLS parity assertion (scoped green + leak red)
+    ("dualwrite.sql", "dw"),          # MB-18: L020 dual-write-path advisory (orders fires, safe does not); --report stays green
+    ("restrictconj.sql", "rcj"),      # MB-6: restrictive predicate conjoined into a routed (solver) obligation -> was PARTIALLY TESTED, now green
+    ("relstatewrite.sql", "rsw"),     # MB-4: relational-state (cardinality) FOR ALL -> INSERT/UPDATE/DELETE write batteries
+    ("recursionwrite.sql", "rcw"),    # MB-4: self-referential hierarchy FOR ALL -> UPDATE/DELETE write batteries (INSERT stays NT)
     ("updcheck.sql", "updcheck"), ("seedfail.sql", "seedfail"),
 ]
 # fixture, schema, required marker(s) in the failing report
 NEGATIVE = [
     ("transitions.sql", "transitions", ["cross-policy WITH CHECK leak"]),
     ("seedimpossible.sql", "seedimpossible", ["UNRELIABLE"]),
+    ("scalarmulti.sql", "scm", ["member of 2 tenants", "21000"]),   # MB-3: scalar-subquery 2-tenant hazard, caught live on read AND write
 ]
 # exotic.sql is deliberately NOT loaded: it contains a broken-by-design 42P17 policy.
 
@@ -62,6 +77,12 @@ def run_cli(dburl, *args):
 
 
 def main():
+    # Windows hardening: the default console/redirect encoding (cp1252) cannot encode the report's matrix
+    # glyphs (checkmark, double-bang, dash), so printing a failure diff to a redirected file would crash the
+    # harness mid-run. Force UTF-8 so it never chokes on its own output (no-op where stdout is already UTF-8).
+    for _s in (sys.stdout, sys.stderr):
+        try: _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception: pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--db-url", required=True, help="DISPOSABLE database (dropped with --recreate)")
     ap.add_argument("--recreate", action="store_true", help="drop + recreate the database first")
@@ -208,8 +229,127 @@ def main():
                                         + "\n".join(d[:20]))
                 print(f"  [private {db}] {schema:<12} gate={gate.returncode}")
 
+    # ---- ISOLATED-DB identity-binding check (MB-19) -------------------------------------------
+    # authshape.sql redefines auth.uid() with a body the probe cannot drive (the flat
+    # request.jwt.claim.sub GUC), so it must run in its OWN database -- loading it into the shared
+    # corpus DB would clobber every other fixture's identity binding. Assert that a CLASSIFIED owner
+    # policy whose identity cannot be bound is flagged LOUDLY (UNRELIABLE + nonzero gate), never a
+    # silent "correctly denied" cell. Not byte-baselined -- it's a gate+marker assertion like NEGATIVE.
+    ISO_FIXTURE = os.path.join(REPO, "examples", "authshape.sql")
+    murl2 = re.match(r"(postgresql://[^/]+/)(\w+)(.*)$", a.db_url)
+    if os.path.exists(ISO_FIXTURE) and murl2:
+        iso_db = murl2.group(2) + "_authshape"
+        admin2 = murl2.group(1) + "postgres" + murl2.group(3)
+        iso_url = murl2.group(1) + iso_db + murl2.group(3)
+        try:
+            with psycopg.connect(admin2, autocommit=True) as c:
+                c.execute(f'DROP DATABASE IF EXISTS "{iso_db}" WITH (FORCE)')
+                c.execute(f'CREATE DATABASE "{iso_db}"')
+            for fx in ("schema.sql", "authshape.sql"):   # schema.sql = roles + JSON auth shim; authshape overrides auth.uid() flat
+                r = subprocess.run([a.psql, iso_url, "-v", "ON_ERROR_STOP=1", "-q",
+                                    "-f", os.path.join(REPO, "examples", fx)], capture_output=True, text=True)
+                if r.returncode != 0:
+                    failures.append(f"[identity-binding] loading {fx} failed: {r.stderr[-400:]}")
+            gate = run_cli(iso_url, "--schema", "ash", "--report")
+            out = gate.stdout + gate.stderr
+            if gate.returncode == 0:
+                failures.append("[identity-binding] ash gate PASSED -- an unbindable owner identity was "
+                                "NOT flagged (MB-19 regressed: silent all-deny is back)")
+            if "UNRELIABLE TEST" not in out or "auth.uid()" not in out:   # the footgun note, not the legend line
+                failures.append("[identity-binding] ash report missing the UNRELIABLE identity-binding marker")
+            print(f"  [identity-binding] ash    gate={gate.returncode} (expected nonzero, UNRELIABLE)")
+            with psycopg.connect(admin2, autocommit=True) as c:
+                c.execute(f'DROP DATABASE IF EXISTS "{iso_db}" WITH (FORCE)')
+        except Exception as e:
+            failures.append(f"[identity-binding] check errored: {e}")
+
+    # ---- ISOLATED-DB flat-claim binding check (MB-23) -----------------------------------------
+    # flatclaim.sql redefines auth.uid() to read the OLD flat request.jwt.claim.sub GUC (cekuu35's
+    # shape). MB-23 makes the probe/emitters ALSO drive that GUC, so the SAME owner policy that stays
+    # UNRELIABLE under a custom app GUC (authshape) now BINDS and goes GREEN. Assert gate==0 and NO
+    # UNRELIABLE marker. Own DB (redefines auth.uid()). Not byte-baselined -- a gate+marker assertion.
+    ISO_FC = os.path.join(REPO, "examples", "flatclaim.sql")
+    if os.path.exists(ISO_FC) and murl2:
+        fc_db = murl2.group(2) + "_flatclaim"
+        admin2 = murl2.group(1) + "postgres" + murl2.group(3)
+        fc_url = murl2.group(1) + fc_db + murl2.group(3)
+        try:
+            with psycopg.connect(admin2, autocommit=True) as c:
+                c.execute(f'DROP DATABASE IF EXISTS "{fc_db}" WITH (FORCE)')
+                c.execute(f'CREATE DATABASE "{fc_db}"')
+            for fx in ("schema.sql", "flatclaim.sql"):
+                r = subprocess.run([a.psql, fc_url, "-v", "ON_ERROR_STOP=1", "-q",
+                                    "-f", os.path.join(REPO, "examples", fx)], capture_output=True, text=True)
+                if r.returncode != 0:
+                    failures.append(f"[flat-claim] loading {fx} failed: {r.stderr[-400:]}")
+            gate = run_cli(fc_url, "--schema", "fc", "--report")
+            out = gate.stdout + gate.stderr
+            if gate.returncode != 0:
+                failures.append("[flat-claim] fc gate FAILED -- the flat request.jwt.claim.sub owner "
+                                "identity did not bind (MB-23 regressed: it fell back to UNRELIABLE)")
+            if "UNRELIABLE TEST" in out:   # the footgun note, not the legend line (which always says "UNRELIABLE")
+                failures.append("[flat-claim] fc report has an UNRELIABLE cell -- the flat GUC identity "
+                                "was not driven (MB-23 regressed)")
+            print(f"  [flat-claim] fc          gate={gate.returncode} (expected 0, bound green)")
+            with psycopg.connect(admin2, autocommit=True) as c:
+                c.execute(f'DROP DATABASE IF EXISTS "{fc_db}" WITH (FORCE)')
+        except Exception as e:
+            failures.append(f"[flat-claim] check errored: {e}")
+
+    # ---- MB-9: OPT-IN CRITICAL-bypass gate + --allow-bypass sanctioning ------------------------
+    # recursion.all_nodes() is a CRITICAL bypass surface (anon-EXECUTE-able SECURITY DEFINER fn that
+    # sidesteps RLS). By DEFAULT it is a review flag -> recursion's normal gate stays 0. Assert that
+    # --fail-on-bypass turns it into a gate FAILURE, and --allow-bypass sanctions it back to green -- so a
+    # NEW unsanctioned CRITICAL surface fails CI while a reviewed one does not. Gate assertion, not
+    # byte-baselined; recursion is already loaded in the shared corpus DB.
+    try:
+        g_def = run_cli(a.db_url, "--schema", "recursion", "--report")
+        if g_def.returncode != 0:
+            failures.append("[bypass-gate] recursion baseline gate != 0 -- the default (no --fail-on-bypass) gate changed")
+        g_on = run_cli(a.db_url, "--schema", "recursion", "--report", "--fail-on-bypass")
+        if g_on.returncode == 0:
+            failures.append("[bypass-gate] recursion --fail-on-bypass PASSED -- the CRITICAL bypass all_nodes() was NOT gated")
+        g_ok = run_cli(a.db_url, "--schema", "recursion", "--report", "--fail-on-bypass", "--allow-bypass", "L012:all_nodes()")
+        if g_ok.returncode != 0:
+            failures.append("[bypass-gate] recursion --allow-bypass L012:all_nodes() FAILED -- sanctioning did not exempt the reviewed surface")
+        print(f"  [bypass-gate] recursion  default={g_def.returncode} fail-on-bypass={g_on.returncode} sanctioned={g_ok.returncode} (expected 0 / nonzero / 0)")
+    except Exception as e:
+        failures.append(f"[bypass-gate] check errored: {e}")
+
+    # ---- MB-25: --allow-unreliable / .rlsautotestignore sanctioning of UNRELIABLE cells --------------
+    # seedimpossible.blocked is UNRELIABLE (its seed row violates a CHECK). Default -> the gate FAILS.
+    # Sanction the whole table -> gate green, the cell stays UNRELIABLE in the report (SANCTIONED note), and
+    # the emitted suite bakes a pgTAP SKIP (never a fail(), never a passing assertion). Sanction only ONE
+    # command -> the other commands must STILL fail (the exemption is scoped, not a blanket --no-fail).
+    try:
+        su_def = run_cli(a.db_url, "--schema", "seedimpossible", "--report")
+        if su_def.returncode == 0:
+            failures.append("[allow-unreliable] seedimpossible baseline gate == 0 -- UNRELIABLE no longer fails the gate")
+        su_all = run_cli(a.db_url, "--schema", "seedimpossible", "--report", "--allow-unreliable", "blocked")
+        if su_all.returncode != 0:
+            failures.append("[allow-unreliable] --allow-unreliable blocked did NOT exempt the gate")
+        if "SANCTIONED UNRELIABLE" not in su_all.stdout:
+            failures.append("[allow-unreliable] sanctioned report is missing the SANCTIONED note (the cell must stay visible)")
+        su_part = run_cli(a.db_url, "--schema", "seedimpossible", "--report", "--allow-unreliable", "blocked:SELECT")
+        if su_part.returncode == 0:
+            failures.append("[allow-unreliable] blocked:SELECT wrongly exempted the whole table (INSERT/UPDATE/DELETE must still fail)")
+        with tempfile.TemporaryDirectory() as _sud:
+            run_cli(a.db_url, "--schema", "seedimpossible", "--emit", _sud, "--allow-unreliable", "blocked")
+            _blocked = None
+            for _root, _dirs, _files in os.walk(_sud):
+                for _fn in _files:
+                    if "blocked" in _fn and _fn.endswith(".sql"):
+                        _blocked = open(os.path.join(_root, _fn), encoding="utf-8").read()
+            if _blocked is None:
+                failures.append("[allow-unreliable] emit produced no blocked suite")
+            elif "SELECT skip(" not in _blocked or "UNRELIABLE - " in _blocked:
+                failures.append("[allow-unreliable] emitted suite did not swap every UNRELIABLE fail() -> skip() under a full sanction")
+        print(f"  [allow-unreliable] seedimpossible  default={su_def.returncode} sanctioned={su_all.returncode} partial-SELECT={su_part.returncode} (expected nonzero / 0 / nonzero)")
+    except Exception as e:
+        failures.append(f"[allow-unreliable] check errored: {e}")
+
     if not a.skip_pytest:
-        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "tests/test_smoke.py"],
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "tests/test_smoke.py", "tests/test_bypassprobe.py", "tests/test_allow_unreliable.py"],
                            capture_output=True, text=True, cwd=REPO)
         print("pytest:", (r.stdout + r.stderr).strip().splitlines()[-1])
         if r.returncode != 0:

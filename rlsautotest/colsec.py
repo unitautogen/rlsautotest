@@ -164,3 +164,21 @@ def column_security(cur, schema, table, roles=None):
             effective = _effective_columns(cur, schema, table, role, cmd)
             cells[role][cmd] = cell_facts(granted, effective)
     return {"columns": columns, "cells": cells}
+
+
+def column_grant_roles(cur, schema, table, exclude=()):
+    """Custom roles (non-superuser, non-`pg_*`) that hold an EXPLICIT column-level grant on this table --
+    pg_attribute.attacl via aclexplode. Such a role expresses a column scope exactly like the standard client
+    roles, so it must get the SAME CLS treatment in BOTH the report grid AND the emitted suite; returning it
+    from ONE shared place is what keeps report and suite from ever disagreeing about which roles are covered.
+    `exclude` names roles the caller already has (the standard client roles, plus any policy-named custom
+    roles the report adds) so they are not returned twice. Superusers are skipped (has_column_privilege is
+    trivially every column for them) as are internal `pg_*` roles. A table with NO custom-role column grant
+    returns [] -> callers add nothing and report/suite stay byte-identical to before this ever existed."""
+    cur.execute("""SELECT DISTINCT r.rolname FROM pg_attribute a
+        JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+        CROSS JOIN LATERAL aclexplode(a.attacl) ae JOIN pg_roles r ON r.oid=ae.grantee
+        WHERE n.nspname=%s AND c.relname=%s AND a.attnum>0 AND NOT a.attisdropped AND a.attacl IS NOT NULL
+          AND NOT r.rolsuper AND left(r.rolname,3) <> 'pg_' AND r.rolname <> ALL(%s::text[])
+        ORDER BY r.rolname""", (schema, table, list(exclude)))
+    return [r[0] for r in cur.fetchall()]

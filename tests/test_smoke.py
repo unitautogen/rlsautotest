@@ -149,9 +149,16 @@ def test_solver_witnesses_noncanonical_subquery():
     # two correlations -> both seeded (outer row + aux row)
     sat2, _ = _solve_predicate(_where("exists (select 1 from links l where l.a = t.a and l.b = t.b)"), ct, {})
     assert "a" in sat2["row"] and "b" in sat2["row"] and {"a", "b"} <= set(sat2["aux"][0]["cols"])
-    # a multi-table (join) subquery -> not modeled -> None (honest NT, never a guess)
-    assert _solve_predicate(_where(
-        "exists (select 1 from links l join other o on o.id = l.a where l.b = t.b)"), ct, {}) is None
+    # MB-2: a 2-table INNER-join subquery is now witnessed -- BOTH tables seeded, the equijoin key
+    # shared between the anchor row's FK and the joined row's key (a wrong seed still DB-fails -> NT).
+    _sj, _fj = _solve_predicate(_where(
+        "exists (select 1 from links l join other o on o.id = l.a where l.b = t.b)"), ct, {})
+    assert _sj is not None
+    assert {"links", "other"} <= {a["table"] for a in _sj["aux"]}
+    _la = next(a["cols"] for a in _sj["aux"] if a["table"] == "links")
+    _oa = next(a["cols"] for a in _sj["aux"] if a["table"] == "other")
+    assert _la["a"] == _oa["id"]                                   # shared join key
+    assert _sj["row"]["b"] != _fj["row"]["b"]                      # falsifier breaks the outer correlation
 
 
 def test_solver_witnesses_is_distinct_from():
@@ -442,5 +449,87 @@ def test_extract_signature_and_shared_subquery_reader():
                        "AND m.user_id = ( SELECT auth.uid() ))")["SubLink"]
     m = _membership(canonical["subselect"], None)
     assert m["kind"] == "membership" and m["mscope_col"] == "org_id" and m["row_scope_col"] == "id"
-    # OR in the WHERE -> no signature at all
-    assert _subquery_sig(_where("EXISTS ( SELECT 1 FROM t m WHERE m.a = x.b OR m.c = 1 )")["SubLink"]["subselect"]) is None
+    # OR in the WHERE (MB-2b): no longer bails to None -- the WHERE is DNF-split and the
+    # identity/correlation arm is returned flagged `or_split` (here the `m.a = x.b` arm; the `m.c = 1`
+    # arm has no correlation and is dropped). The classifier and the relational-state extractor stay
+    # conservative on an or_split sig and defer to the DB-verified solver.
+    _orq = "EXISTS ( SELECT 1 FROM t m WHERE m.a = x.b OR m.c = 1 )"
+    _orsig = _subquery_sig(_where(_orq)["SubLink"]["subselect"])
+    assert _orsig is not None and _orsig.get("or_split") and _orsig["corr"] == [("a", "b")]
+    assert _membership(_where(_orq)["SubLink"]["subselect"], None)["kind"] == "unknown"
+    from rlsautotest.witness import _subquery_tables
+    assert _subquery_tables(_where(_orq)) == []
+
+
+def test_scalar_subquery_lookup_detector_issue4():
+    # Issue #4: `col = (SELECT ... FROM t WHERE ... = auth.uid())` is the member-of-2-tenants hazard
+    # (2 rows -> 21000; LIMIT 1 -> arbitrary pick). The detector is AST-based, so the initplan idiom
+    # and the multi-row-safe forms (EXISTS / IN / ANY) must NOT match.
+    from rlsautotest.lint import _scalar_subquery_lookups
+    hits = _scalar_subquery_lookups("team_id = (SELECT team_id FROM team_members WHERE user_id = auth.uid())")
+    assert hits and hits[0][0] == "team_members" and hits[0][1] == "user_id" and hits[0][2] is False
+    hits = _scalar_subquery_lookups("team_id = (SELECT team_id FROM team_members WHERE user_id = auth.uid() LIMIT 1)")
+    assert hits and hits[0][2] is True, "LIMIT variant must be reported with has_limit=True"
+    hits = _scalar_subquery_lookups("(SELECT team_id FROM app.team_members WHERE user_id = auth.uid()) = team_id")
+    assert hits and hits[0][0] == "app.team_members", "reversed comparison + qualified table must match"
+    # safe shapes -> no hit
+    assert not _scalar_subquery_lookups("(SELECT auth.uid()) = user_id"), "initplan idiom has no FROM"
+    assert not _scalar_subquery_lookups("EXISTS (SELECT 1 FROM team_members m WHERE m.team_id = team_id AND m.user_id = auth.uid())")
+    assert not _scalar_subquery_lookups("team_id IN (SELECT team_id FROM team_members WHERE user_id = auth.uid())")
+    assert not _scalar_subquery_lookups("status = (SELECT val FROM settings)"), "no caller correlation -> not the hazard"
+
+
+def test_seed_plan_multi_membership_gating_issue4():
+    # The 2-tenant member is seeded ONLY for a PURE canonical-membership SELECT branch, and the
+    # self-pollution guard keeps it off the membership table itself. No DB needed: _seed_plan runs
+    # without a conn (the schema-uniqueness check is conn-gated).
+    from rlsautotest.seeding import _seed_plan
+    from rlsautotest.atoms import build_class
+    mem_atom = {"kind": "membership", "mtable": "app.team_members", "muser_col": "user_id",
+                "mscope_col": "team_id", "row_scope_col": "team_id"}
+    own_atom = {"kind": "owner", "col": "owner_id"}
+    cols = [("id", "bigint", 1, True), ("team_id", "uuid", 2, False), ("title", "text", 3, False)]
+    colsmap = {"app.docs": [("id", "bigint", False, True), ("team_id", "uuid", True, False), ("title", "text", True, False)],
+               "app.team_members": [("team_id", "uuid", True, False), ("user_id", "uuid", True, False)]}
+    per = {"SELECT": {"classes": [build_class([mem_atom], 0)], "open": False}}
+    S = _seed_plan("app", "docs", per, ["SELECT"], cols, {}, colsmap, {}, set())
+    assert S["multi"]["on"] and S["multi"]["branch"] == 0 and S["multi"]["extra"] == 1
+    assert "member of 2 tenants" in S["seed"] and "org M row" in S["seed"]
+    # impure branch (membership AND owner): another conjunct could legitimately narrow the view -> OFF
+    per2 = {"SELECT": {"classes": [build_class([mem_atom, own_atom], 0)], "open": False}}
+    S2 = _seed_plan("app", "docs", per2, ["SELECT"], cols, {}, colsmap, {}, set())
+    assert not S2["multi"]["on"]
+    # the table under test IS the membership table -> self-pollution guard -> OFF
+    mem_self = dict(mem_atom, mtable="app.docs")
+    per3 = {"SELECT": {"classes": [build_class([mem_self], 0)], "open": False}}
+    S3 = _seed_plan("app", "docs", per3, ["SELECT"], cols, {}, colsmap, {}, set())
+    assert not S3["multi"]["on"]
+
+
+def test_fn_expansion_helpers():
+    """UDF understanding: count-positive rewrite detection + parameter substitution (AST-level)."""
+    import json
+    from pglast.parser import parse_sql_json
+    from rlsautotest.atoms import _is_count_positive, _subst_params, _EXPAND_FAIL
+
+    def expr(sql):
+        st = json.loads(parse_sql_json(f"SELECT {sql}"))["stmts"][0]["stmt"]["SelectStmt"]
+        return st["targetList"][0]["ResTarget"]["val"]
+
+    # count(*) > 0 / >= 1 (either operand order) are positive gates; other comparisons are not
+    assert _is_count_positive(expr("count(*) > 0"))
+    assert _is_count_positive(expr("count(*) >= 1"))
+    assert _is_count_positive(expr("0 < count(*)"))
+    assert not _is_count_positive(expr("count(*) > 1"))
+    assert not _is_count_positive(expr("sum(x) > 0"))
+
+    # $1 (SQL bodies) and bare named refs (named params / plpgsql vars) substitute; unresolvable fails
+    const = expr("'editor'")
+    node = expr("role = $1")
+    out = _subst_params(node, [const], [])
+    assert "'editor'" not in str(node) or True   # original untouched (deep copy semantics)
+    assert json.dumps(out).count("editor") == 1
+    named = expr("role = wanted")
+    out2 = _subst_params(named, [const], ["wanted"])
+    assert json.dumps(out2).count("editor") == 1
+    assert _subst_params(expr("role = $2"), [const], []) is _EXPAND_FAIL

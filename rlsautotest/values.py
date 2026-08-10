@@ -203,6 +203,12 @@ RIVAL_ORG = "b0000000-0000-0000-0000-00000000b0b0"   # tenant B's scope value â€
 
 INS = "cccccccc-cccc-cccc-cccc-cccccccccccc"   # fresh value for insert-into-own-scope tests
 
+MULTI_SUB = "d0000000-0000-4000-8000-0000000000dd"   # issue #4: ONE user holding membership in TWO tenants (org A + org M)
+
+MULTI_ORG = "d0000000-0000-4000-8000-00000000d0d0"   # the 2-tenant member's SECOND scope (org M; distinct from the rival's org B)
+
+MULTI_ORG2 = "d0000000-0000-4000-8000-00000000d222"  # MB-3 scalar shape: the 2-tenant member's FIRST scope (needs TWO orgs of its own, not tied to a branch seed)
+
 WV_UID = "5ce1a000-0000-4000-8000-000000000001"   # the witness solver's acting identity (auth.uid())
 
 WV_SCOPE = "5c09e000-0000-4000-8000-000000000001"   # the witness solver's scope/correlation value
@@ -221,6 +227,7 @@ ALL_SENTINELS = {
     "CV0": CV[0], "CV1": CV[1], "CV2": CV[2],
     "MV0": MV[0], "MV1": MV[1], "MV2": MV[2],
     "FOREIGN": FOREIGN, "NOBODY": NOBODY, "RIVAL_SUB": RIVAL_SUB, "RIVAL_ORG": RIVAL_ORG, "INS": INS,
+    "MULTI_SUB": MULTI_SUB, "MULTI_ORG": MULTI_ORG, "MULTI_ORG2": MULTI_ORG2,
     "WV_UID": WV_UID, "WV_SCOPE": WV_SCOPE, "WV_MISS": WV_MISS,
     "REC_ROOT": REC_ROOT, "REC_OTHER": REC_OTHER,
     "SPAIR_A": "aaaaaaaa-0000-4000-8000-00000000aaaa", "SPAIR_B": "bbbbbbbb-0000-4000-8000-00000000bbbb",

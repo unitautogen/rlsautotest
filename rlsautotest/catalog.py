@@ -136,6 +136,27 @@ def _fk_by_name(cur, cname):
 
 
 
+def _single_unique_col(cur, table_fqn, col):
+    """True when `col` ALONE is unique in table_fqn (a single-column PK/UNIQUE constraint, or a full —
+    non-partial, non-expression — unique index on exactly that column). Two rows sharing that column
+    value CANNOT coexist. Consumers: the member-of-2-tenants probe (a membership table whose user
+    column is unique enforces at most ONE membership per user BY SCHEMA, so the two-membership state
+    cannot exist in production — nothing to test) and the scalar-subquery lint (a lookup keyed on a
+    unique column returns at most one row — the classic profile-lookup shape — and is NOT a hazard)."""
+    try:
+        cur.execute("""SELECT count(*) FROM pg_index i
+                       WHERE i.indrelid = to_regclass(%s) AND i.indisunique
+                         AND i.indnkeyatts = 1 AND i.indpred IS NULL AND i.indexprs IS NULL
+                         AND (SELECT a.attname FROM pg_attribute a
+                              WHERE a.attrelid = i.indrelid AND a.attnum = i.indkey[0]) = %s""",
+                    (table_fqn, col))
+        r = cur.fetchone()
+        return bool(r and r[0])
+    except Exception:
+        return False
+
+
+
 def _check_bool_udfs(cur, cname):
     """Boolean UDFs the named CHECK constraint actually calls -> [(qualified_signature, original_functiondef)].
     Resolved EXACTLY via pg_depend (the constraint's recorded dependency on the function) so a same-named
@@ -203,26 +224,50 @@ def auth_profile(cur, schema):
     brand logic, and understands an unknown provider on its own terms. `flavor` is derived from the identity/
     claims function VOCABULARY and is ADVISORY only (for provider quirks like the helper shim), never a gate.
     Returns role NAMES; `service_role` is None when no bypass role is reachable here."""
+    # RA-1 + RA-5: a policy with no TO clause is stored as polroles = {0} -- OID 0 is the PUBLIC
+    # pseudo-role, has NO row in pg_roles, and therefore can never satisfy a literal OID match. In a
+    # schema whose policies all omit TO (very common in the wild), a literal-only match reads every
+    # role as "no policy references it". `haspub` carries that fact explicitly. Group inheritance is
+    # the same bug class reached through the role graph: a policy `TO admins` applies to every member
+    # that inherits admins' privileges, so membership is tested with pg_has_role (what Postgres itself
+    # checks), not OID equality. LOGIN roles reachable only via PUBLIC are admitted as client-role
+    # candidates, EXCEPT the connecting role and the schema owner (keeps the docstring's contract that
+    # connection/owner login roles are excluded).
     cur.execute("""
-        WITH sc AS (SELECT oid FROM pg_namespace WHERE nspname = %s),
+        WITH sc AS (SELECT oid, nspowner FROM pg_namespace WHERE nspname = %s),
         polr AS (
             SELECT DISTINCT t.roid AS roid
             FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid,
                  LATERAL unnest(p.polroles) AS t(roid)
-            WHERE c.relnamespace = (SELECT oid FROM sc)
+            WHERE c.relnamespace = (SELECT oid FROM sc) AND t.roid <> 0
+        ),
+        haspub AS (
+            SELECT EXISTS (SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
+                           WHERE c.relnamespace = (SELECT oid FROM sc)
+                             AND p.polroles @> ARRAY[0]::oid[]) AS yes
         )
-        SELECT r.rolname, r.rolbypassrls, (r.oid IN (SELECT roid FROM polr)) AS in_policy
+        SELECT r.rolname, r.rolbypassrls,
+               (EXISTS (SELECT 1 FROM polr WHERE pg_has_role(r.oid, polr.roid, 'USAGE'))
+                OR (SELECT yes FROM haspub)) AS in_policy
         FROM pg_roles r
         WHERE NOT r.rolsuper AND left(r.rolname, 3) <> 'pg_'
           AND has_schema_privilege(r.oid, (SELECT oid FROM sc), 'USAGE')
-          AND (NOT r.rolcanlogin OR r.oid IN (SELECT roid FROM polr))
+          AND (NOT r.rolcanlogin
+               OR EXISTS (SELECT 1 FROM polr WHERE pg_has_role(r.oid, polr.roid, 'USAGE'))
+               OR ((SELECT yes FROM haspub)
+                   AND r.rolname <> current_user
+                   AND r.oid <> (SELECT nspowner FROM sc)))
           AND EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = (SELECT oid FROM sc) AND c.relkind = 'r'
                         AND (has_table_privilege(r.oid, c.oid, 'SELECT') OR has_table_privilege(r.oid, c.oid, 'INSERT')
                              OR has_table_privilege(r.oid, c.oid, 'UPDATE') OR has_table_privilege(r.oid, c.oid, 'DELETE')))
         ORDER BY r.rolname
     """, (schema,))
     client = cur.fetchall()                                   # [(rolname, rolbypassrls, in_policy)]
-    bypass = next((n for (n, b, _ip) in client if b), None)   # rolbypassrls role (Supabase service_role); else None
+    # MB-9b: a conventionally-named PROBED client role (authenticated/anon/anonymous) that itself carries
+    # rolbypassrls must NOT be absorbed into the sanctioned service_role slot -- it is a role we PROBE AS,
+    # and probing as a BYPASSRLS role sees every row regardless of policy. Absorb only a NON-probed bypass
+    # role (Supabase's service_role); a bypassing client role stays in its slot -> emit bakes it UNRELIABLE.
+    bypass = next((n for (n, b, _ip) in client if b and n not in ("authenticated", "anon", "anonymous")), None)   # rolbypassrls role; else None
     rest = [(n, ip) for (n, b, ip) in client if n != bypass]
     names = [n for (n, _ip) in rest]
     if "authenticated" in names:
@@ -238,7 +283,30 @@ def auth_profile(cur, schema):
                 "(to_regprocedure('auth.uid()') IS NOT NULL OR to_regprocedure('auth.jwt()') IS NOT NULL)")
     neon_fns, sb_fns = cur.fetchone()
     flavor = "neon" if (neon_fns and not sb_fns) else ("supabase" if sb_fns else "generic")
-    return {"flavor": flavor, "authenticated": authed, "unauth": unauth, "service_role": bypass}
+    # MB-23: does auth.uid()/auth.jwt()/auth.role() read the OLD flat per-claim GUC
+    # `request.jwt.claim.<key>` (older GoTrue / hand-rolled) rather than the `request.jwt.claims`
+    # JSON the probe sets? The trailing dot distinguishes it from `request.jwt.claims`. If so, the
+    # identity emitters ALSO drive the flat GUCs so the identity binds (else it would read NULL).
+    cur.execute("""SELECT coalesce(string_agg(pg_get_functiondef(p.oid), ' '), '')
+        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'auth' AND p.proname IN ('uid','jwt','role')""")
+    _bodies = (cur.fetchone() or [""])[0] or ""
+    claim_style = "flat" if "request.jwt.claim." in _bodies else "json"
+    return {"flavor": flavor, "authenticated": authed, "unauth": unauth, "service_role": bypass,
+            "claim_style": claim_style}
+
+
+def probed_bypassrls(cur, roles):
+    """MB-9b: which of these PROBED client roles carry rolbypassrls? Probing the row-level matrix AS such a
+    role sees every row regardless of policy, so its observations are UNRELIABLE (never a green cell) -- a
+    passing read there cannot tell a correct policy from a broken one. auth_profile already excludes
+    superusers, so rolbypassrls is the only role-level bypass to catch here; the sanctioned service_role
+    slot is NOT passed in (its bypass IS the point of that row). Returns the subset of `roles` that bypass."""
+    rs = [r for r in dict.fromkeys(roles) if r]   # de-dup (preserve order), drop falsy/None
+    if not rs:
+        return set()
+    cur.execute("SELECT rolname FROM pg_roles WHERE rolname = ANY(%s) AND rolbypassrls", (rs,))
+    return {r[0] for r in cur.fetchall()}
 
 
 

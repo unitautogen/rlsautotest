@@ -105,7 +105,7 @@ def _subquery_tables(node):
             return
         if _t(n) == "SubLink":
             sig = _subquery_sig(_v(n).get("subselect"))
-            if sig is not None and not sig["unmodeled"] and not sig["fns"]:
+            if sig is not None and not sig["unmodeled"] and not sig["fns"] and not sig.get("joins") and not sig.get("or_split"):
                 out.append({"mtable": sig["mtable"], "uid": sig["uid"], "corr": sig["corr"],
                             "extras": sig["extras"], "num": sig["agg"],
                             "scope": "5c0d0000-0000-4000-8000-000000000001"})
@@ -400,6 +400,35 @@ def _solve_fncol_preimage(L, R, coltypes, enums):
     return None
 
 
+def _solve_njoin(sig):
+    """MB-2b: witness for an N-table (>2) EXISTS join chain. `sig["njoin"]` carries the pre-grouped aux rows
+    (each column -> a value-ref) in reversed-BFS order (FK parents first) plus the outer-row correlation refs.
+    Materialize the refs into concrete values -- a fresh key per join group, auth.uid()/a constant/the
+    correlation value where the group is tagged -- then build the SAT witness (outer correlation matched + one
+    row per table) and the FAL witness (outer correlation pointed at a no-match value -> EXISTS false). Every
+    value flows through solve_emit's DB-verify, so a wrong FK direction or unsatisfiable shape falls to NT."""
+    nj = sig["njoin"]
+    sat, fal = _wv_ctx(), _wv_ctx()
+    keyval = {}
+    def _val(ref):
+        if ref[0] == "uid":
+            return _WV_UID
+        if ref[0] == "const":
+            return ref[1]
+        if ref[0] == "corr":
+            return "5c09e000-0000-4000-8000-%012x" % (ref[1] + 1)
+        keyval.setdefault(ref[1], "5c0f%04x-0000-4000-8000-000000000001" % (ref[1] & 0xffff))
+        return keyval[ref[1]]
+    if nj["has_uid"]:
+        sat["sub"] = fal["sub"] = _WV_UID
+    for (rcol, ref) in nj["outer"]:
+        sat["row"][rcol] = _val(ref)
+        fal["row"][rcol] = "5c09e000-0000-4000-8000-0000000000ff"   # no matching row -> EXISTS false
+    for auxt in nj["aux"]:
+        sat["aux"].append({"table": auxt["table"], "cols": {c: _val(ref) for c, ref in auxt["cols"].items()}})
+    return (sat, fal)
+
+
 def _solve_subquery(node, coltypes, enums):
     """WB-3: general EXISTS/IN subquery witness. Single base table, AND-only WHERE. Captures ALL correlations
     (subq col = outer col), an optional `auth.uid()` identity, and extra equality/boolean conditions on subquery
@@ -416,6 +445,8 @@ def _solve_subquery(node, coltypes, enums):
     sig = _subquery_sig(sv.get("subselect"), sv.get("testexpr") if st == "ANY_SUBLINK" else None)
     if sig is None or sig["unmodeled"] or sig["fns"] or not sig["corr"]:
         return None
+    if sig.get("njoin"):
+        return _solve_njoin(sig)
     correlations, muser, extras = sig["corr"], sig["uid"], sig["extras"]
     mtable = sig["mtable"]
     sat, fal = _wv_ctx(), _wv_ctx()
@@ -428,6 +459,23 @@ def _solve_subquery(node, coltypes, enums):
         sat["sub"] = fal["sub"] = _WV_UID
         auxcols[muser] = _WV_UID
     auxcols.update(extras)
+    # MB-2: seed the joined table(s). The joined row(s) go in FIRST so an anchor->joined FK resolves;
+    # the join key is a fresh value placed on BOTH the anchor row (its FK col) and the joined row (its
+    # key col). A join carrying an opaque fn cannot be witnessed soundly -> bail to NT. DB-verified by
+    # solve_emit, so a non-uuid key or an unsettable identity PK simply fails to confirm (never a false pass).
+    for _ji, j in enumerate(sig.get("joins", [])):
+        if j.get("fns"):
+            return None
+        jcols = {}
+        for _k, (acol, jcol) in enumerate(j["on"]):
+            jk = "5c0f%04x-0000-4000-8000-%012x" % (_ji, _k + 1)
+            auxcols[acol] = jk
+            jcols[jcol] = jk
+        if j.get("uid"):
+            sat["sub"] = fal["sub"] = _WV_UID
+            jcols[j["uid"]] = _WV_UID
+        jcols.update(j["extras"])
+        sat["aux"].append({"table": j["mtable"], "cols": jcols})   # joined (FK parent) before anchor
     sat["aux"].append({"table": mtable, "cols": auxcols})
     return (sat, fal)
 

@@ -35,6 +35,8 @@ def finding_type(code, message):
         return "role"
     if code == "L015":
         return "table"
+    if code == "L020":
+        return "table"
     return ""
 
 
@@ -98,6 +100,28 @@ def classify_function(sig, callers, opaque, rls_hits, mutable_sp):
     return out
 
 
+def classify_dual_write(table, writer_fns, dml_roles):
+    """MB-18 / L020 "dual write path": an RLS table whose intended write path is a client-callable
+    SECURITY DEFINER rpc that holds the validation, while a client role ALSO holds direct INSERT/UPDATE/
+    DELETE on the table plus (typically) a permissive owner policy. Every per-command RLS assertion
+    passes -- a direct own-row write genuinely IS allowed -- but the client can simply skip the rpc and
+    its validation. Not a red/green cell (the intent "all writes go through the rpc" is not in the
+    catalog, no oracle), so it is an ADVISORY: fires when BOTH a client-callable definer writer fn and a
+    direct client DML grant exist on the same RLS table. Fix = REVOKE the direct DML so the rpc is the
+    only write path (the definer rpc keeps working), after which the direct-write denial becomes an
+    assertable matrix cell that locks the boundary."""
+    if not writer_fns or not dml_roles:
+        return None
+    worst = _worst(dml_roles)
+    sev = "HIGH" if worst == "anon" else "MEDIUM"
+    return ("L020", sev, table, None,
+        f"dual write path: a SECURITY DEFINER rpc ({', '.join(sorted(set(writer_fns)))}) writes this table "
+        f"AND {worst} holds a direct INSERT/UPDATE/DELETE grant on it. If the rpc is the intended write path "
+        f"(it holds the validation), the client can skip it and write the table directly -- every RLS "
+        f"assertion still passes. REVOKE the direct DML so the rpc is the only path; the direct-write denial "
+        f"then becomes an assertable boundary.")
+
+
 def classify_role(rolname, issuper, bypassrls, reachable, allow):
     """A role finding, or None. `allow` = sanctioned-bypass role names (service_role + platform + user allowlist).
     reachable = the role is a client role, can LOGIN, or a client can SET ROLE into it."""
@@ -147,6 +171,16 @@ def _readers(cur, oid, roles, usable):
         if cur.fetchone()[0]:
             out.append(role)
     return out
+
+
+def _has_table_priv(cur, role, schema, table, priv):
+    """Does `role` hold `priv` (INSERT/UPDATE/DELETE) directly on schema.table? Effective privilege
+    (PUBLIC + explicit grants + role membership), so it stays correct on hosted Supabase too."""
+    try:
+        cur.execute("SELECT has_table_privilege(%s, %s, %s)", (role, f'"{schema}"."{table}"', priv))
+        return bool(cur.fetchone()[0])
+    except Exception:
+        return False
 
 
 def _callers(cur, oid, roles, usable):
@@ -231,10 +265,22 @@ def find_bypass(cur, schema, allow_roles=None):
     cur.execute("""SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                    WHERE n.nspname = %s AND c.relkind = 'r' AND c.relrowsecurity""", (schema,))
     rls_names = [r[0] for r in cur.fetchall()]
+    _writers = {}   # MB-18/L020: rls table -> client-callable definer fns whose body WRITES it
     for oid, name, args, mutable_sp, lang, src in secdef:
         callers = _callers(cur, oid, roles, usable)
         hits = [t for t in rls_names if src and re.search(r'\b' + re.escape(t) + r'\b', src)]
         findings.extend(classify_function(f"{name}({args})", callers, lang != "sql", hits, mutable_sp))
+        if callers and src:
+            for t in rls_names:
+                te = re.escape(t)
+                if re.search(r'(?is)\b(?:insert\s+into|update|delete\s+from)\s+(?:[a-z_][\w$]*\.)?"?' + te + r'"?\b', src):
+                    _writers.setdefault(t, set()).add(f"{name}({args})")
+    for t, fns in _writers.items():                       # direct client DML on a table the rpc also writes?
+        dml_roles = [r for r in _CLIENT_ROLES if r in roles and any(
+            _has_table_priv(cur, r, schema, t, priv) for priv in ("INSERT", "UPDATE", "DELETE"))]
+        f = classify_dual_write(t, sorted(fns), dml_roles)
+        if f:
+            findings.append(f)
 
     # roles that bypass RLS
     cur.execute("""SELECT rolname, rolsuper, rolbypassrls, rolcanlogin FROM pg_roles

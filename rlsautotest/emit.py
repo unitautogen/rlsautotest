@@ -6,15 +6,18 @@ Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
 import json
-from .astutil import _CMDS4, _TAGLINE, _TAGLINE2, _expr_cols, _qi, _split_statements, _sq, _where
-from .values import CV, FOREIGN, FUTURE_EXP, INS, MV, NOBODY, RIVAL_SUB
-from .catalog import _FK_SQL, _columns, _constraint_meta, _effective_grants, _exposed, all_tables, auth_profile
+from .astutil import _CMDS4, _TAGLINE, _TAGLINE2, _expr_cols, _qi, _qt, _scalar_membership_sig, _split_statements, _sq, _where
+from .values import CV, FOREIGN, FUTURE_EXP, INS, MULTI_SUB, MV, NOBODY, RIVAL_SUB
+from .catalog import _FK_SQL, _columns, _constraint_meta, _effective_grants, _exposed, all_tables, auth_profile, probed_bypassrls
 from .atoms import _check_value_set, analyze
 from .probe import ProbeBaker, _probe, _update_selfassign_retry
 from .seeding import _seed_plan, _synthesize_row, _wrap_seed
 from .structs import EmitContext, Observation
 from .strategies import AUGMENT, HANDLED, REGISTRY
 from .strategies.mock import _opaque_fn_sig, _policy_bool_udfs, mock_emit
+from .strategies.relstate import relstate_emit
+from .strategies.solver import _calls_udf
+from .atoms import _expand_udf_calls
 from .strategies.solver import solve_emit
 
 
@@ -99,7 +102,7 @@ END $$;
 
 
 
-def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks=None, cuniques=None, relchecks=None, compfks=None, helpers=True, grants_map=None, conn=None, implicit_deny=False, obs_out=None):
+def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks=None, cuniques=None, relchecks=None, compfks=None, helpers=True, grants_map=None, conn=None, implicit_deny=False, obs_out=None, notes_out=None, sanctioned=None):
     """Native Supabase FLAT pgTAP form: begin; plan(N); inline AAA; finish(); rollback.
 
     helpers=True (DEFAULT): tests read natively — tests.create_supabase_user / authenticate_as /
@@ -114,6 +117,13 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
         raise ValueError("emit_flat requires a live database connection (--db-url or PG* env): "
                          "tests are probe-and-baked, not guessed")
     _authp = auth_profile(conn.cursor(), schema)   # catalog-discovered client-role model (authenticated / unauth / optional bypass)
+    # MB-9b: which CONSTRAINED probed slots (the authenticated identity + the unauth role) themselves carry
+    # BYPASSRLS? If so, probing as them sees every row regardless of policy -> their matrix cells are baked
+    # UNRELIABLE (never a green), by the guard in ProbeBaker.read_assert/write_assert. Empty for every
+    # normal schema (only service_role bypasses), so the corpus stays byte-identical. service_role is NOT
+    # passed in -- its bypass is the point of that row.
+    _bypass_probed = probed_bypassrls(conn.cursor(), ["authenticated", _authp["unauth"]])
+    no_probe = getattr(conn, "_rlsa_no_probe", False)   # MB-10 --no-probe: emit only the no-probe (structural) tests
     S = _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols, checks, cuniques, relchecks, compfks, conn=conn)
     q = S["q"]; seed = S["seed"]; total_rows = S["total_rows"]
     insert_plan = S["insert_plan"]; nobody_ins = S["nobody_ins"]; fill = S["fill"]
@@ -145,7 +155,8 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
         try:
             _uc = conn.cursor(); _uc.execute("SELECT to_regclass('auth.users')")
             if _uc.fetchone()[0] is not None:
-                _idsubs = sorted({NOBODY, RIVAL_SUB, INS, *CV, *MV})   # INS: the fresh-identity INSERT's acting user may FK auth.users too
+                _idsubs = sorted({NOBODY, RIVAL_SUB, INS, *CV, *MV}
+                                 | ({MULTI_SUB} if S.get("multi", {}).get("on") else set()))   # INS: the fresh-identity INSERT's acting user may FK auth.users too; MULTI_SUB only when the 2-tenant member is seeded (keeps non-membership suites byte-identical)
                 seed = ";\n".join(f"INSERT INTO auth.users(id) VALUES ('{s}') ON CONFLICT DO NOTHING" for s in _idsubs) + ";\n" + seed
         except Exception:
             pass
@@ -163,11 +174,14 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                       colsmap=colsmap, enums=enums, unique_cols=unique_cols, checks=checks,
                       cuniques=cuniques, relchecks=relchecks, compfks=compfks, helpers=helpers,
                       gmap=grants_map or {}, conn=conn, q=q, S=S, seed=seed, total_rows=total_rows,
+                      claim_style=_authp.get("claim_style", "json"),
                       unauth_role=_authp["unauth"], emit_service_role=(_authp["service_role"] is not None),
                       service_role_name=(_authp["service_role"] or "service_role"),
+                      bypass_probed=_bypass_probed, sanctioned_unreliable=sanctioned,
                       insert_plan=insert_plan, nobody_ins=nobody_ins, fill=fill, rowlinked=rowlinked,
                       seed_fn_mock=_seed_fn_mock, NB=NB, body=body, n=n,
-                      observations=(obs_out if obs_out is not None else []))
+                      observations=(obs_out if obs_out is not None else []),
+                      branch_nt=(notes_out if notes_out is not None else []))
     baker = ProbeBaker(ctx)
     umap = ctx.umap
     ident = ctx.ident
@@ -179,7 +193,18 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
     # Seed as an identity-NEUTRAL privileged role: RESET ROLE drops the Postgres role but NOT the JWT claim,
     # so auth.uid() would still return the last probed identity and an ownership-on-insert trigger (e.g.
     # supabase_rbac's on_group_created) would attribute the seeded row to it. Clear the claim so auth.uid() is NULL.
-    reseed = ctx.reseed = f"RESET ROLE;\nSELECT set_config('request.jwt.claims', '', true);\nDELETE FROM {q};\n{seed_emit}"
+    # When the table has AUX/scope tables, clear them BEFORE `DELETE FROM q`: if q is an aux table's FK
+    # PARENT (tenancy.orgs with memberships.org_id -> orgs.id, mtt.teams with team_members.team_id ->
+    # teams.id), the q-first DELETE violates the FK and -- raw, inside the pgTAP transaction -- aborted the
+    # rest of the file (pg_prove "planned N ran M"). The delete block is _rlsa_try-wrapped like the
+    # header's, so an unrelated FK reference degrades to a loud failing count, never a mid-file abort.
+    # Tables with NO aux keep the exact old raw form (emitted bytes unchanged).
+    _aux_ts = S.get("aux_tables", [])
+    if _aux_ts:
+        _redel = _wrap_seed("".join(f"DELETE FROM {_qt(t)};\n" for t in _aux_ts) + f"DELETE FROM {q}")
+        reseed = ctx.reseed = f"RESET ROLE;\nSELECT set_config('request.jwt.claims', '', true);\n{_redel}\n{seed_emit}"
+    else:
+        reseed = ctx.reseed = f"RESET ROLE;\nSELECT set_config('request.jwt.claims', '', true);\nDELETE FROM {q};\n{seed_emit}"
     read_test, mut_test = baker.read_test, baker.mut_test
     desc = ctx.desc
     # Real effective grants for the client roles (NOT re-granted): we PROVE actual access, never assume it.
@@ -194,7 +219,11 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                      "DELETE": f"DELETE FROM {q}"}
     deny = baker.deny
     if conn is not None:   # PROBE path: observe the REAL outcome of each identity x command on the copy, then bake it
-        arrange_stmts = [s for s in _split_statements(f"DELETE FROM {q};\n{seed}") if s.strip()]
+        # aux tables cleared BEFORE q for the same FK-parent reason as the reseed above: the probe's
+        # per-statement savepoints would swallow a failing q-first DELETE, silently leaving stale
+        # committed rows in the counts.
+        _adel = "".join(f"DELETE FROM {_qt(t)};\n" for t in S.get("aux_tables", []))
+        arrange_stmts = [s for s in _split_statements(f"{_adel}DELETE FROM {q};\n{seed}") if s.strip()]
         _fk_cols = set(fkmap.get(f"{schema}.{table}", {}))   # avoid FK cols: SET fk=val triggers an RI check (parent access), not the table's own UPDATE perm
         _rowseed = {x for cc in rowlinked for x in cc['rowseed']}
         # Columns referenced by ANY policy on the table (USING + WITH CHECK). SETting one of these would
@@ -239,9 +268,13 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
         # Fall back to a SELF-ASSIGNMENT column: `SET col = col` changes nothing and moves no row
         # between scopes, but Postgres still enforces the UPDATE privilege and re-evaluates
         # USING/WITH CHECK — exactly what the UPDATE cell claims to measure. (An unchanged FK skips
-        # the RI re-check, and identity/generated/unique columns are still excluded.)
+        # the RI re-check; identity/generated columns are still excluded.) MB-5: a UNIQUE column is now
+        # allowed here -- `SET col = col` assigns the row its OWN current value, which cannot collide
+        # with another row, so the unique constraint is not violated. This tests the last shape that
+        # previously fell to a "-" dash (updcheck.t4: identity PK + a UNIQUE policy column). A CLS
+        # denial on the column surfaces as an observed 42501 (a real denial), never a false grant.
         _upd_self = None if upd_col else next((nn0 for (nn0, tt0, c0, h0) in cols
-                                               if nn0 not in _unsettable and nn0 not in unique_cols), None)
+                                               if nn0 not in _unsettable), None)
         ctx.arrange_stmts, ctx.fk_cols, ctx.upd_col = arrange_stmts, _fk_cols, upd_col
         _upd_val = ctx.upd_val       # CHECK-satisfying SET literal (see EmitContext.upd_val)
         pident = ctx.pident
@@ -255,6 +288,8 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
         for (_cm,) in _cur.fetchall():
             _pol |= set(_CMDS4) if _cm == "ALL" else ({_cm} if _cm in _CMDS4 else set())
         for cmd in [c for c in _CMDS4 if c in (set(cmds) | _pol)]:
+            if no_probe:
+                continue   # MB-10 --no-probe: skip EVERY row-level battery (all probe-based) -> those cells stay NOT tested
             _all_cls = per.get(cmd, {}).get("classes", [])
             classes = [c for c in _all_cls if c["handled"]]
             # MIXED case: a classifiable policy AND a SEPARATE opaque-function policy OR'd together (permissive).
@@ -271,18 +306,99 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                     break
                 if _res == AUGMENT:      # wiring tests emitted; the identity battery below still runs
                     break
+            # BL-1 generalized -- the OBLIGATION ROUTER: a classifiable branch handled this command, but OTHER
+            # min-terms carry novel (unclassified) atoms. Route EVERY unhandled branch, node-scoped, through
+            # the fallback chain: the general solver first, then the relational-state DB-oracle floor. A branch
+            # that delegates to an opaque boolean fn is excluded here (the mock wiring above owns it, and its
+            # mocking is already flagged); a branch that still ends up unwitnessed is RECORDED (ctx.branch_nt)
+            # so the report can say "partially tested" instead of hiding the gap behind a green sibling cell.
+            if classes:
+                for _uc in [c for c in _all_cls if not c.get("handled")]:
+                    _ra = _uc.get("raw_atoms")
+                    _nd = None
+                    if _ra:
+                        _nd = _ra[0] if len(_ra) == 1 else {"BoolExpr": {"boolop": "AND_EXPR", "args": _ra}}
+                    _is_fn_branch = _nd is not None and _calls_udf(_nd, udfs)
+                    if _is_fn_branch:
+                        # UDF branch: expand the function body into an effective predicate (witness
+                        # HINTS only -- the probe still runs the real policy calling the real fn) and
+                        # route the substituted node like any other branch. Unexpandable -> stay on
+                        # the mock wiring path (already emitted + flagged above).
+                        _nd = _expand_udf_calls(_nd, conn.cursor())
+                    # MB-6: a restrictive policy is AND'd onto this permissive branch by Postgres. raw_atoms
+                    # carries only the PERMISSIVE min-term, so a witness solved from _nd alone can violate the
+                    # restrictive check -> the REAL policy denies -> the branch would fall to PARTIALLY TESTED
+                    # (sound, coverage lost). Conjoin the restrictive predicate(s) so the solver seeds them too.
+                    # A restrictive conjunct that itself delegates to an opaque fn is expanded (witness hints);
+                    # if it can't be expanded, it is dropped from the obligation (the branch just degrades to
+                    # the pre-MB-6 coverage for that case -- still sound, the probe runs the real restrictive fn).
+                    _rst = _uc.get("raw_restrict")
+                    if _nd is not None and _rst:
+                        _rst_nodes = []
+                        for _rn in _rst:
+                            _rn2 = _expand_udf_calls(_rn, conn.cursor()) if _calls_udf(_rn, udfs) else _rn
+                            if _rn2 is not None and not _calls_udf(_rn2, udfs):
+                                _rst_nodes.append(_rn2)
+                        if _rst_nodes:
+                            _nd = {"BoolExpr": {"boolop": "AND_EXPR", "args": [_nd] + _rst_nodes}}
+                    _rescued = False
+                    if _nd is not None:
+                        _rescued = solve_emit(ctx, baker, cmd, node=_nd)
+                        if not _rescued:
+                            _rescued = relstate_emit(ctx, baker, cmd, node=_nd)
+                    if _is_fn_branch:
+                        continue   # never a branch_nt entry: the wiring proof + mock footgun note cover the fn branch
+                    if not _rescued:
+                        _rr = _uc.get("reason") or "branch could not be parsed"
+                        ctx.branch_nt.append((cmd, _uc.get("src_policy"), _rr))
+                        body.append(f"-- PARTIALLY TESTED: {cmd} policy branch [{_uc.get('src_policy') or '?'}] left unwitnessed -> {_rr}")
             if not handled and classes and _shadowed_fn:                  # mixed: also wiring-test the shadowed opaque-fn branch
                 mock_emit(ctx, baker, cmd)
+            # MB-3: SCALAR-SUBQUERY member-of-2-tenants hazard, on READ *and* WRITE. Placed BEFORE the
+            # `if handled: continue` because the SELECT floor for this shape is the relstate strategy (which
+            # marks the command handled on single-membership data) -- the two-tenant catch must still run.
+            # A two-tenant identity is seeded so the scalar subquery
+            # `col = (SELECT scope FROM junction WHERE user = auth.uid())` returns 2 rows; probe the REAL
+            # command and bake a FAILING test ONLY when Postgres actually raises 21000 -- observed reality,
+            # never fabricated. Any other outcome leaves the existing coverage (relstate floor / implicit
+            # deny) untouched, so this only ADDS the live catch the static lint predicted. (The canonical
+            # EXISTS-membership shape stays SELECT-only, in its own block after the identity battery.)
+            _mx = S.get("multi", {})
+            if _mx.get("on") and _mx.get("shape") == "scalar" and cmd in _mx.get("cmds", []):
+                _mwho = "authenticated, member of 2 tenants"; _mcl = _mx["claims"]
+                if cmd == "SELECT":
+                    _mact, _mkind = f"SELECT count(*) FROM {q}", "read"
+                elif cmd == "INSERT":
+                    _ir = _mx.get("ins_row") or {}
+                    _mact = (f"INSERT INTO {q}({', '.join(_qi(cc) for cc in _ir)}) VALUES ({', '.join(_ir.values())})" if _ir else None); _mkind = "write"
+                elif cmd == "UPDATE":
+                    _mact = (f"UPDATE {q} SET {_qi(upd_col[0])}={_upd_val(upd_col[0], upd_col[1])}" if upd_col
+                             else (f"UPDATE {q} SET {_qi(_upd_self)}={_qi(_upd_self)}" if _upd_self else None)); _mkind = "write"
+                else:
+                    _mact, _mkind = f"DELETE FROM {q}", "write"
+                if _mact is not None:
+                    _om = _probe(conn, arrange_stmts, pident(_mcl, "authenticated"), _mkind, _mact)
+                    if not _om[2] and _om[0] == "err" and _om[1] == "21000":
+                        ctx.observations.append(Observation(cmd=cmd, ident="multi", exp=False, kind="multi_bad", detail="error"))
+                        (read_test if cmd == "SELECT" else mut_test)(_mcl, "authenticated",
+                            f"SELECT fail( {desc(cmd + ': ' + _mwho + ' -- the ' + cmd + ' ERRORED (21000) for a user who belongs to two tenants; a single-membership user works fine. Cause: a scalar subquery (col = (SELECT scope FROM junction WHERE user = auth.uid())) returns 2 rows once the user joins a second tenant. Use EXISTS/IN, or resolve the tenant into a JWT claim at auth time [member-of-2-tenants]')} );")
+            # MB-3b: canonical EXISTS-membership WRITE union drift-guard (companion to the SELECT union guard
+            # below). Placed BEFORE `if handled: continue` because a membership INSERT is marked handled by its
+            # strategy. A user in TWO tenants must be able to WRITE into their SECOND tenant too (the single-
+            # membership battery only exercises the first). Probe the 2-tenant member INSERTing a row scoped to
+            # org M and bake the OBSERVED outcome via the same ProbeBaker: a correct WITH CHECK -> isnt_empty
+            # (green, drift-pinned); a later change that blocks the second tenant -> red. Runs ONLY when the
+            # seeder built the org-M insert row (a membership-scoped INSERT on the same scope column), so every
+            # non-membership write shape is byte-identical.
+            _mxb = S.get("multi", {})
+            if cmd == "INSERT" and _mxb.get("on") and _mxb.get("shape") == "membership" and _mxb.get("ins_m"):
+                _mir = _mxb["ins_m"]
+                _mia = f"INSERT INTO {q}({', '.join(_qi(cc) for cc in _mir)}) VALUES ({', '.join(_mir.values())})"
+                _mio = _probe(conn, arrange_stmts, pident(_mxb["claims"], "authenticated"), "write", _mia)
+                mut_test(_mxb["claims"], "authenticated",
+                         baker.write_assert(_mio, "INSERT", _mia, "authenticated, member of 2 tenants (writes into their SECOND tenant -- union write)", ident="multi"))
             if handled:
                 continue
-            # BL-1: a classifiable branch handled this command, but OTHER min-terms carry a novel (unclassified)
-            # atom (e.g. `owner=auth.uid() OR metadata @> '...'`). Solve each unhandled branch per-min-term and
-            # DB-verify it, so the novel branch is no longer silently dropped to NT. (not udfs: opaque-fn branches
-            # are mock-wired above, not solved.)
-            if classes and not udfs:
-                for _uc in [c for c in _all_cls if not c.get("handled") and c.get("raw_atoms")]:
-                    _ra = _uc["raw_atoms"]
-                    solve_emit(ctx, baker, cmd, node=(_ra[0] if len(_ra) == 1 else {"BoolExpr": {"boolop": "AND_EXPR", "args": _ra}}))
             # NO CLIENT POLICY shapes this command (it is in the matrix only via non-client roles,
             # e.g. a service_role FOR ALL): no identity could ever be "authorized", so the deny IS
             # the expected behavior for the WHOLE authenticated population. Emit it under the
@@ -313,11 +429,32 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                             _deny = (o[0] == "err" and o[1] == "42501") or (o[0] == "rows" and o[1] == 0)
                             if not o[2] and _deny:
                                 mut_test(NB, "authenticated", baker.write_assert(o, cmd, _nact, _nwho, ident="authorized"))
+            _sel_counts = {}   # branch idx -> the branch identity's own SELECT observation (2-tenant-member differential)
             for who, cjson, role, c in identities(classes):
                 _oid = "anon" if role in ("anon", "anonymous", _authp["unauth"]) else ("service_role" if role == (_authp["service_role"] or "service_role") else ("authorized" if c is not None else "other"))
                 _wcj = cjson   # the identity that performs the WRITE (a fresh identity for unique-owner INSERTs)
                 if cmd == "SELECT":
                     o = _probe(conn, arrange_stmts, pident(cjson, role), "read", f"SELECT count(*) FROM {q}")
+                    if c is not None:
+                        _sel_counts[c["idx"]] = o
+                    # MB-19: a ROWLINKED authorized identity that sees 0 of its OWN seeded row is not a
+                    # policy denial -- the identity precondition (auth.uid()/claim binding) could not be
+                    # established, so the row the seeder planted for this identity was filtered away.
+                    # Common cause: an auth.uid() shape the probe does not drive (the flat-GUC
+                    # request.jwt.claim.sub variant, or a custom session GUC like current_setting('app.*')).
+                    # Baking the observed 0 as "correctly denied" would be the exact false alarm a
+                    # correct-but-unbound policy produces (rows visible to nobody) -- flag it LOUDLY as
+                    # UNRELIABLE instead of a silent "\u00b7". Sound: only a rowlinked identity's OWN-row
+                    # miss is reclassified, never a genuine cross-identity deny (those are not rowlinked).
+                    if (c is not None and c.get("rowlinked") and not o[2]
+                            and o[0] == "count" and o[1] == 0):
+                        o = (o[0], o[1], "the authorized identity saw 0 of its OWN seeded row(s) -- the "
+                             "identity precondition could not be established (auth.uid()/claim binding did "
+                             "not resolve to the seeded owner; e.g. an auth.uid() shape the probe does not "
+                             "set, such as the flat request.jwt.claim.* GUC, or a custom session GUC). "
+                             "Fix: align the identity model rather than trusting this 'denied' result -- make "
+                             "auth.uid()/the claim resolve to the seeded owner (match the claim style the "
+                             "policy reads, or use --as-user to probe from a real auth.users identity)")
                     read_test(cjson, role, baker.read_assert(o, who, mock_suffix=(' [mocked; wiring]' if _seed_fn_mock else ''), ident=_oid, mocked=_seed_fn_mock))
                     continue
                 if cmd == "INSERT":
@@ -392,6 +529,47 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                                     ctx.observations.append(Observation(cmd="UPDATE", ident=_oid, exp=False, kind="leak"))
                                     mut_test(cjson, role, f"SELECT throws_ok( $$ {_tact} $$, '42501', NULL, {desc('UPDATE: ' + who + ' can set ' + _vcol + '=' + _V + ', but policy [' + str(c.get('src_policy')) + '] WITH CHECK permits only {' + ', '.join(sorted(_allowed)) + '} -- cross-policy WITH CHECK leak [transition-leak]')} );")
 
+            # ── MEMBER-OF-2-TENANTS probe (issue #4): a seeded identity holding membership in TWO
+            # scopes (org A + org M), with one org-M row in the table. Single-membership seeds cannot
+            # surface a policy that mis-serves users who belong to 2 tenants, so probe what this identity
+            # ACTUALLY sees and judge it differentially against the single-membership branch identity:
+            #   sees branch + extra  -> union semantics confirmed; bake the exact count (drift-pinned)
+            #   query ERRORS         -> the policy breaks for two-membership users (classic: a scalar
+            #                           `col = (SELECT ...)` returning 2 rows, 21000) -> failing test + gate
+            #   sees fewer           -> one membership's data silently hidden with NOTHING in the policy
+            #                           (this is a pure-membership branch: no claim/session input) to pick
+            #                           which -> failing test + gate
+            #   sees more            -> over-delivers past its memberships -> failing test + gate
+            # SELECT-only v1 (visibility cardinality is the issue's ask); the baked mismatch line asserts
+            # the UNION cardinality and fails on replay -- observed reality, never a fabricated pass.
+            if cmd == "SELECT" and S.get("multi", {}).get("on") and S["multi"].get("shape") != "scalar":
+                _mi = S["multi"]; _mwho = "authenticated, member of 2 tenants"
+                _ob = _sel_counts.get(_mi["branch"])
+                _om = _probe(conn, arrange_stmts, pident(_mi["claims"], "authenticated"), "read", f"SELECT count(*) FROM {q}")
+                if _om[2]:
+                    read_test(_mi["claims"], "authenticated", baker.read_assert(_om, _mwho, ident="multi"))
+                elif _ob is not None and not _ob[2] and _ob[0] == "count":
+                    _mexp = _ob[1] + _mi["extra"]
+                    if _om[0] == "err":
+                        ctx.observations.append(Observation(cmd="SELECT", ident="multi", exp=False, kind="multi_bad", detail="error"))
+                        read_test(_mi["claims"], "authenticated",
+                                  f"SELECT fail( {desc('SELECT: ' + _mwho + ' -- the query ERRORED (' + str(_om[1]) + ') for a user with two memberships; a single-membership user works fine. Classic cause: a scalar subquery (col = (SELECT ...)) returning 2 rows (21000). Use EXISTS/IN, or resolve the tenant into a JWT claim at auth time [member-of-2-tenants]')} );")
+                    elif _om[0] == "count" and _om[1] == _mexp:
+                        read_test(_mi["claims"], "authenticated",
+                                  baker.read_assert(_om, _mwho, sees_suffix=" (rows from BOTH memberships -- union cardinality pinned)", ident="multi"))
+                    elif _om[0] == "count":
+                        _mdir = "under" if _om[1] < _mexp else "over"
+                        _mwhy = ("sees FEWER rows than its two memberships grant -- one membership's data is silently hidden, and nothing in the policy (no claim/session input) selects which one"
+                                 if _mdir == "under" else
+                                 "sees MORE rows than its two memberships grant -- the policy over-delivers for users who belong to 2 tenants")
+                        ctx.observations.append(Observation(cmd="SELECT", ident="multi", exp=(_om[1] >= 1), kind="multi_bad", detail=_mdir))
+                        read_test(_mi["claims"], "authenticated",
+                                  f"SELECT is( (SELECT count(*) FROM {q})::int, {_mexp}, {desc('SELECT: ' + _mwho + ' should see ' + str(_mexp) + ' row(s) (the union of both memberships) but the policy yields ' + str(_om[1]) + ' -- ' + _mwhy + ' [member-of-2-tenants]')} );")
+                    else:
+                        ctx.observations.append(Observation(cmd="SELECT", ident="multi", exp=False, kind="multi_bad", detail="error"))
+                        read_test(_mi["claims"], "authenticated",
+                                  f"SELECT fail( {desc('SELECT: ' + _mwho + ' -- unexpected probe outcome (' + str(_om[0]) + '=' + str(_om[1]) + ') for a user with two memberships [member-of-2-tenants]')} );")
+
         # IMPLICIT-DENY (DEFAULT; disable with --no-implicit-deny): RLS is ON and these commands have NO policy -> deny-by-default.
         # Probe each client identity and bake the OBSERVED deny so the FULL command matrix is governed in CI: a
         # future too-broad GRANT or policy that lets a no-policy command through then turns this test red.
@@ -432,6 +610,11 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
                         mut_test(cj0, role, f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' (implicit deny) must affect 0 rows — no policy means deny')} );")
                     else:
                         mut_test(cj0, role, f"SELECT is_empty( $$ {action} RETURNING 1 $$, {desc(cmd + ': ' + who + ' (implicit deny) affects 0 rows')} );")
+    if no_probe:
+        body.append("-- (--no-probe / --structural-only) The row-level matrix was NOT generated: every row-level")
+        body.append("-- assertion is probe-and-baked (INSERT/UPDATE/DELETE against the target), which this mode skips")
+        body.append("-- so it is safe against a production replica. Only the checks below need no probing. Re-run")
+        body.append("-- WITHOUT --no-probe against a DISPOSABLE copy for the full grant/deny row-level coverage.")
     # -- Column-level security (parity with the report grid): one assertion per column-scoped cell.
     # A column grant a BROADER grant bypasses (leak) FAILS here; an intact scope passes. Pure
     # has_column_privilege vs the column-grant set -> deterministic, and it reads the SAME fact the
@@ -441,15 +624,46 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
     try:
         from .colsec import column_security as _cls_colsec, cls_assertions as _cls_asserts
         _cls_roles = ([_authp["service_role"]] if _authp["service_role"] else []) + ["authenticated", _authp["unauth"]]
+        # MB-12: ALSO cover CUSTOM roles that hold a COLUMN-level grant on this table (pg_attribute.attacl),
+        # so a custom role's expressed column scope gets the SAME parity assertion the standard client roles
+        # get. Before this, a policy-named custom role's column scope SHOWED in the report grid (the report
+        # builds its CLS role set from the standard roles PLUS the policy-named customs it renders) yet the
+        # suite asserted NOTHING for it -- report and suite silently disagreed. The report already renders
+        # exactly these roles, so adding them here makes the two cover the same cells. A table with no
+        # custom-role column grant adds no roles -> the emitted suite is byte-identical to before.
+        try:
+            from .colsec import column_grant_roles as _cls_grant_roles
+            _cls_roles = _cls_roles + _cls_grant_roles(conn.cursor(), schema, table, _cls_roles)
+        except Exception:
+            pass
         _cls_cells = _cls_colsec(conn.cursor(), schema, table, _cls_roles).get("cells", {})
         for _ca in _cls_asserts(schema, table, _cls_cells):
             n[0] += 1
             body.append(_ca["sql"])
     except Exception:
         pass   # CLS is strictly additive -- never break the core battery
+    if no_probe and n[0] == 0:
+        # A --no-probe file for a table with NO column-level grants would otherwise be plan(0) with zero
+        # assertions -> real pgTAP's finish() raises "# No tests run!" and the file ERRORS (pg_prove / supabase
+        # test db fail the run). Emit ONE genuine no-probe assertion: RLS must be enabled on this reachable
+        # table (the same fact the schema-wide 010 guard checks, and it needs no probe). The row-level matrix is
+        # still honestly skipped -- the note above says so -- this only keeps the file a valid, truthful pgTAP file.
+        _lit = f"'\"{schema}\".\"{table}\"'::regclass"
+        n[0] += 1
+        body.append(f"SELECT is( (SELECT relrowsecurity FROM pg_class WHERE oid = {_lit}), true, "
+                    f"'{schema}.{table}: RLS enabled (structural-only; row-level matrix skipped under --no-probe)' );")
     body_text = "\n".join(body)
+    # MB-10 --no-probe / --structural-only: the row-level battery is probe-and-baked and was skipped above,
+    # so there is nothing to arrange. Blank the test-user creates, the pre-seed DELETE and the seed itself so
+    # the emitted suite performs ZERO writes -- emitting the seed here would try to write rows the probe never
+    # synthesized and the file would ERROR on run. The structural checks that remain (the separate RLS-enabled
+    # guard file and the CLS column-scope parity appended below) need no seed, so the suite stays pure-read.
+    _NOPROBE_ARR = "-- Arrange: none -- --no-probe (structural-only) skips the probe-and-baked row-level battery, so nothing is seeded (zero writes)."
+    _arr_h = _NOPROBE_ARR if no_probe else "-- Arrange: create test users (fixed uids), then seed as the privileged (RLS-bypassing) connection role."
+    _arr_nh = _NOPROBE_ARR if no_probe else "-- Arrange: seed as the privileged (RLS-bypassing) connection role."
+    _delseed = "" if no_probe else f"SELECT public._rlsa_try($rlsa_seed$ DELETE FROM {q} $rlsa_seed$);\n{seed_emit}"
     if helpers:
-        creates = "\n".join(
+        creates = "" if no_probe else "\n".join(
             f"INSERT INTO auth.users (id, email, raw_user_meta_data, raw_app_meta_data, created_at, updated_at) "
             f"VALUES ('{sub}', concat('{sub}', '@test.com'), jsonb_build_object('test_identifier', '{nm}'), '{{}}'::jsonb, now(), now()) ON CONFLICT (id) DO NOTHING;"
             for sub, nm in umap.items())
@@ -460,11 +674,10 @@ def emit_flat(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_cols
 {_PGTAP_ENSURE}
 BEGIN;
 SELECT plan({n[0]});
--- Arrange: create test users (fixed uids), then seed as the privileged (RLS-bypassing) connection role.
+{_arr_h}
 -- NOTE: grants are NOT re-granted — tests run against the database's real grants so a missing grant is proven, not masked.
 {creates}
-SELECT public._rlsa_try($rlsa_seed$ DELETE FROM {q} $rlsa_seed$);
-{seed_emit}
+{_delseed}
 """
     else:
         header = f"""-- GENERATED by rlsautotest (flat, self-contained / --no-helpers) from {q}.
@@ -473,10 +686,9 @@ SELECT public._rlsa_try($rlsa_seed$ DELETE FROM {q} $rlsa_seed$);
 {_PGTAP_ENSURE}
 BEGIN;
 SELECT plan({n[0]});
--- Arrange: seed as the privileged (RLS-bypassing) connection role.
+{_arr_nh}
 -- NOTE: grants are NOT re-granted — tests run against the database's real grants so a missing grant is proven, not masked.
-SELECT public._rlsa_try($rlsa_seed$ DELETE FROM {q} $rlsa_seed$);
-{seed_emit}
+{_delseed}
 """
     return header + "\n" + body_text + "\n\nSELECT * FROM finish();\nROLLBACK;\n"
 
@@ -540,6 +752,40 @@ BEGIN PERFORM set_config('role', 'anon', true); PERFORM set_config('request.jwt.
 """
 
 
+def _shim_sql(prof=None):
+    """MB-11: the offline tests.* shim with its CLIENT-ROLE VOCABULARY taken from the schema's DISCOVERED
+    role model (auth_profile) instead of hardcoded to Supabase's anon / service_role. A conventional
+    unauthenticated role (anon or anonymous) is used verbatim; anything else -- or no profile -- falls back
+    to 'anon' (so a mis-discovered login role never rewrites the shim). The RLS-bypass helper is emitted
+    against the discovered bypass role when the database HAS one; a provider without one (Neon has no
+    service_role) gets a loud-failing stub, so a hand-written call errors clearly instead of on a missing
+    role. For a standard Supabase role model -- or prof=None -- every branch is skipped and this returns
+    _SHIM verbatim, byte-identical to before. Targeted string edits keep the (long) shim body in ONE place."""
+    _u = (prof or {}).get("unauth")
+    unauth = _u if _u in ("anon", "anonymous") else "anon"
+    # The bypass helper reflects whether the PROVIDER has an RLS-bypass role, not whether one is granted in
+    # THIS schema (auth_profile.service_role is schema-scoped -> None wherever service_role holds no local
+    # grant, though a Supabase DB still HAS the role). So drop it only for a provider with none (Neon), and
+    # otherwise keep 'service_role' (or a discovered rename). This keeps every Supabase schema byte-identical.
+    if prof and prof.get("flavor") == "neon":
+        service = None
+    else:
+        service = (prof or {}).get("service_role") or "service_role"
+    s = _SHIM
+    if unauth != "anon":
+        s = s.replace("GRANT USAGE ON SCHEMA tests TO anon,", f"GRANT USAGE ON SCHEMA tests TO {unauth},")
+        s = s.replace("BEGIN PERFORM set_config('role', 'anon', true);",
+                      f"BEGIN PERFORM set_config('role', '{unauth}', true);")
+    if not service:
+        s = s.replace(", service_role;", ";")   # no RLS-bypass role -> drop it from the tests-schema grant
+        s = s.replace("BEGIN PERFORM set_config('role', 'service_role', true); PERFORM set_config('request.jwt.claims', null, true); END",
+                      "BEGIN RAISE EXCEPTION 'this database has no RLS-bypass (service_role) role'; END")
+    elif service != "service_role":
+        s = s.replace(", service_role;", f", {service};")
+        s = s.replace("set_config('role', 'service_role', true)", f"set_config('role', '{service}', true)")
+    return s
+
+
 
 _PGTAP_ENSURE = r"""-- Make pgTAP available with ZERO setup: use the real extension if installed; otherwise load a minimal,
 -- TAP-compatible shim. The shim is created ONLY when pgTAP is absent, so a real install (e.g. on Supabase)
@@ -579,13 +825,16 @@ _HOOK_SELFTEST = (
 
 
 
-def setup_hook_sql(basejump_present):
-    """000-setup-tests-hooks.sql content: pgtap + (offline shim iff basejump absent) + a self-test pass."""
+def setup_hook_sql(basejump_present, prof=None):
+    """000-setup-tests-hooks.sql content: pgtap + (offline shim iff basejump absent) + a self-test pass.
+    `prof` (an auth_profile dict) makes the emitted shim's role vocabulary match the schema's DISCOVERED
+    role model -- anon/anonymous, and whether a bypass role exists -- instead of hardcoding Supabase's
+    (MB-11). Omitted / None reproduces the previous Supabase-shaped shim byte-for-byte."""
     head = ("-- GENERATED by rlsautotest. Pre-test hook (runs first, alphabetically).\n"
             f"-- {_TAGLINE} {_TAGLINE2}\n" + _PGTAP_ENSURE + "\n")
     if basejump_present:
         return head + "-- basejump supabase_test_helpers detected; using them.\n" + _HOOK_SELFTEST
-    return head + "\n" + _SHIM + _HOOK_SELFTEST
+    return head + "\n" + _shim_sql(prof) + _HOOK_SELFTEST
 
 
 
@@ -605,6 +854,9 @@ def _load_ctx(cur, schema, table):
     for cmd in cmds:
         for c in per[cmd]["classes"]:
             for au in c["aux"]: load(au["table"])
+            for _rn in (c.get("raw_atoms") or []):   # MB-3: the scalar-subquery junction is inside an UNCLASSIFIED branch (no aux) -> load it so its FK parents can be seeded
+                _sm = _scalar_membership_sig(_rn)
+                if _sm: load(_sm["junction"])
     cur.execute("SELECT n.nspname, t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_type t JOIN pg_enum e ON e.enumtypid=t.oid JOIN pg_namespace n ON n.oid=t.typnamespace GROUP BY 1, 2")
     enums = {}
     for nsp, tn, labels in cur.fetchall():
@@ -632,14 +884,17 @@ def _load_ctx(cur, schema, table):
 
 
 
-def _emit_both(schema, table, ctx, helpers, conn=None, implicit_deny=True, obs_out=None, debug=False):
+def _emit_both(schema, table, ctx, helpers, conn=None, implicit_deny=True, obs_out=None, notes_out=None, debug=False, sanctioned=None):
     """The flat probe-and-bake suite, plus (only when debug=True) the legacy nested runtests()
     artifact. F9: the nested emitter is DEMOTED — it predates the probe era (no probe, no
     transition audit, no UNRELIABLE, no solver) and is kept for explicit debugging only, so it
-    stops being a hand-maintained second battery generator on every emit/report."""
+    stops being a hand-maintained second battery generator on every emit/report.
+
+    MB-25: `sanctioned` (set of UPPERCASE commands on this table accepted via --allow-unreliable /
+    .rlsautotestignore) flows to the EmitContext so those UNRELIABLE cells bake as SKIP, not fail()."""
     nt = "".join(f"-- FOOTGUN NOTE: {x}\n" for x in ctx["notes"])
     args = (schema, table, ctx["per"], ctx["cmds"], ctx["cols"], ctx["fkmap"], ctx["colsmap"], ctx["enums"], ctx["unique_cols"], ctx["checks"], ctx["cuniques"], ctx["relchecks"], ctx["compfks"])
-    flat = nt + emit_flat(*args, helpers=helpers, grants_map=ctx.get("grants"), conn=conn, implicit_deny=implicit_deny, obs_out=obs_out)
+    flat = nt + emit_flat(*args, helpers=helpers, grants_map=ctx.get("grants"), conn=conn, implicit_deny=implicit_deny, obs_out=obs_out, notes_out=notes_out, sanctioned=sanctioned)
     return flat, (nt + emit(*args)) if debug else None
 
 

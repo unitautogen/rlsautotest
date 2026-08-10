@@ -40,9 +40,37 @@ def _custom_roles(conn, schema, table):
         if isinstance(roles, str):
             roles = [r.strip().strip('"') for r in roles.strip("{}").split(",") if r.strip()]
         for r in (roles or []):
-            if r not in _STANDARD and r not in out:
+            # RA-7: pg_* predefined group roles (pg_read_all_data, pg_database_owner, ...) are not
+            # SET ROLE-able audiences: membership is computed (pg_database_owner refuses SET ROLE
+            # outright) so probing them as custom roles either fails or proves nothing. Excluded
+            # here; analyze() surfaces an informational note instead.
+            if r not in _STANDARD and not r.startswith("pg_") and r not in out:
                 out.append(r)
     return out
+
+
+def _public_grant_roles(conn, schema, table, exclude):
+    """MB-27: custom client roles that hold a DIRECT table grant on this table AND are admitted by a
+    no-`TO` PUBLIC policy on it -- so they genuinely reach the table even though NO policy names them.
+    The anon slot is already shown, but a second role granted alongside it under a `USING (true)` policy
+    used to be invisible despite identical access (e.g. pto.settings granted TO pto_member + pto_visitor).
+    aclexplode reads only DIRECT grants (grantee <> 0), so a table granted to PUBLIC does NOT pull in every
+    role. [] when the table has no PUBLIC policy or no such direct-grant role -> byte-identical for every
+    schema without this exact shape. `exclude` drops the standard slots (already shown) + platform roles."""
+    cur = conn.cursor()
+    cur.execute("""
+        WITH tbl AS (SELECT c.oid, c.relacl FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = %s AND c.relname = %s),
+        pub AS (SELECT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = (SELECT oid FROM tbl)
+                               AND p.polroles @> ARRAY[0]::oid[]) AS yes)
+        SELECT DISTINCT r.rolname
+        FROM tbl, LATERAL aclexplode(tbl.relacl) a JOIN pg_roles r ON r.oid = a.grantee
+        WHERE (SELECT yes FROM pub)
+          AND a.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE')
+          AND NOT r.rolsuper AND left(r.rolname, 3) <> 'pg_' AND r.rolname <> current_user
+        ORDER BY r.rolname
+    """, (schema, table))
+    return [r for (r,) in cur.fetchall() if r not in exclude]
 
 
 def _const_lit(node):
@@ -108,6 +136,13 @@ def run(ctx, baker, cmd):
     conn, q, schema, table = ctx.conn, ctx.q, ctx.schema, ctx.table
     body, n, reseed = ctx.body, ctx.n, ctx.reseed
     roles = _custom_roles(conn, schema, table)
+    # MB-27: ALSO probe a custom role that reaches the table by a DIRECT grant + a no-`TO` PUBLIC policy,
+    # even though no policy NAMES it (identical access to the anon slot, previously invisible). Additive +
+    # deduped; [] for tables without this shape, so every other schema stays byte-identical.
+    _excl = _STANDARD | {ctx.unauth_role, ctx.service_role_name or "service_role"}
+    for _pr in _public_grant_roles(conn, schema, table, _excl):
+        if _pr not in roles:
+            roles.append(_pr)
     if not roles:
         return CONTINUE
 

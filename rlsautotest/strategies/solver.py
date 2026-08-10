@@ -6,8 +6,8 @@ DB-oracle floors (BL-6 single-column, BL-11 joint session x multi-column search)
 from __future__ import annotations
 import json
 
-from ..astutil import _claim_paths, _expr_cols, _expr_consts, _jwt_anywhere, _qi, _qlit, _qt, _where
-from ..atoms import _set_claim
+from ..astutil import _claim_paths, _expr_cols, _expr_consts, _jwt_anywhere, _node_fn_names, _qi, _qlit, _qt, _where
+from ..atoms import _dnf_ast, _expand_udf_calls, _set_claim
 from ..probe import _probe
 from ..seeding import _aux_row_stmts, _ensure_table_loaded, _mock_valid_row, _synth_required_cols
 from ..witness import _WV_UID, _candidate_sessions, _candidate_values, _solve_predicate, _wv_ctx, _wv_lit
@@ -112,7 +112,17 @@ def _search_witness(ctx, expr):
     return (_ctx(*sat) if sat else None, _ctx(*fal) if fal else None)
 
 
-def _emit_positive_only(ctx, cmd, node, sat):
+def _calls_udf(node, udfs):
+    """True when `node` calls one of the table's opaque boolean policy functions anywhere inside it.
+    Branch-scoped replacement for the old TABLE-WIDE `if udfs: return False` gate: a solvable predicate
+    is no longer refused just because a SEPARATE policy (or a SEPARATE branch) delegates to a function."""
+    if not udfs or node is None:
+        return False
+    bare = {u["name"] for u in udfs}
+    return any(nm.split(".")[-1] in bare for nm in _node_fn_names(node))
+
+
+def _emit_positive_only(ctx, cmd, node, sat, _tag=''):
     """Satisfy-only floor: a valid row that SATISFIES `node` exists, but no VIOLATING row is constructible
     (e.g. `owner IS NOT NULL` on a NOT NULL column -> a tautology; the only falsifier, NULL, breaks the
     constraint). Rather than drop the whole cell to NT, seed the satisfy row and OBSERVE every identity's
@@ -162,17 +172,17 @@ def _emit_positive_only(ctx, cmd, node, sat):
         if ot[2] or ot[0] != "count" or ot[1] < 1:
             return False                                                     # positive not confirmed -> stay NT
         ctx.observations.append(Observation(cmd="SELECT", ident="authorized", exp=True, partial=True))
-        emit(arr, s_id, f"SELECT is( (SELECT count(*) FROM {q})::int, {ot[1]}, {desc('SELECT: authenticated, authorized sees its row(s)' + _BND)} );")
+        emit(arr, s_id, f"SELECT is( (SELECT count(*) FROM {q})::int, {ot[1]}, {desc('SELECT: authenticated, authorized sees its row(s)' + _BND + _tag)} );")
         for ident, idsqls in (("other", other_id), ("anon", anon_id)):
             o = _probe(conn, arr, idsqls, "read", f"SELECT count(*) FROM {q}")
             if o[2]:
                 continue
             if o[0] == "count":
                 ctx.observations.append(Observation(cmd="SELECT", ident=ident, exp=(o[1] >= 1), partial=True))
-                emit(arr, idsqls, f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + ident + ' sees ' + str(o[1]) + ' row(s) [solver: positive-only]')} );")
+                emit(arr, idsqls, f"SELECT is( (SELECT count(*) FROM {q})::int, {o[1]}, {desc('SELECT: ' + ident + ' sees ' + str(o[1]) + ' row(s) [solver: positive-only]' + _tag)} );")
             else:
                 ctx.observations.append(Observation(cmd="SELECT", ident=ident, exp=False, partial=True))
-                emit(arr, idsqls, f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + ident + ' denied (' + o[1] + ') [solver: positive-only]')} );")
+                emit(arr, idsqls, f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{o[1]}', NULL, {desc('SELECT: ' + ident + ' denied (' + o[1] + ') [solver: positive-only]' + _tag)} );")
         body.append(reseed)
         return True
     # writes: INSERT / UPDATE / DELETE
@@ -191,20 +201,20 @@ def _emit_positive_only(ctx, cmd, node, sat):
     if ot[2] or ot[0] != "rows" or ot[1] < 1:
         return False                                                         # positive not confirmed -> stay NT
     ctx.observations.append(Observation(cmd=cmd, ident="authorized", exp=True, partial=True))
-    emit(arr, s_id, f"SELECT {'lives_ok' if cmd == 'INSERT' else 'isnt_empty'}( $$ {act}{'' if cmd == 'INSERT' else ' RETURNING 1'} $$, {desc(cmd + ': authenticated, authorized may act' + _BND)} );")
+    emit(arr, s_id, f"SELECT {'lives_ok' if cmd == 'INSERT' else 'isnt_empty'}( $$ {act}{'' if cmd == 'INSERT' else ' RETURNING 1'} $$, {desc(cmd + ': authenticated, authorized may act' + _BND + _tag)} );")
     for ident, idsqls in (("other", other_id), ("anon", anon_id)):
         o = _probe(conn, arr, idsqls, "write", act)
         if o[2]:
             continue
         if o[0] == "err":
             ctx.observations.append(Observation(cmd=cmd, ident=ident, exp=False, partial=True))
-            emit(arr, idsqls, f"SELECT throws_ok( $$ {act} $$, '{o[1]}', NULL, {desc(cmd + ': ' + ident + ' denied (' + o[1] + ') [solver: positive-only]')} );")
+            emit(arr, idsqls, f"SELECT throws_ok( $$ {act} $$, '{o[1]}', NULL, {desc(cmd + ': ' + ident + ' denied (' + o[1] + ') [solver: positive-only]' + _tag)} );")
         elif o[0] == "rows" and o[1] >= 1:
             ctx.observations.append(Observation(cmd=cmd, ident=ident, exp=True, partial=True))
-            emit(arr, idsqls, f"SELECT isnt_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + ident + ' affected ' + str(o[1]) + ' row(s) [solver: positive-only]')} );")
+            emit(arr, idsqls, f"SELECT isnt_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + ident + ' affected ' + str(o[1]) + ' row(s) [solver: positive-only]' + _tag)} );")
         else:
             ctx.observations.append(Observation(cmd=cmd, ident=ident, exp=False, partial=True))
-            emit(arr, idsqls, f"SELECT is_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + ident + ' affects 0 rows [solver: positive-only]')} );")
+            emit(arr, idsqls, f"SELECT is_empty( $$ {act} RETURNING 1 $$, {desc(cmd + ': ' + ident + ' affects 0 rows [solver: positive-only]' + _tag)} );")
     body.append(reseed)
     return True
 
@@ -219,20 +229,38 @@ def solve_emit(ctx, baker, cmd, node=None):
     fkmap, colsmap, checks, relchecks, compfks = ctx.fkmap, ctx.colsmap, ctx.checks, ctx.relchecks, ctx.compfks
     body, n, reseed, desc = ctx.body, ctx.n, ctx.reseed, ctx.desc
     _upd_val, upd_col = ctx.upd_val, ctx.upd_col
-    if udfs:
-        return False
     if node is not None:
+        if _calls_udf(node, udfs):
+            return False        # this branch delegates to an opaque fn -> the mock wiring path owns it
         _cands = [node]
     else:
         _c = conn.cursor()
         _c.execute("SELECT qual, with_check FROM pg_policies WHERE schemaname=%s AND tablename=%s AND cmd IN (%s,'ALL') AND permissive='PERMISSIVE'", (schema, table, cmd))
-        _cands = [_where(wc if (cmd == "INSERT" and wc) else qual) for (qual, wc) in _c.fetchall()]
+        _cands = []
+        for (qual, wc) in _c.fetchall():
+            _nd = _where(wc if (cmd == "INSERT" and wc) else qual)
+            if _nd is not None and _calls_udf(_nd, udfs):
+                _nd = _expand_udf_calls(_nd, conn.cursor())   # fn-body expansion as witness hints (probe runs the REAL fn)
+            if _nd is None:
+                continue
+            _cands.append(_nd)
+            # an OR-of-branches predicate gets, IN ADDITION to the whole-node battery, one battery per
+            # DISJUNCT: the whole-node grant witness only ever exercises ONE branch of an OR, so each
+            # min-term is solved (and DB-verified) separately -- no branch rides along untested.
+            _mts = _dnf_ast(_nd)
+            if len(_mts) > 1:
+                for _mt in _mts:
+                    _sub = _mt[0] if len(_mt) == 1 else {"BoolExpr": {"boolop": "AND_EXPR", "args": list(_mt)}}
+                    if not _calls_udf(_sub, udfs):
+                        _cands.append(_sub)
     _req, _bad = _synth_required_cols(conn, schema, table, fkmap)
     if _bad:
         return False
+    _emitted = 0
     for expr_node in _cands:
         if expr_node is None:
             continue
+        _tag = '' if _emitted == 0 else f' [branch {_emitted + 1}]'   # first battery keeps the historical labels
         # Try each finder in the old cascade order. The FIRST one that yields a COMPLETE grant/deny pair wins
         # (verbatim old behavior -> paired cells are byte-identical). If none yields a pair, keep the first
         # SATISFY-only witness for the positive-only floor below (a tautology / constraint-blocked negation is
@@ -252,8 +280,8 @@ def solve_emit(ctx, baker, cmd, node=None):
         if sat is None and fal is None:
             continue
         if fal is None:   # only the positive is constructible -> observe every identity on the satisfy row (sound, partial)
-            if _emit_positive_only(ctx, cmd, expr_node, sat):
-                return True
+            if _emit_positive_only(ctx, cmd, expr_node, sat, _tag):
+                _emitted += 1
             continue
         def ctx_sql(wctx):
             base = {"role": wctx.get("role", "authenticated")}
@@ -286,18 +314,18 @@ def solve_emit(ctx, baker, cmd, node=None):
                 # (the falsifier violates a NOT NULL / constraint -> the predicate is a tautology, e.g.
                 # `owner IS NOT NULL` on a NOT NULL column), degrade to the sound positive-only floor
                 # rather than dropping the whole cell to NT.
-                if (not ot[2]) and ot[0] == "count" and ot[1] >= 1 and _emit_positive_only(ctx, cmd, expr_node, sat):
-                    return True
-                continue   # DB didn't confirm the witness (or precondition unreliable) -> try the next policy, else stay NT
+                if (not ot[2]) and ot[0] == "count" and ot[1] >= 1 and _emit_positive_only(ctx, cmd, expr_node, sat, _tag):
+                    _emitted += 1
+                continue   # DB didn't confirm the witness (or precondition unreliable) -> try the next candidate, else stay NT
             ctx.observations.append(Observation(cmd="SELECT", ident="authorized", exp=True))
             n[0] += 1
             body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_t); body.extend(s + ";" for s in idsql(s_claims, s_gucs))
-            body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, {ot[1]}, {desc('SELECT: authenticated, authorized sees its row(s) [solver]')} );")
+            body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, {ot[1]}, {desc('SELECT: authenticated, authorized sees its row(s) [solver]' + _tag)} );")
             body.append("RESET ROLE;")
             ctx.observations.append(Observation(cmd="SELECT", ident="other", exp=False))
             n[0] += 1
             body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_f); body.extend(s + ";" for s in idsql(f_claims, f_gucs))
-            body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized sees nothing [solver]')} );")
+            body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, 0, {desc('SELECT: authenticated, not authorized sees nothing [solver]' + _tag)} );")
             body.append("RESET ROLE;")
             oa = _probe(conn, arr_t, ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"], "read", f"SELECT count(*) FROM {q}")
             if not oa[2]:   # also probe anon so the matrix is complete (no stray '– not tested' cell)
@@ -305,10 +333,11 @@ def solve_emit(ctx, baker, cmd, node=None):
                 n[0] += 1
                 body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_t)
                 body.append("SELECT set_config('request.jwt.claims', '', true);"); body.append("SET LOCAL ROLE anon;")
-                body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, {oa[1]}, {desc('SELECT: anon sees ' + str(oa[1]) + ' row(s) [solver]')} );" if oa[0] == "count"
-                            else f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{oa[1]}', NULL, {desc('SELECT: anon denied (' + oa[1] + ') [solver]')} );")
+                body.append(f"SELECT is( (SELECT count(*) FROM {q})::int, {oa[1]}, {desc('SELECT: anon sees ' + str(oa[1]) + ' row(s) [solver]' + _tag)} );" if oa[0] == "count"
+                            else f"SELECT throws_ok( $$ SELECT 1 FROM {q} $$, '{oa[1]}', NULL, {desc('SELECT: anon denied (' + oa[1] + ') [solver]' + _tag)} );")
                 body.append("RESET ROLE;"); body.append(reseed)
-            return True
+            _emitted += 1
+            continue
         if cmd == "INSERT":
             act_t, act_f = rowins(s_row), rowins(f_row)
             arr_t = [f"DELETE FROM {q}"] + parents + s_aux
@@ -326,21 +355,21 @@ def solve_emit(ctx, baker, cmd, node=None):
         of = _probe(conn, arr_f, idsql(f_claims, f_gucs), "write", act_f)
         if ot[2] or of[2] or not ((ot[0] == "rows" and ot[1] >= 1) and (of[0] == "err" or (of[0] == "rows" and of[1] == 0))):
             # grant side solid but deny side unestablished (tautological WITH CHECK) -> positive-only floor
-            if (not ot[2]) and ot[0] == "rows" and ot[1] >= 1 and _emit_positive_only(ctx, cmd, expr_node, sat):
-                return True
+            if (not ot[2]) and ot[0] == "rows" and ot[1] >= 1 and _emit_positive_only(ctx, cmd, expr_node, sat, _tag):
+                _emitted += 1
             continue
         ctx.observations.append(Observation(cmd=cmd, ident="authorized", exp=True))
         n[0] += 1
         body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_t); body.extend(s + ";" for s in idsql(s_claims, s_gucs))
-        body.append(f"SELECT {'lives_ok' if cmd == 'INSERT' else 'isnt_empty'}( $$ {act_t}{'' if cmd == 'INSERT' else ' RETURNING 1'} $$, {desc(cmd + ': authenticated, authorized may act [solver]')} );")
+        body.append(f"SELECT {'lives_ok' if cmd == 'INSERT' else 'isnt_empty'}( $$ {act_t}{'' if cmd == 'INSERT' else ' RETURNING 1'} $$, {desc(cmd + ': authenticated, authorized may act [solver]' + _tag)} );")
         body.append("RESET ROLE;"); body.append(reseed)
         ctx.observations.append(Observation(cmd=cmd, ident="other", exp=False))
         n[0] += 1
         body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_f); body.extend(s + ";" for s in idsql(f_claims, f_gucs))
         if of[0] == "err":
-            body.append(f"SELECT throws_ok( $$ {act_f} $$, '{of[1]}', NULL, {desc(cmd + ': authenticated, not authorized denied (' + of[1] + ') [solver]')} );")
+            body.append(f"SELECT throws_ok( $$ {act_f} $$, '{of[1]}', NULL, {desc(cmd + ': authenticated, not authorized denied (' + of[1] + ') [solver]' + _tag)} );")
         else:
-            body.append(f"SELECT is_empty( $$ {act_f} RETURNING 1 $$, {desc(cmd + ': authenticated, not authorized affects 0 rows [solver]')} );")
+            body.append(f"SELECT is_empty( $$ {act_f} RETURNING 1 $$, {desc(cmd + ': authenticated, not authorized affects 0 rows [solver]' + _tag)} );")
         body.append("RESET ROLE;"); body.append(reseed)
         oa = _probe(conn, arr_t, ["SELECT set_config('request.jwt.claims', '', true)", "SET LOCAL ROLE anon"], "write", act_t)
         if not oa[2]:   # also probe anon so the matrix is complete (no stray '– not tested' cell)
@@ -349,14 +378,14 @@ def solve_emit(ctx, baker, cmd, node=None):
             body.append("RESET ROLE;"); body.extend(s + ";" for s in arr_t)
             body.append("SELECT set_config('request.jwt.claims', '', true);"); body.append("SET LOCAL ROLE anon;")
             if oa[0] == "err":
-                body.append(f"SELECT throws_ok( $$ {act_t} $$, '{oa[1]}', NULL, {desc(cmd + ': anon denied (' + oa[1] + ') [solver]')} );")
+                body.append(f"SELECT throws_ok( $$ {act_t} $$, '{oa[1]}', NULL, {desc(cmd + ': anon denied (' + oa[1] + ') [solver]' + _tag)} );")
             elif oa[0] == "rows" and oa[1] >= 1:
-                body.append(f"SELECT isnt_empty( $$ {act_t} RETURNING 1 $$, {desc(cmd + ': anon CAN act (policy permits anon) - REVIEW [solver]')} );")
+                body.append(f"SELECT isnt_empty( $$ {act_t} RETURNING 1 $$, {desc(cmd + ': anon CAN act (policy permits anon) - REVIEW [solver]' + _tag)} );")
             else:
-                body.append(f"SELECT is_empty( $$ {act_t} RETURNING 1 $$, {desc(cmd + ': anon affects 0 rows [solver]')} );")
+                body.append(f"SELECT is_empty( $$ {act_t} RETURNING 1 $$, {desc(cmd + ': anon affects 0 rows [solver]' + _tag)} );")
             body.append("RESET ROLE;"); body.append(reseed)
-        return True
-    return False
+        _emitted += 1
+    return _emitted > 0
 
 
 def run(ctx, baker, cmd):

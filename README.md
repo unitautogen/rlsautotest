@@ -67,6 +67,7 @@ It verifies the access-control safeguard, not your whole HIPAA or SOC 2 program.
 - **Proves policies are correct, not just present.** It becomes each identity (owner, other user, anon, role-holder) and checks actual access, so a policy that's enabled but wrong (`USING (true)`, the wrong column, an always-true predicate) is caught, not just "RLS is on."
 - **Every test asserts a real, owned row.** Assertions check the exact rows an identity can and can't see, so a passing suite means something: break a policy and the test turns red.
 - **Proves multi-tenant isolation.** It seeds two tenants' data and claims and verifies one tenant sees only its own rows: the core invariant of most apps, checked directly.
+- **Probes the two-membership user single-membership fixtures can never test.** Every membership policy is exercised by test users who belong to exactly one team — but real users join second teams, and that's exactly when the classic bugs fire: `team_id = (SELECT team_id FROM team_members WHERE user_id = auth.uid())` errors (`21000`) the moment the subquery returns two rows, and a `LIMIT 1` "fix" silently picks one team at random. For membership-scoped tables rlsautotest additionally seeds **one identity belonging to two tenants** (plus a visible row in each), probes what that identity actually sees, and pins the union cardinality as a test — so a policy that breaks, hides data, or over-delivers for users who belong to 2 tenants fails the gate, and any later drift turns the suite red. `lint` flags the scalar-subquery shape statically, with the fix (use `EXISTS`/`IN`, or resolve the tenant into a JWT claim at auth time).
 - **Models "denied" the right way.** Row-level filtering is verified as zero rows visible; a missing grant is verified as a permission error. The two are distinguished, so a block is proven for the right reason.
 - **Catches the cross-policy `WITH CHECK` leak.** This fires when a table has **two or more *permissive* `UPDATE` (or `INSERT`) policies** whose per-policy `WITH CHECK` is a *narrow value constraint* (a partition, e.g. one allowed status per role), but the discriminator that's meant to limit *who* may write *what* (role, owner, tenant) sits **only in `USING`, not repeated in `WITH CHECK`**. Postgres OR-combines every permissive policy's `WITH CHECK` independently of which `USING` matched, so the effective check becomes the *union* of all of them, with no discriminator. Any identity that can target a row can then write *any* value *any* policy permits (e.g. a `cutter` setting `status='Completed'`). rlsautotest enumerates the value space and proves, per identity, exactly which forbidden values are accepted. Fix: repeat the role/owner/tenant guard inside each `WITH CHECK`, or enforce the transition in a trigger / `SECURITY DEFINER` function, or make the constraint `AS RESTRICTIVE` so it `AND`s instead of `OR`s.
 - **Handles real schemas.** It seeds foreign-key parents in dependency order, so tables with required relationships are actually tested, and it handles the tricky policies: owner (`auth.uid()`), tenant/JWT-claim, membership (`EXISTS`/`IN`), array membership (`= ANY`), role lookups (`(select role from profiles where id = auth.uid())`), RBAC functions (`authorize()` / `has_role()`), recursive hierarchies, escape-hatch `OR` admin grants, and permissive + `AS RESTRICTIVE` composition.
@@ -140,6 +141,43 @@ anon                             Â·       Â·       Â·       Â·
 `âœ“` = can, `Â·` = blocked. The one thing that lights up red is a `âœ“` where it should be `Â·`: an *authenticated-but-not-authorized* user or *anon* that can act (a security hole). It jumps out without decoding anything. `service_role` is shown for completeness; it bypasses RLS by design. A table with **RLS off** is flagged loud (it has no row-level protection at all).
 
 The identity rows are deliberately worded so they aren't mistaken for database roles: `authenticated, authorized` and `authenticated, not authorized` are the **same Postgres role** (`authenticated`) under different JWT identities/claims. Only `service_role`, `authenticated`, and `anon` are actual Postgres roles. "Authorized" vs "not authorized" is simply whether that identity passes the table's policies (owns the row, is in the right tenant/org, or has the required role).
+
+## The two-membership user
+
+A membership policy (`EXISTS (SELECT 1 FROM team_members ...)`) is usually tested — by every tool and most hand-written suites — with users who each belong to exactly **one** team. Real users belong to two. That single difference is where a class of bugs lives:
+
+- `team_id = (SELECT team_id FROM team_members WHERE user_id = auth.uid())` works perfectly in every single-membership test and **errors on every query** (`21000: more than one row returned`) the moment a user joins a second team.
+- Adding `LIMIT 1` stops the error and starts something worse: Postgres picks one of the user's teams **arbitrarily**, so they randomly see one team's data with the other silently hidden.
+- An over-broad rewrite quietly shows a multi-team user more than their memberships grant.
+
+For a table whose policy is a canonical membership check, rlsautotest seeds an extra identity — `authenticated, member of 2 tenants` in the report — with membership rows in **two** tenants and a visible row in each, probes what it actually sees, and compares against the single-membership branch identity. Union confirmed → the exact count is **pinned as a test**, so any later drift into one of the shapes above turns the suite red in CI. Error, hidden data, or over-delivery → a failing test is baked, the report marks the row, and the gate exits non-zero.
+
+Judgement is enforcement-only, never intent: the probe runs only when *nothing* in the policy (no claim or session input) could legitimately narrow a two-membership view to one team. And it skips, by construction, the membership table itself (seeding two memberships there would insert rows into the very table being measured) and any schema that makes a second membership impossible (a unique user column) — a state that cannot exist in production needs no test.
+
+`rlsautotest lint` catches the scalar-subquery shape statically, too — flagged HIGH with the fix (use `EXISTS`/`IN` over the membership table, or resolve the tenant into a JWT claim at auth time), while the safe shapes (`EXISTS`, `IN`, the `(SELECT auth.uid())` initplan idiom, and lookups keyed on a unique column) are never flagged.
+
+## Who a policy actually applies to: `TO`, `PUBLIC`, and role groups
+
+Every policy has an audience (the `TO` clause), and it is the least-read line in the whole policy. The predicate gets all the attention, but the audience decides who the predicate applies to at all. Postgres gives you several ways to name that audience, and some of them routinely end up saying something different from what the author meant:
+
+| You write | Postgres records | Who it actually covers |
+|---|---|---|
+| *(no `TO` clause at all)* | `PUBLIC` | **Every role, present and future.** Omitting `TO` is not "a sensible default audience"; it is the widest audience that exists. |
+| `TO PUBLIC` | `PUBLIC` | The same as above, but at least it says so out loud. |
+| `TO authenticated`, `TO anon` | that role | The named role, plus any role that inherits from it. These names are Supabase/Neon *conventions*, not Postgres keywords; on a vanilla cluster they mean nothing unless someone created them. |
+| `TO some_group` | that role | The group **and every member that inherits its privileges**. Any role can act as a group: `GRANT some_group TO alice` puts `alice` under this policy without her name appearing anywhere near it. |
+| `TO CURRENT_USER` / `TO CURRENT_ROLE` / `TO SESSION_USER` | a concrete role, resolved **at creation time** | Whoever ran the migration. The keyword is gone by the time the policy is stored; reading the catalog later, you cannot tell it was ever dynamic. |
+| `TO pg_database_owner`, `TO pg_read_all_data`, ... | that predefined role | Postgres's built-in group roles. `pg_database_owner` is the strangest: its membership is *computed* (whoever owns the current database), never stored. |
+
+One reassurance: a role literally named `public` cannot exist (the name is reserved), so when a catalog view shows `public` in a policy's role list, it always means "everyone".
+
+Two of these rows are where audits go wrong:
+
+**The omitted `TO` on a permissive policy.** A policy named `"Service role full access"` with `USING (true)` and no `TO` clause does not apply to the service role. It applies to **everyone**, anon included. And because permissive policies OR together, that one policy silently absorbs every carefully-scoped policy sitting next to it: the user-scoped predicates still evaluate, they just no longer matter. The policy's name is documentation; the audience is the enforcement, and here they disagree.
+
+**Inheritance.** A policy `TO admins` covers `alice` the moment she is granted membership, even though no text search for `alice` across your migrations will ever connect her to it. Audience is a property of the role graph, not of the policy text.
+
+Both are the same lesson this tool is built around: what a policy *reaches* is a fact about the catalog, not about the policy's name or the author's intent. Reach is what has to be measured.
 
 ## Every schema at once
 
@@ -268,7 +306,13 @@ The same idea runs deeper on other engines:
 - **SQL Server**: automated unit-test generation and branch coverage for stored procedures, emitting **tSQLt** (the open-source SQL Server test framework).
 - **Oracle, Azure SQL**: in development.
 
-If your team needs automated database test *generation* beyond Postgres RLS (SQL Server, Oracle, Azure), [get in touch](https://github.com/unitautogen).
+**Coming soon - UnitAutogen for PostgreSQL, Supabase & Neon:**
+
+1. Automated pgTAP test-suite generation and coverage for functions and triggers which is ready for CI.
+2. Database security-coverage suite - Every function and trigger exercised under every database role.
+3. Automated HIPAA compliance evidence, generated as pgTAP tests.
+
+Want early access? [hello@unitautogen.com](mailto:hello@unitautogen.com?subject=UnitAutogen%20early%20access)
 
 ## Credits
 

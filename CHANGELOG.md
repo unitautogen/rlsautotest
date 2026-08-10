@@ -4,6 +4,277 @@ All notable changes to **rlsautotest** are documented here. The format is based 
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and versions
 roughly follow semantic versioning.
 
+## [0.7.0] - 2026-08-07
+
+### Added
+- **The member-of-2-tenants probe: a seeded identity that belongs to TWO tenants, with the union cardinality it should see pinned as a test.** (#4) Every test identity used to hold exactly one membership, so a policy bug that only manifests when a real user belongs to two teams -- the classic being `team_id = (SELECT team_id FROM team_members WHERE user_id = auth.uid())`, which raises `21000` (or picks one team arbitrarily under `LIMIT 1`) the moment someone joins a second team -- passed every generated test. For a table whose SELECT branch is a canonical membership policy, the engine now seeds one identity with membership rows in two scopes plus one visible row in the second scope, probes what that identity actually sees, and judges it differentially against the single-membership branch identity: the union confirms -> the exact count is baked as a green `authenticated, member of 2 tenants` test (so any later policy drift that mis-serves users who belong to 2 tenants turns the suite red); the query errors, or the identity sees fewer/more rows than its two memberships grant -> a failing test is baked, the report marks the new `authenticated, member of 2 tenants` row (`✗`/`✓!`), a `MEMBER OF 2 TENANTS` note explains it, and the CI gate exits non-zero. Judgement is enforcement-only, never intent: the probe runs solely on a pure canonical-membership branch, where nothing in the policy (no claim or session input) could legitimately narrow a two-membership view to one. It is skipped, by construction, when the table under test is (or FK-reaches) the membership table itself -- seeding the two memberships would insert rows into the very table being measured (the rival identity's self-pollution guard, reused) -- and when the membership table's schema makes a second membership impossible (a unique user column), because then the state cannot exist in production. SELECT-only in this release; suites for tables without a canonical membership branch are byte-identical.
+- **`lint` flags the scalar-subquery membership lookup.** (#4) `col = (SELECT ... FROM t WHERE ... = auth.uid())` works only while every user has at most one row in `t`; a second membership makes every query on the table error for that user (`21000`), and a `LIMIT` variant silently picks one membership arbitrarily. Flagged HIGH with a fix suggestion (use `EXISTS`/`IN` over the membership table, or resolve the value into a JWT claim at auth time). The detector reads the policy's parse tree, not a regex: the `(SELECT auth.uid())` initplan idiom (no `FROM`) and the multi-row-safe `EXISTS`/`IN`/`ANY` forms are never flagged, and a lookup keyed on a UNIQUE column (the classic read-my-role-from-my-profile-row shape, at most one row by schema) is exempt.
+- New fixture `examples/multimembership.sql` (canonical EXISTS membership, the membership table itself, its FK parent, and the scalar-subquery hazard) wired into the CI green loop, plus a CI step proving all three guards: lint flags the scalar shape; the emitted union-cardinality pin goes red when the policy drifts to an arbitrary-pick shape; and the report gate catches the same drift at generation time.
+- **The relational-state fallback now bakes anon's no-grant SELECT denial instead of leaving the cell untested.** When a table's SELECT policy is unclassified and the DB-oracle fallback (BL-12) probes anon, a table where anon holds no SELECT grant used to return an error rather than a count, so nothing was baked and the report showed a `-` (not tested) cell with a NOT TESTABLE note. But that specific denial is decided by GRANTs alone -- SQLSTATE `42501` fires before any policy row filtering -- so it is provable without understanding the policy. The fallback now recognizes the probed `42501` and bakes the same `throws_ok('42501')` denial test the write batteries emit for implicit deny, turning the cell into a tested "blocked". Only the observed insufficient-privilege case is baked (probe-and-bake, never a guess); any other anon probe error still leaves the cell honestly untested. Suites where anon holds a SELECT grant, or where the SELECT branch is classified, are byte-identical.
+- **Obligation-based branch routing: every branch of every policy is now tested (or loudly declared untested) -- no branch rides along silently.** Four generic changes, no pattern-specific code: (1) the DNF dedup key now includes an unclassified atom's identity, so two DIFFERENT not-yet-understood branches can no longer collide and silently drop one of them from the model; (2) an unhandled min-term OR'd with a classified branch is routed, node-scoped, through the full fallback chain (general solver, then the relational-state DB-oracle floor) instead of only the bare per-min-term solver -- and the opaque-function refusal is now per-BRANCH, not per-table, so a solvable predicate is no longer refused because a SEPARATE policy delegates to a function; (3) the solver and the relational-state floor no longer stop at the first confirmed policy: EVERY permissive policy of a command gets its own battery, and an OR predicate additionally gets one battery per disjunct (labeled ` [branch N]`), so a second policy or a second branch can never hide behind the first one's green; (4) a branch that STILL cannot be witnessed is recorded and surfaced -- a `PARTIALLY TESTED` footgun note in the report naming the command, policy and reason, and a matching comment in the emitted suite -- instead of disappearing behind a green sibling cell. All new tests remain probe-and-baked (only DB-observed outcomes are asserted); suites for tables with a single fully-classified policy are byte-identical. New fixture `examples/mixedor.sql` (a classified-OR-novel branch, two permissive policies on one command, and a `NOT (a AND b)` De Morgan pair) plus CI guards that fail if the per-disjunct batteries or the branch rescue ever regress.
+- **Function understanding: a policy that delegates to a user-defined boolean function is now tested with REAL inputs when the function's body is readable.** The engine expands the parsed body (SQL and single-expression plpgsql, `SELECT EXISTS(...)` and `count(*) > 0` shapes, call-site constants substituted for parameters, functions calling functions expanded transitively) into an effective predicate and uses it ONLY to decide what to seed; the probe and every baked test run the policy with the REAL function, so a wrong or incomplete expansion degrades to the existing mock wiring proof and can never fabricate a pass. Real-input batteries are emitted BEFORE the wiring block on purpose: wiring re-installs the generation-time function definition mid-file, so a battery emitted after it would exercise the restored body and a drifted function would slip through on replay -- emitted first, a function body that drifts (broadened OR narrowed) turns the suite red, which is the point. VOLATILE functions, non-constant arguments, multi-statement or control-flow bodies (the `rbac_tenant` shapes), and dynamic SQL stay on the honest wiring path unchanged. New fixture `examples/fnexpand.sql` (EXISTS body, `count(*)>0` body, a function calling a function, and a deliberately unexpandable dynamic-EXECUTE control) plus CI guards for both directions; `regexfree`'s reviews table upgrades from wiring-only to a DB-verified solver battery, and the rest of the corpus is byte-identical.
+- **Mock-wiring batteries are probe-first now -- the last guessed-assertion path is retired (MB-1).** When a policy delegates to an opaque boolean function whose body cannot be read, the engine mocks the function true and false to prove the policy WIRES to it. Those wiring batteries used to bake reasoned expected outcomes (`count = 1`/`0`, `lives_ok`/`throws_ok`) without ever probing -- the codebase's one remaining exception to probe-and-bake. They now probe the mock-true and mock-false arrangements against the live database at generation time and bake the OBSERVED outcome through the same ProbeBaker every other strategy uses. A policy that does not actually gate on the mocked function (another permissive policy grants, or a restrictive conjunct blocks the row) bakes the honest observation instead of a guess that would false-fail on replay; and a new soundness guard turns an un-isolable wiring proof -- mocking the function TRUE does not grant the command -- into a loud UNRELIABLE naming the cause, never a misleading "authorized denied" cell. Because every existing wiring test already passed on replay, the observed outcomes equal the previous guesses: every report matrix cell is byte-identical, and only the assertion wording changes (the udf-table suites rebaseline to the `mock_force` wording).
+- **Correct on every way Postgres names a policy audience.** A policy with no `TO` clause is stored as `polroles = {0}` -- the PUBLIC pseudo-role, which has no `pg_roles` row -- so literal role matching read "no policy references any role" for entire schemas that omit `TO` (the reported bug; the reporter's audited schema was 17/17 no-`TO`). Role discovery (`auth_profile`) now models PUBLIC explicitly, admits LOGIN client roles reachable only through PUBLIC (still excluding the connecting role and the schema owner), and tests audience membership with `pg_has_role` so a policy `TO some_group` is correctly attributed to every role that inherits it -- the same bug class reached through the role graph. Lint learned the same lesson: L001 and L007 now treat a no-`TO` policy as anon-inclusive (the reporter's exact `USING (true)` policy is CRITICAL, not HIGH), and a new HIGH rule, **L017**, flags a permissive no-`TO` policy sitting beside role-scoped policies -- the classic policy NAMED "Service role full access" whose actual audience is everyone (deliberately quiet when the whole schema omits `TO`, the tutorial norm). Emitted suites now conditionally quote role names in `SET LOCAL ROLE` (a mixed-case role no longer breaks the file; lowercase output is byte-identical), `pg_*` predefined group roles in a `TO` clause are reported as an informational note instead of being probed via `SET ROLE` (which Postgres refuses for `pg_database_owner`), and the `tests.clear_authentication()` helper -- which hardcodes role `anon` -- is only used when the unauthenticated role IS `anon`, so a generic provider's suite (and a custom role probed with empty claims) replays as the same role the generator actually probed. New fixture `examples/publicto.sql` plus CI guards on the CRITICAL/L017 lints and the discovered-role identity; the generated-test engine was already PUBLIC-correct, and the rest of the corpus is byte-identical except the custom-role suites, whose replay identity now matches the probed role.
+- **An owner policy whose identity cannot be bound is now flagged loudly instead of read as "correctly denied."** When a rowlinked authorized identity sees zero of its OWN seeded row, the precondition (the `auth.uid()`/claim binding resolving to the seeded owner) was not established -- the row was filtered away, not denied by intent. The engine previously baked the observed zero as a silent "blocked" cell, which is the exact false alarm a correct-but-unbound policy produces (a valid policy that appears to hide every row). It now bakes an UNRELIABLE assertion that fails loudly and names the likely cause: an `auth.uid()` shape the probe does not drive (the older flat `request.jwt.claim.sub` GUC, as used by some GoTrue and hand-rolled setups) or a custom session GUC such as `current_setting('app.*')`. Sound and narrow: only a rowlinked identity's own-row miss is reclassified, never a genuine cross-identity denial. Verified in an isolated regression database (`examples/authshape.sql`, which redefines `auth.uid()` to the flat shape and so cannot share the corpus DB); suites where the identity binds correctly are byte-identical.
+- **New lint L018: a self-owned write that leaves an access-scope column unconstrained.** When a
+  write policy pins the row to the caller's own identity (a `col = auth.uid()` / claim self-check) but
+  the schema uses ANOTHER column to define access scope (a column compared against the caller's
+  identity in some policy) and the write side never re-checks it, a caller can edit their own row and
+  change that column -- reassign ownership, or move the row to another tenant -- while every
+  per-command assertion still passes. L018 (MEDIUM) reports the policy, the constrained columns, and
+  the unconstrained scope column(s), with the fix (add them to WITH CHECK). Scope-ness is derived from
+  predicate STRUCTURE, not column-name heuristics, so `body`/`title` are never mistaken for scope keys;
+  and a role/admin-gated write (e.g. `has_role(org_id,'owner')` inserting any `user_id` into a
+  membership table) is deliberately NOT flagged, since setting other columns is the admin's intent.
+  New fixture `examples/writescope.sql`. Lint-only -- no change to generated suites or the report gate.
+- **The general subquery witness now handles a two-table inner join.** A membership-through-a-join
+  policy -- `EXISTS (SELECT 1 FROM memberships m JOIN roles r ON r.id = m.role_id WHERE m.user_id =
+  auth.uid() AND m.org_id = docs.org_id AND r.name = 'admin')` -- previously fell to "not tested"
+  because the subquery grammar accepted only a single base table. The reader now recognizes a 2-table
+  INNER join (JoinExpr or comma-join), identifies the anchor table (the one carrying the caller
+  correlation / `auth.uid()`) and the joined table reached by the equijoin key, and the witness seeds
+  BOTH tables -- the joined row first (so an anchor->joined foreign key resolves) with the join key
+  shared between the anchor row's FK and the joined row's key -- then DB-verifies the grant/deny pair.
+  A wrong seed (a non-uuid key, an unsettable identity PK, an opaque function on the joined table)
+  simply fails to confirm and stays NT -- never a false pass. The single-table grammar is unchanged,
+  so existing suites are byte-identical; the classifier and the relational-state floor stay
+  conservative on joins (they defer to this witness). Joins of three or more tables remain deferred.
+  New fixture `examples/joinsub.sql`.
+- **The subquery witness now also handles an OR inside the subquery WHERE (MB-2b).** A membership
+  policy whose EXISTS/IN subquery ORs two conditions -- `EXISTS (SELECT 1 FROM members m WHERE
+  m.org_id = docs.org_id AND (m.user_id = auth.uid() OR m.via_group))` -- previously fell to "not
+  tested" because the single-signature reader accepted only an AND-only WHERE. The reader now
+  distributes the WHERE to DNF min-terms and takes the identity/correlation arm (the direct-membership
+  arm); because any condition ANDed OUTSIDE the OR appears in every min-term, the falsifier that breaks
+  the correlation still denies every arm, so the deny side is real. The chosen arm is a best-effort
+  witness HINT: the classifier and the relational-state extractor stay conservative on it, and the
+  general solver DB-verifies the grant/deny pair before baking -- an OR whose arms it cannot soundly
+  isolate simply stays not-tested, never a false pass. The single-arm (AND-only) grammar was refactored
+  to share one code path but is behavior-preserving, so every existing suite is byte-identical. New
+  fixture `examples/orsubquery.sql` (a member-directly-OR-via-group policy that upgrades from not-tested
+  to a DB-verified `[solver]` battery). Joins of three or more tables remain deferred.
+- **A regression fixture now guards the Neon (pg_session_jwt) adapter (MB-11).** rlsautotest's support
+  for Neon's RLS vocabulary and role model was built and verified against a real Neon database in an
+  earlier release, but nothing in the corpus guarded it against a future regression. `examples/neon.sql`
+  adds a Neon-shaped schema -- identity via `auth.user_id()` and claims via `auth.session()` (recognized
+  by construct as the equivalents of `auth.uid()` / `auth.jwt()`), the roles `authenticated` and
+  `anonymous`, and no `service_role` -- and the engine handles it on its own terms: `documents` is
+  owner-isolated through `auth.user_id()`, `posts` is gated on a custom `user_role` claim read via
+  `auth.session()`, and the report shows a faithful three-row matrix (authenticated authorized /
+  not-authorized plus `anonymous`) with no phantom `service_role` row, because the role model is
+  discovered from the catalog rather than assumed.
+- **The offline `--emit` helper shim is now flavor-aware, so a Neon suite is runnable with the default
+  `--emit` (no `--no-helpers` needed) (MB-11).** The `000-setup-tests-hooks.sql` shim used to hardcode
+  Supabase's client roles -- it granted the `tests` schema to `anon, authenticated, service_role`, made
+  `clear_authentication()` set role `anon`, and defined an `authenticate_as_service_role()`. On a provider
+  with a different role model (Neon uses `anonymous`, not `anon`, and has no `service_role`) those roles do
+  not exist, so the generated suite could not run as-is. The shim now derives its role vocabulary from the
+  same catalog-discovered role model the rest of the engine uses: the unauthenticated role is taken verbatim
+  when it is a conventional `anon`/`anonymous` (otherwise it falls back to `anon`, so a login role that a
+  no-`TO`/no-anon-grant schema causes to be discovered as the unauth slot never rewrites the shim), and the
+  RLS-bypass helper is emitted only when the provider actually has such a role -- on one that does not (Neon)
+  it becomes a loud-failing stub instead of a call against a missing role. A standard Supabase role model
+  produces the previous shim byte-for-byte, so every existing suite is unchanged; a Neon schema's setup hook
+  now grants to `anonymous`/`authenticated` and authenticates as `anonymous`, and the emitted Neon suite runs
+  green end-to-end.
+- **The plain-text `--report` now lists the bypass surfaces too (MB-9).** The objects and roles that can
+  sidestep RLS even when the policies are correct -- a client-reachable SECURITY DEFINER view or function
+  that reaches an RLS table, a mutable-search_path definer function, a dual-write path, a role that
+  bypasses RLS -- were already surfaced in the HTML and `--report-json` output (the L011-L015 / L020
+  bypass lint, shipped in 0.3.0); only the text report omitted them. It now prints a `bypass surfaces
+  (N found)` section, severity-ordered and shown ONLY when findings exist (a clean report stays terse),
+  reading the SAME findings the other formats do. The section is DELIBERATELY informational and NOT wired
+  into the pass/fail exit gate: a corpus audit confirmed that legitimate green schemas routinely expose
+  sanctioned SECURITY DEFINER helpers (recursion readers, write-rpcs, org-creation triggers), so gating on
+  them would false-fail correct schemas -- a bypass surface is a review flag, never a generated test (there
+  is no oracle to green a definer body). Two follow-on sub-parts of the original ask also shipped this
+  release (their own entries below): an opt-in CI gate that can fail on bypass surfaces, and an UNRELIABLE
+  cell for a PROBED client role that itself carries BYPASSRLS. The four corpus reports that carry definer helpers
+  (rbt, recursion, dw, rcw) rebaseline to add the section; every other report is byte-identical and no
+  emitted suite changes.
+- **Custom-role column-level-security parity: a custom role's column grant now carries the same CLS
+  assertion the standard roles get (MB-12).** Column-level security (0.4.0) flags a column-specific GRANT
+  that a BROADER grant silently bypasses and bakes one parity assertion per column-scoped cell. It covered
+  the standard client roles (service_role / authenticated / anon) but not a CUSTOM role: a policy-named
+  role such as an `auditor` holding `GRANT SELECT (id, ...)` showed its column scope in the report grid
+  while the emitted suite asserted nothing for it -- the report claimed a scope the suite never guarded.
+  The suite's CLS role set now also gathers custom roles that hold a column-level grant
+  (`pg_attribute.attacl`), through a shared `colsec.column_grant_roles` helper, so the report and the suite
+  read the SAME roles and can never disagree about a custom role's column scope. A table with no
+  custom-role column grant adds no roles, so every existing suite is byte-identical. New fixture
+  `examples/clscustom.sql` -- a custom `clsc_auditor` role column-scoped to `[id, amount]` on one table
+  where the scope holds (a passing assertion) and to `[id]` on another where a table-wide grant leaks
+  owner/action/ip/secret past it (the assertion names the leak) -- wired into the local regression corpus
+  and guarded in CI.
+- **A `--no-probe`/`--structural-only` mode emits a suite that runs ZERO probes, safe to point at a
+  production replica (MB-10).** Normally the engine executes real INSERT/UPDATE/DELETE against the target
+  to observe each policy outcome (inside an always-rolled-back savepoint, so nothing commits) -- but a user
+  who wants a hard guarantee of no side effects can now pass `--no-probe` (alias `--structural-only`). It
+  runs no live probe at all and emits only the tests that need none: the schema-wide RLS-enabled guard, a
+  per-table RLS-enabled assertion, and the column-level-security parity assertions. The row-level
+  grant/deny matrix is honestly left NOT generated -- each file carries a loud note saying so and pointing
+  the reader to re-run without the flag against a disposable copy for full coverage -- so partial coverage
+  is never dressed up as a pass. The flag is strictly opt-in: without it every emitted suite is
+  byte-identical to before (verified across the corpus). Two details keep each emitted file valid: the
+  arrange block (test-user creates, the pre-seed DELETE, and the seed) is omitted so the file performs no
+  writes at all, and a table that would otherwise plan zero assertions gets one genuine no-probe assertion
+  (RLS must be enabled on the reachable table) so a real pgTAP `finish()` does not error on an empty file.
+- **The member-of-2-tenants guard now also pins the WRITE union (MB-3b).** The two-membership probe
+  previously pinned only what a user in two tenants can SEE (the SELECT union cardinality). It now also
+  probes whether that user can WRITE into their SECOND tenant: for a canonical EXISTS-membership table that
+  also takes a membership-scoped INSERT on the same scope column, the engine probes the 2-tenant member
+  inserting a row scoped to their second org and bakes the OBSERVED outcome -- a correct WITH CHECK gives a
+  passing `isnt_empty` (drift-pinned), and a later policy change that blocks the second tenant turns it red.
+  The single-membership battery only ever exercised the first tenant, so this closes the write side of the
+  same blind spot. Sound and narrow: it runs only when the seeder built the second-org insert row (a
+  matching membership INSERT branch), so owner/other write shapes and every non-membership table stay
+  byte-identical; in the corpus only the two canonical-membership-with-INSERT tables (mtt.docs,
+  tenancy.projects) gain the assertion and a ✓ in the member-of-2-tenants INSERT cell.
+- **The subquery join witness now handles chains of three or more tables (MB-2b).** A membership policy
+  whose EXISTS subquery joins three or more tables -- `EXISTS (SELECT 1 FROM memberships m JOIN roles r ON
+  r.id = m.role_id JOIN role_types t ON t.id = r.type_id WHERE m.user_id = auth.uid() AND m.org_id =
+  docs.org_id AND t.name = 'admin')` -- previously fell to "not tested" because the reader accepted only a
+  single two-table join. It now recursively flattens the FROM into its base tables and every ON condition,
+  union-finds the columns tied by equijoins into shared-value groups (so one value flows correctly along the
+  whole chain, even where a table joins another joined table rather than the anchor), and seeds one row per
+  table in FK-parent-first order before DB-verifying the grant/deny pair. A wrong seed -- an unsatisfiable
+  shape, a join key the schema does not actually share, or a joined lookup table the querying role cannot
+  read -- simply fails to confirm and stays not-tested, never a false pass. The single- and two-table
+  grammars are unchanged, so existing suites are byte-identical. New fixture `examples/joinsub3.sql`
+  (a memberships -> roles -> role_types chain).
+- **An opt-in CI gate on bypass surfaces, with a sanctioning list (MB-9).** rlsautotest already surfaces
+  the objects that can sidestep RLS even when the policies are correct -- SECURITY DEFINER views/functions
+  reachable by a client role, and roles with BYPASSRLS/superuser -- as review flags in the report. They can
+  now also fail the CI gate, but only when you opt in: `--fail-on-bypass[=SEVERITY]` (a bare flag means
+  CRITICAL) fails on any bypass finding at or above SEVERITY. Because an intentional definer helper is a
+  legitimate, reviewed surface, `--allow-bypass CODE:OBJECT` (or a bare CODE) sanctions specific findings so
+  only a NEW, unsanctioned surface trips the gate. The flag is off by default, so every existing suite,
+  report, and gate is byte-identical; turning it on is how a team declares that no undeclared RLS bypass may
+  land.
+- **A client role that itself carries BYPASSRLS is now caught as UNRELIABLE, never a false pass (MB-9b).**
+  If the role the tests run as (the `authenticated` identity, or the unauthenticated role) itself has
+  BYPASSRLS, it sees every row regardless of policy -- so a passing row-level observation there cannot tell a
+  correct policy from a broken one, exactly the false pass this tool exists to prevent. rlsautotest now detects
+  it: client-role discovery no longer folds a conventionally-named bypassing role into the sanctioned
+  service_role slot, and every matrix cell probed as such a role is baked as a loud UNRELIABLE (a failing
+  assertion that names the cause) instead of a green. The sanctioned service_role bypass row is exempt, since
+  showing that it bypasses is the point of that row. Off by construction for normal schemas (no client role
+  bypasses RLS), so every existing suite and report stays byte-identical; it is covered by unit tests rather
+  than a corpus fixture, because a shared BYPASSRLS client role cannot be added to the example database safely.
+- **UNRELIABLE cells now tell you how to fix them (MB-24).** When rlsautotest cannot trust a probe result it
+  marks the cell UNRELIABLE -- a loud failing test, never a false pass. Each UNRELIABLE finding now carries a
+  specific `Fix:` for its cause: a client role that bypasses RLS says `ALTER ROLE <role> NOBYPASSRLS`; a mock
+  or helper that could not be installed says to connect as the role that owns it or run `rlsautotest doctor`;
+  an identity whose claim did not resolve to its own seeded row says to align the claim style or probe with
+  `--as-user`; a write that tripped a table CHECK says to give the column a CHECK-satisfying value; and a
+  seeded-0 cell distinguishes a row that could not be planted at all (the seed INSERT hit a table
+  CHECK/constraint -- give the table a conforming fixture row, or treat the cell as not auto-probable) from a
+  row that was planted but is invisible to the identity (an owner-claim / RLS mismatch -- align the claim
+  style), so it no longer blames identity binding when the real blocker was the seed. The
+  guidance appears in both the failing pgTAP message and the report's UNRELIABLE section, replacing the old
+  blanket "investigate seeding" wording that was accurate for only one of the causes. Off-path for clean
+  schemas: the emitted suites are byte-identical (only the report legend line changed).
+- **`--allow-unreliable`: sanction a reviewed, un-probeable UNRELIABLE cell so CI can pass (MB-25).** Some
+  UNRELIABLE cells cannot be made measurable -- the seed row can only violate a table CHECK, so no probe row
+  exists. Such a cell fails CI with no clean escape before now: `--no-probe` drops row-level coverage for
+  every table, `--no-fail` drops the whole gate, and there was no per-table exclude. Now `--allow-unreliable
+  [schema.]table[:CMD]` (repeatable; a bare table covers all four commands), or the same entries in a
+  checked-in `.rlsautotestignore` at the repo root, sanctions specific cells: they stay visible as UNRELIABLE
+  in the report (a new SANCTIONED note names them, never hidden) but drop out of the exit gate, and the
+  emitted pgTAP line becomes `SELECT skip(...)` instead of `fail(...)`, so a committed suite run under
+  pg_prove / `supabase test db` goes green on that cell without ever asserting a possibly-wrong result. Any
+  UNRELIABLE cell you did not list still fails loudly. Mirrors the `--allow-bypass` sanctioning model. Off by
+  default, so no flag and no file leaves every emitted suite and report byte-identical.
+- **The unauthenticated row in the report is labelled clearly, not by a bare role name (MB-26).** When a
+  schema's unauthenticated client role is not literally `anon` -- a custom LOGIN role, or Neon's `anonymous` --
+  the report used to show it in the bottom identity row by its plain name, which reads like an ordinary named
+  role and makes readers wonder where the "anon" row went. It now renders as `anon,
+  anonymous-(unauthenticated)`, with a note under the table naming the real Postgres role behind it, so nothing
+  is lost. A row whose role really is `anon` is unchanged. Report-only: the generated pgTAP suites are
+  byte-identical.
+- **A custom role that reaches a table through a PUBLIC policy is now shown, even if no policy names it
+  (MB-27).** A custom client role got its own row on a table only when a policy targeted it with `TO <role>`.
+  So a role granted directly on a table alongside the anon role, and admitted by the same no-`TO` PUBLIC
+  `USING (true)` policy, had identical access yet was invisible on that table. The report now also probes any
+  custom role that holds a direct table grant and is covered by a PUBLIC policy, so it appears with the same
+  cells as the anon row (reads all rows under a `USING (true)` policy). Only direct grants count -- a table
+  granted to PUBLIC does not pull in every role -- and it is additive: a table without this shape is
+  byte-identical.
+- **New lint L020: a "dual write path".** An RLS table whose intended write path is a client-callable
+  SECURITY DEFINER rpc that holds the validation, while a client role ALSO holds a direct
+  INSERT/UPDATE/DELETE grant on the table. Every per-command RLS assertion passes -- a direct own-row
+  write genuinely is allowed -- but the client can skip the rpc and its validation entirely. Reported
+  as an advisory (there is no oracle for "all writes must go through the rpc"), with the fix: REVOKE the
+  direct DML so the rpc is the only path, after which the direct-write denial becomes an assertable
+  boundary. New fixture `examples/dualwrite.sql`.
+- **New lint L019: unwrapped auth.uid() re-evaluated per row.** `auth.uid()`/`auth.jwt()`/`auth.role()`
+  called bare in a policy predicate is evaluated once per row; `(select auth.uid())` is hoisted to a
+  single InitPlan (Supabase's 0003_auth_rls_initplan). INFO -- a performance note, behavior unchanged.
+  Both L019 and L020 are lint-only -- no change to generated suites or the report gate.
+- **UPDATE is now probed on tables whose only settable column is UNIQUE.** The self-assignment
+  fallback (`SET col = col`, used when a table has no policy-neutral column so the UPDATE grant can
+  still be exercised) previously excluded unique columns and so left a "-" dash on tables that are
+  nothing but an identity PK plus a unique policy column (e.g. `updcheck.t4`). Assigning a row its own
+  current value cannot collide with another row, so a unique column is safe to self-assign: the UPDATE
+  privilege and the USING/WITH CHECK re-check are exercised exactly as intended, and a column-level
+  denial still surfaces as an observed 42501, never a false grant. That last dash cell is now a real
+  tested cell.
+- **HTML report footer repositions UnitAutogen** as "the next-generation database security-coverage and
+  code-coverage tool for functions and triggers" (was "automated unit-test generation ... Need it for
+  SQL Server/Oracle/Azure?"). HTML report only; the text report and emitted-suite headers are unchanged.
+- **The shared footer/header tagline is repositioned to match.** The old "part of UnitAutogen -
+  automated unit-test generation ... Need it for SQL Server (tSQLt), Oracle, or Azure?" line (text
+  report footer, emitted pgTAP suite headers, and CLI output) now reads "part of UnitAutogen - the
+  next-generation database security-coverage and code-coverage tool for functions and triggers." plus
+  the project link; the cross-DB CTA is dropped.
+- **The flat `request.jwt.claim.<key>` auth.uid() shape now binds (MB-23, follow-on to the loud
+  unbound-identity fix).** When a schema's `auth.uid()`/`auth.jwt()` reads the older flat per-claim
+  GUC (`request.jwt.claim.sub`, as some GoTrue and hand-rolled setups do) rather than the
+  `request.jwt.claims` JSON, the identity emitters now also drive those flat GUCs, so a correct owner
+  policy is tested green instead of flagged UNRELIABLE. Detected from the function bodies
+  (`claim_style`), gated so JSON-shape schemas emit nothing new and stay byte-identical. A custom
+  session GUC the tool cannot know (e.g. `current_setting('app.*')`) still stays UNRELIABLE by design.
+  New isolated fixture `examples/flatclaim.sql`; `examples/authshape.sql` switched to the custom-GUC
+  shape so it keeps exercising the loud-UNRELIABLE path.
+- **RESTRICTIVE policies are now conjoined into rescued (solver) branches (MB-6).** When one permissive
+  branch is classified and another is not, the obligation router hands the unclassified branch to the
+  general solver. It previously received only the permissive predicate, so if a RESTRICTIVE policy
+  also applied, the witness it built could violate that restrictive check; the real policy (which
+  includes it) then denied the "authorized" row and the branch fell to PARTIALLY TESTED (sound, but a
+  lost cell). The router now conjoins the restrictive predicate(s) into the routed obligation, so the
+  solver seeds them too and the branch is DB-confirmed. A restrictive conjunct that delegates to an
+  opaque function is expanded as witness hints; one that cannot be expanded is dropped from the
+  obligation (still sound -- the probe runs the real restrictive function). Schemas with no restrictive
+  policy, and fully-classified restrictive cases, emit byte-identical output. New fixture
+  `examples/restrictconj.sql`.
+- **The member-of-2-tenants differential now catches the SCALAR-subquery shape, on read AND write
+  (MB-3).** The two-tenant probe previously ran only on canonical EXISTS membership and only for
+  SELECT. It now also recognizes the scalar shape `col = (SELECT scope FROM junction WHERE
+  user = auth.uid())` -- issue #4's classic broken pattern -- and probes INSERT/UPDATE/DELETE as well.
+  A two-membership identity is seeded and the real command is probed; the moment Postgres raises 21000
+  (the scalar subquery returns 2 rows) a FAILING test is baked naming the cause and the fix (use
+  EXISTS/IN, or resolve the tenant into a JWT claim). This upgrades the shape from a static lint to a
+  live, caught-red test in both directions. Recognition is deliberately tight (the FROM-less
+  `= (SELECT auth.uid())` and the `(subquery) = const` role-lookup are excluded) and guarded like the
+  canonical path (skip when the table under test reaches the junction, or when the junction enforces
+  single membership), so every schema without this exact shape emits byte-identical output. The broken
+  scalar table moved out of `examples/multimembership.sql` into a dedicated negative fixture
+  `examples/scalarmulti.sql`.
+- **Write batteries for the relational-state and recursion DB-oracle floors (MB-4).** Both floors --
+  the cardinality/aggregate floor (a policy gated on `count(*) >= N` of another table) and the
+  self-referential-hierarchy floor (`WITH RECURSIVE`) -- were SELECT-only, so a `FOR ALL` policy gated
+  that way left INSERT/UPDATE/DELETE untested. They now also probe writes: seed a candidate number of
+  matching rows (or an ancestor chain), perform the real write, and bake the observed grant/deny pair
+  (INSERT gated by `WITH CHECK`, UPDATE/DELETE by `USING`). The DB evaluates the real aggregate, so a
+  brand-new gate needs zero per-operator code; recursion INSERT stays a deliberate not-tested (a
+  recursive `WITH CHECK` cannot be seeded soundly). The recursion detector is now command-scoped, so a
+  `FOR SELECT` recursive policy never drives a write battery. Schemas with no write-command policy of
+  these shapes emit byte-identical output. New fixtures `examples/relstatewrite.sql` and
+  `examples/recursionwrite.sql`.
+
+### Fixed
+- **Suites for a table that is the FK parent of its own membership/scope table no longer abort mid-file.** The per-test re-seed ran a raw `DELETE FROM <table>` before clearing the aux (membership/rbac/lookup) tables that reference it, so on shapes like `tenancy.orgs` (memberships -> orgs) or `mtt.teams` (team_members -> teams) the delete raised a foreign-key violation inside the pgTAP transaction and every remaining test in the file was skipped (`pg_prove`: "planned N but ran M"; present in published 0.6.0). The re-seed now clears the aux tables first and the delete block is fault-tolerant like the header's, so an unrelated FK reference degrades to a loud failing count instead of a mid-file abort; the probe's arrange path got the same ordering so a swallowed q-first delete can no longer leave stale committed rows in the observed counts. Tables with no aux tables emit byte-identical files.
+
 ## [0.6.0] - 2026-08-05
 
 ### Added

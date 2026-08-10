@@ -21,6 +21,24 @@ def _v(n): return n[_t(n)]
 def _names(lst): return ".".join(x.get("String", {}).get("sval", "") for x in (lst or []))
 
 
+def _node_fn_names(n, out=None):
+    """Every function name called anywhere inside an AST node (nested subqueries included) -> set of
+    dotted names. Generic walk over the pglast dict/list structure -- no shape assumptions."""
+    if out is None:
+        out = set()
+    if isinstance(n, dict):
+        for k, v in n.items():
+            if k == "FuncCall":
+                nm = _names((v or {}).get("funcname"))
+                if nm:
+                    out.add(nm)
+            _node_fn_names(v, out)
+    elif isinstance(n, list):
+        for x in n:
+            _node_fn_names(x, out)
+    return out
+
+
 
 def _where(clause):
     try:
@@ -183,51 +201,42 @@ def _bool_extra(c, alias):
 
 
 
-def _subquery_sig(subselect, testexpr=None):
-    """F2 (= BL-5): the ONE reader of a policy subquery's shape, consumed by the classifier
-    (_membership), the general subquery witness (_solve_subquery) and the relational-state demand
-    extractor (_subquery_tables) — a new subquery nuance is taught HERE, once. Returns None when
-    there is no single base table or the WHERE contains OR; otherwise a signature dict where
-    `unmodeled` marks any conjunct outside the modeled grammar (each consumer decides how strict
-    to be):
-      mtable, alias            the (qualified) base table and its alias
-      uid                      subq column compared to auth.uid() (the identity correlation)
-      corr [(subq, outer)]     column = column correlations (testexpr/IN first, then WHERE order)
-      extras {subq col: lit}   equality-to-constant and bare-boolean conditions
-      fns [{mcol, node}]       subq column = <opaque fn()/sublink> conjuncts (mock candidates)
-      agg [cols]               the aggregated column when the target is sum/avg/min/max
-      target_col               the first target column (the IN-subquery's yielded column)
-    """
-    ss = (subselect or {}).get("SelectStmt", {})
-    frm = ss.get("fromClause", [])
-    if not frm or len(frm) != 1 or "RangeVar" not in frm[0]:
-        return None
-    rv = frm[0]["RangeVar"]
-    mtable = (rv.get("schemaname") + "." if rv.get("schemaname") else "") + rv.get("relname", "")
-    if not mtable:
-        return None
-    alias = (rv.get("alias") or {}).get("aliasname") or rv.get("relname")
-    conj = _and_conjuncts(ss.get("whereClause")) if ss.get("whereClause") is not None else []
-    if conj is None:                                   # OR in the WHERE -> not an AND-only shape
-        return None
-    sig = {"mtable": mtable, "alias": alias, "uid": None, "corr": [], "extras": {}, "fns": [],
-           "agg": [], "target_col": None, "unmodeled": False}
-    tl = ss.get("targetList", [])
-    if tl:
-        tval = tl[0].get("ResTarget", {}).get("val")
-        sig["target_col"] = _colname(tval)
-        if _t(tval) == "FuncCall":                     # sum/avg/min/max -> note the aggregated column
-            fn = _names(_v(tval).get("funcname")).split(".")[-1].lower()
-            fa = _v(tval).get("args", [])
-            ac = _colname(fa[0]) if fa else None
-            if fn in ("sum", "avg", "min", "max") and ac:
-                sig["agg"].append(ac)
-    if testexpr is not None:                           # outer IN (SELECT target FROM ...) correlation, FIRST
-        _, rowc = _colqual(testexpr)
-        if rowc and sig["target_col"]:
-            sig["corr"].append((sig["target_col"], rowc))
-        else:
-            sig["unmodeled"] = True
+def _dnf_minterms(node, cap=24):
+    """DNF of a boolean AST -> a list of min-terms, each a list of leaf conjunct nodes. AND distributes
+    over OR (cartesian product); OR concatenates; a NOT node or any non-BoolExpr is a single leaf. Returns
+    None if the product would exceed `cap` (keeps the split bounded). Used by _subquery_sig (MB-2b) to widen
+    an OR-containing subquery WHERE into candidate min-terms; every derived witness is DB-verified
+    downstream, so an over-broad split degrades to NT, never a false pass."""
+    if not (isinstance(node, dict) and _t(node) == "BoolExpr"):
+        return [[node]] if node is not None else [[]]
+    op = _v(node).get("boolop"); args = _v(node).get("args", [])
+    if op == "AND_EXPR":
+        result = [[]]
+        for a in args:
+            amt = _dnf_minterms(a, cap)
+            if amt is None:
+                return None
+            result = [r + m for r in result for m in amt]
+            if len(result) > cap:
+                return None
+        return result
+    if op == "OR_EXPR":
+        out = []
+        for a in args:
+            amt = _dnf_minterms(a, cap)
+            if amt is None:
+                return None
+            out += amt
+            if len(out) > cap:
+                return None
+        return out
+    return [[node]]   # NOT_EXPR -> a single leaf
+
+
+def _apply_conjuncts(sig, conj, alias):
+    """Fill a subquery signature's uid/corr/extras/fns/unmodeled from an AND-list of WHERE conjuncts
+    (`conj`), each read against the subquery table's `alias`. Extracted verbatim from _subquery_sig so the
+    single-arm path and each OR min-term (MB-2b) share ONE grammar. Mutates and returns `sig`."""
     for c in conj:
         if _t(c) == "A_Expr" and _names(_v(c).get("name")) == "=":
             l, r = _v(c).get("lexpr"), _v(c).get("rexpr")
@@ -249,6 +258,314 @@ def _subquery_sig(subselect, testexpr=None):
             sig["extras"][bx[0]] = bx[1]; continue
         sig["unmodeled"] = True
     return sig
+
+
+def _join_sig(ss, frm, testexpr):
+    """MB-2: a 2-table INNER-join policy subquery
+    (`EXISTS (SELECT 1 FROM a JOIN b ON a.k=b.k WHERE a.user_id=auth.uid() AND a.scope=outer AND b.x=const)`).
+    Returns a signature whose PRIMARY fields describe the ANCHOR table (the one carrying the outer
+    correlation / auth.uid), plus a `joins` list for the other table reached by the equijoin key. The
+    single-table grammar is unchanged; only shapes that used to return None reach here. EXISTS only
+    (an IN-subquery over a join returns None -> deferred). Only the general witness (_solve_subquery)
+    consumes `joins`; the classifier and the relational-state extractor bail on it (stay conservative)."""
+    if testexpr is not None:
+        return None
+    rvs = []
+    join_quals = []
+    # MB-2b: recursively flatten the FROM into its base RangeVars and collect every ON qual, so a chain of
+    # N INNER joins (nested JoinExpr, e.g. `a JOIN b ON .. JOIN c ON ..`) and an N-way comma join both reduce
+    # to a flat table list. All joins must be INNER; any subselect/outer-join in FROM defers to NT. The
+    # 2-table shapes reduce to the exact same rvs/join_quals as before, so their witnesses are byte-identical.
+    def _collect_from(nd):
+        t = _t(nd)
+        if t == "RangeVar":
+            rvs.append(_v(nd)); return True
+        if t == "JoinExpr":
+            je = _v(nd)
+            if je.get("jointype") != "JOIN_INNER":
+                return False           # LEFT/RIGHT/FULL join -> defer (row-preserving semantics differ)
+            if not _collect_from(je.get("larg")) or not _collect_from(je.get("rarg")):
+                return False
+            if je.get("quals") is not None:
+                jq = _and_conjuncts(je.get("quals"))
+                if jq is None:         # OR in an ON clause -> defer
+                    return False
+                join_quals.extend(jq)
+            return True
+        return False                   # subselect-in-FROM etc. -> defer
+    for _fe in frm:
+        if not _collect_from(_fe):
+            return None
+    def _tbl(rv):
+        return (rv.get("schemaname") + "." if rv.get("schemaname") else "") + rv.get("relname", "")
+    def _al(rv):
+        return (rv.get("alias") or {}).get("aliasname") or rv.get("relname")
+    aliases = {}
+    for rv in rvs:
+        a = _al(rv)
+        if not a or not _tbl(rv):
+            return None
+        aliases[a] = _tbl(rv)
+    if len(aliases) < 2 or len(aliases) != len(rvs):
+        return None                    # <2 tables, or a self-join (a table aliased twice) -> defer
+    where = _and_conjuncts(ss.get("whereClause")) if ss.get("whereClause") is not None else []
+    if where is None:                  # OR in the WHERE -> defer (MB-2b)
+        return None
+    uid = {}
+    corr = {a: [] for a in aliases}
+    extras = {a: {} for a in aliases}
+    fns = {a: [] for a in aliases}
+    joinkeys = []
+    unmodeled = False
+    for c in join_quals + where:
+        if _t(c) == "A_Expr" and _names(_v(c).get("name")) == "=":
+            l, r = _v(c).get("lexpr"), _v(c).get("rexpr")
+            if _is_func(l, "auth.uid") or _is_func(r, "auth.uid"):
+                q, col = _colqual(r if _is_func(l, "auth.uid") else l)
+                if q in aliases and col:
+                    uid[q] = col
+                else:
+                    unmodeled = True
+                continue
+            lq, lc = _colqual(l)
+            rq, rc = _colqual(r)
+            if lc and rc and lq in aliases and rq in aliases and lq != rq:
+                joinkeys.append((lq, lc, rq, rc)); continue          # a.k = b.k (equijoin)
+            if lc and rc and (lq in aliases) != (rq in aliases):     # alias col = OUTER col (correlation)
+                if lq in aliases:
+                    corr[lq].append((lc, rc))
+                else:
+                    corr[rq].append((rc, lc))
+                continue
+            placed = False
+            for (qq, cc, other) in ((lq, lc, r), (rq, rc, l)):       # alias col = const / fn / sublink
+                if qq in aliases and cc:
+                    if _t(other) in ("FuncCall", "SubLink"):
+                        fns[qq].append({"mcol": cc, "node": other})
+                    else:
+                        cv = _const(other)
+                        if cv is not None:
+                            extras[qq][cc] = cv
+                        else:
+                            unmodeled = True
+                    placed = True
+                    break
+            if not placed:
+                unmodeled = True
+            continue
+        placed = False
+        for a in aliases:
+            bx = _bool_extra(c, a)
+            if bx:
+                extras[a][bx[0]] = bx[1]; placed = True; break
+        if not placed:
+            unmodeled = True
+    anchors = [a for a in aliases if corr[a]]
+    if len(anchors) == 1:
+        anchor = anchors[0]
+    elif not anchors and len(uid) == 1:
+        anchor = next(iter(uid))
+    else:
+        return None                    # ambiguous or uncorrelated -> defer to the solver as-is
+    if len(aliases) == 2:
+        # 2-table path: byte-identical to before (MB-2). One joined table reached from the anchor.
+        joined = next(a for a in aliases if a != anchor)
+        on = []
+        for (qA, cA, qB, cB) in joinkeys:
+            if {qA, qB} == {anchor, joined}:
+                on.append((cA, cB) if qA == anchor else (cB, cA))
+        if not on:
+            return None                    # tables not actually joined (cross join) -> defer
+        return {"mtable": aliases[anchor], "alias": anchor, "uid": uid.get(anchor),
+                "corr": corr[anchor], "extras": extras[anchor], "fns": fns[anchor],
+                "agg": [], "target_col": None, "unmodeled": unmodeled,
+                "joins": [{"mtable": aliases[joined], "alias": joined, "on": on,
+                           "uid": uid.get(joined), "extras": extras[joined], "fns": fns[joined]}]}
+    # MB-2b: N-table (>2) join chain. A table carrying an opaque fn conjunct, or the same base table joined
+    # twice, cannot be witnessed soundly -> defer. Otherwise UNION-FIND the columns tied by equijoins into
+    # shared-value GROUPS, tag a group when one of its columns carries the anchor's correlation / auth.uid() /
+    # a constant, and pre-assign each group a value-ref. Each table's aux row is {col: its group's value-ref};
+    # the seeder materializes the refs and emits the rows in reversed-BFS-from-anchor order (ultimate FK
+    # parents first) so _seed_one's ON CONFLICT parent-seeding lands the extras. DB-verified downstream, so a
+    # wrong FK direction / unsatisfiable shape simply fails to confirm -> NT, never a false pass.
+    if any(fns[a] for a in aliases) or len(set(aliases.values())) != len(aliases):
+        return None
+    adj = {a: set() for a in aliases}
+    parent = {}
+    def _find(x):
+        parent.setdefault(x, x)
+        r = x
+        while parent[r] != r:
+            r = parent[r]
+        while parent[x] != r:
+            parent[x], x = r, parent[x]
+        return r
+    for (qA, cA, qB, cB) in joinkeys:
+        adj[qA].add(qB); adj[qB].add(qA)
+        parent[_find((qA, cA))] = _find((qB, cB))
+    # every base table must be equijoined into the anchor's component (BFS gives the parents-first order)
+    seen, frontier, order = {anchor}, [anchor], [anchor]
+    while frontier:
+        nxt = []
+        for a in frontier:
+            for b in sorted(adj[a]):
+                if b not in seen:
+                    seen.add(b); nxt.append(b); order.append(b)
+        frontier = nxt
+    if seen != set(aliases):
+        return None                        # a table not equijoined into the anchor's component -> defer
+    g_uid, g_const, g_corr = set(), {}, {}
+    for a, col in uid.items():
+        g_uid.add(_find((a, col)))
+    for a in aliases:
+        for col, cv in extras[a].items():
+            g = _find((a, col))
+            if g in g_const and g_const[g] != cv:
+                return None                # two different constants forced equal -> unsatisfiable
+            g_const[g] = cv
+    for i, (mcol, rcol) in enumerate(corr[anchor]):
+        g_corr.setdefault(_find((anchor, mcol)), []).append((i, rcol))
+    if g_uid & set(g_const):
+        return None                        # a column pinned to BOTH auth.uid() and a constant -> unsatisfiable
+    groups = sorted({_find(k) for k in list(parent)}, key=str)
+    gref, outer = {}, []
+    for gi, g in enumerate(groups):
+        if g in g_uid:
+            gref[g] = ("uid",)
+        elif g in g_const:
+            gref[g] = ("const", g_const[g])
+        elif g in g_corr:
+            gref[g] = ("corr", g_corr[g][0][0])
+        else:
+            gref[g] = ("key", gi)
+    for g, lst in g_corr.items():
+        for (_i, rcol) in lst:
+            outer.append((rcol, gref[g]))
+    cols_by_alias = {a: sorted({c for (qa, c) in parent if qa == a}) for a in aliases}
+    aux = [{"table": aliases[a], "cols": {c: gref[_find((a, c))] for c in cols_by_alias[a]}}
+           for a in reversed(order)]
+    return {"mtable": aliases[anchor], "alias": anchor, "uid": uid.get(anchor),
+            "corr": corr[anchor], "extras": extras[anchor], "fns": [],
+            "agg": [], "target_col": None, "unmodeled": unmodeled,
+            "joins": [{"alias": a} for a in aliases if a != anchor],   # truthy -> other consumers stay conservative
+            "njoin": {"aux": aux, "outer": outer, "has_uid": bool(g_uid)}}
+
+
+def _scalar_membership_sig(node):
+    """MB-3: the two-tenant HAZARD shape written as a SCALAR subquery ->
+    `<qcol> = (SELECT <scope> FROM <junction> WHERE <juser> = auth.uid())`. An EXPR_SUBLINK on one
+    side of an equality, a bare column of the table under test on the other; the subquery reads a
+    SINGLE base table, projects ONE bare column (the scope), and filters that table's user column to
+    auth.uid(). Returns {"qcol","junction","muser","mscope"} or None.
+
+    This is the scalar sibling of canonical EXISTS membership: correct only while every user has ONE
+    membership; the moment a user joins a second tenant the subquery returns 2 rows and every row's
+    policy check raises 21000. Deliberately distinct from `_scalar_lookup` (subquery compared to a
+    CONST -> a role/flag read) and from `col = (SELECT auth.uid())` (FROM-less, always single-row):
+    both of those return None here. The membership-differential probe seeds a two-tenant identity and
+    OBSERVES the 21000 live, upgrading this shape from a static lint to a failing test."""
+    if _t(node) != "A_Expr" or _names(_v(node).get("name")) != "=":
+        return None
+    L, R = _v(node).get("lexpr"), _v(node).get("rexpr")
+    for side, other in ((L, R), (R, L)):
+        if _t(side) != "SubLink" or _v(side).get("subLinkType") != "EXPR_SUBLINK":
+            continue
+        qcol = _colname(other)                      # the table-under-test column (not a const)
+        if not qcol:
+            continue
+        ss = (_v(side).get("subselect") or {}).get("SelectStmt", {})
+        frm = ss.get("fromClause", [])
+        if len(frm) != 1 or "RangeVar" not in frm[0]:
+            continue                                # single base table only (FROM-less / joins -> not this shape)
+        rv = frm[0]["RangeVar"]
+        junction = (rv.get("schemaname") + "." if rv.get("schemaname") else "") + rv.get("relname", "")
+        tl = ss.get("targetList", [])
+        if len(tl) != 1:
+            continue
+        mscope = _colname(tl[0].get("ResTarget", {}).get("val"))
+        if not mscope:
+            continue
+        muser = None
+        for (l, r) in _eq_pairs(ss.get("whereClause")):
+            if _is_func(l, "auth.uid") and _colname(r): muser = _colname(r)
+            elif _is_func(r, "auth.uid") and _colname(l): muser = _colname(l)
+        if not muser or mscope == muser:            # need a user filter, and a scope distinct from it
+            continue
+        return {"qcol": qcol, "junction": junction, "muser": muser, "mscope": mscope}
+    return None
+
+
+def _subquery_sig(subselect, testexpr=None):
+    """F2 (= BL-5): the ONE reader of a policy subquery's shape, consumed by the classifier
+    (_membership), the general subquery witness (_solve_subquery) and the relational-state demand
+    extractor (_subquery_tables) — a new subquery nuance is taught HERE, once. Returns None when
+    there is no single base table or the WHERE contains OR; otherwise a signature dict where
+    `unmodeled` marks any conjunct outside the modeled grammar (each consumer decides how strict
+    to be):
+      mtable, alias            the (qualified) base table and its alias
+      uid                      subq column compared to auth.uid() (the identity correlation)
+      corr [(subq, outer)]     column = column correlations (testexpr/IN first, then WHERE order)
+      extras {subq col: lit}   equality-to-constant and bare-boolean conditions
+      fns [{mcol, node}]       subq column = <opaque fn()/sublink> conjuncts (mock candidates)
+      agg [cols]               the aggregated column when the target is sum/avg/min/max
+      target_col               the first target column (the IN-subquery's yielded column)
+    """
+    ss = (subselect or {}).get("SelectStmt", {})
+    frm = ss.get("fromClause", [])
+    if not frm:
+        return None
+    if not (len(frm) == 1 and "RangeVar" in frm[0]):
+        return _join_sig(ss, frm, testexpr)   # MB-2: 2-table inner-join subquery (else None)
+    rv = frm[0]["RangeVar"]
+    mtable = (rv.get("schemaname") + "." if rv.get("schemaname") else "") + rv.get("relname", "")
+    if not mtable:
+        return None
+    alias = (rv.get("alias") or {}).get("aliasname") or rv.get("relname")
+    sig = {"mtable": mtable, "alias": alias, "uid": None, "corr": [], "extras": {}, "fns": [],
+           "agg": [], "target_col": None, "unmodeled": False, "joins": []}
+    tl = ss.get("targetList", [])
+    if tl:
+        tval = tl[0].get("ResTarget", {}).get("val")
+        sig["target_col"] = _colname(tval)
+        if _t(tval) == "FuncCall":                     # sum/avg/min/max -> note the aggregated column
+            fn = _names(_v(tval).get("funcname")).split(".")[-1].lower()
+            fa = _v(tval).get("args", [])
+            ac = _colname(fa[0]) if fa else None
+            if fn in ("sum", "avg", "min", "max") and ac:
+                sig["agg"].append(ac)
+    if testexpr is not None:                           # outer IN (SELECT target FROM ...) correlation, FIRST
+        _, rowc = _colqual(testexpr)
+        if rowc and sig["target_col"]:
+            sig["corr"].append((sig["target_col"], rowc))
+        else:
+            sig["unmodeled"] = True
+    where = ss.get("whereClause")
+    conj = _and_conjuncts(where) if where is not None else []
+    if conj is not None:                               # AND-only WHERE -> the single-signature path (unchanged)
+        return _apply_conjuncts(sig, conj, alias)
+    # MB-2b: OR in the subquery WHERE. Distribute to DNF min-terms and take the identity/correlation arm
+    # (the membership arm). Conditions OUTSIDE the OR (e.g. the outer correlation `m.doc = docs.id`) are ANDed
+    # into EVERY min-term, so the falsifier that breaks the correlation still denies every arm. The chosen arm
+    # is a best-effort witness hint flagged `or_split`: the classifier and the relational-state extractor stay
+    # conservative on it, and the solver DB-verifies before baking (an unconfirmed arm -> NT, never a pass).
+    minterms = _dnf_minterms(where)
+    if not minterms or len(minterms) < 2:
+        return None
+    best = None
+    for mt in minterms:
+        arm = {"mtable": mtable, "alias": alias, "uid": None, "corr": list(sig["corr"]), "extras": {},
+               "fns": [], "agg": list(sig["agg"]), "target_col": sig["target_col"],
+               "unmodeled": sig["unmodeled"], "joins": []}
+        _apply_conjuncts(arm, mt, alias)
+        if arm["unmodeled"] or arm["fns"] or not (arm["uid"] or arm["corr"]):
+            continue
+        score = (2 if arm["uid"] else 0) + len(arm["corr"])   # prefer the arm carrying the identity + most correlations
+        if best is None or score > best[0]:
+            best = (score, arm)
+    if best is None:
+        return None
+    best[1]["or_split"] = True
+    return best[1]
 
 
 def extract_signature(node, coltypes):
@@ -446,7 +763,7 @@ def _split_statements(sql):
 # Attribution / funnel — rlsautotest is the free PostgreSQL member of the UnitAutogen family.
 _HOME = "https://github.com/unitautogen"
 
-_TAGLINE = "rlsautotest is part of UnitAutogen — automated unit-test generation for your database."
+_TAGLINE = "rlsautotest is part of UnitAutogen - the next-generation database security-coverage and code-coverage tool for functions and triggers."
 
-_TAGLINE2 = "Need it for SQL Server (tSQLt), Oracle, or Azure? " + _HOME
+_TAGLINE2 = _HOME   # just the project link; the old cross-DB CTA was dropped (not helping)
 

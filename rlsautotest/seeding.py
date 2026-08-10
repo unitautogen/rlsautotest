@@ -8,9 +8,9 @@ from __future__ import annotations
 import json
 import re
 import psycopg
-from .astutil import _split_statements, _sq, _qi, _qt
-from .values import FOREIGN, FUTURE_EXP, INS, RIVAL_ORG, RIVAL_SUB, _bump_lit, _castable_lit, _fill_lit, _nonempty_array_lit, _pick_lit, _verified_lit
-from .catalog import _FK_SQL, _check_bool_udfs, _columns, _constraint_meta, _fk_by_name
+from .astutil import _split_statements, _sq, _qi, _qt, _scalar_membership_sig
+from .values import FOREIGN, FUTURE_EXP, INS, MULTI_ORG, MULTI_ORG2, MULTI_SUB, RIVAL_ORG, RIVAL_SUB, _bump_lit, _castable_lit, _fill_lit, _nonempty_array_lit, _pick_lit, _verified_lit
+from .catalog import _FK_SQL, _check_bool_udfs, _columns, _constraint_meta, _fk_by_name, _single_unique_col
 from .checkwitness import _fmt_check_witness
 from .atoms import _set_claim
 
@@ -278,6 +278,81 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
             anc(rv, a["table"]); stmts.append(insert(a["table"], rv, conflict=True) + "  -- rival tenant (org B) membership")
             rival_on = True
 
+    # ── member of 2 tenants (issue #4): ONE identity holding membership in TWO scopes — the branch's
+    #    org A AND a third org M — plus one extra row of the table under test in org M. The engine then
+    #    probes what that identity actually sees and pins the union cardinality, because a policy bug
+    #    that only manifests when a user belongs to two tenants is INVISIBLE to single-membership seeds.
+    #    Restricted to a PURE canonical-membership branch (kinds == ["membership"]): any other conjunct
+    #    (a claim, an owner link, a row constant) could legitimately narrow the view, and the probe must
+    #    judge enforcement, never guess intent. Skipped when:
+    #      - the table under test IS (or FK-reaches) the membership table — seeding the memberships
+    #        would insert rows INTO the measured table (same self-pollution guard as the rival), or
+    #      - the membership table's schema enforces single membership (unique user column): the
+    #        two-membership state cannot exist in production, so there is nothing to prove.
+    multi = {"on": False}
+    for c in (x for x in per.get("SELECT", {}).get("classes", []) if x.get("handled")) if "SELECT" in cmds else []:
+        # SELECT classes ONLY (v1 probes visibility cardinality) — class idx is per-command, so a
+        # membership class found on another command must not be differentialled against a SELECT branch.
+        if multi["on"]:
+            break
+        if c.get("kinds") != ["membership"] or len(c.get("aux") or []) != 1 or not c.get("scalar_link"):
+            continue
+        a = c["aux"][0]
+        if a.get("kind") != "membership" or q in _touches(a["table"]):
+            continue
+        if conn is not None and _single_unique_col(conn.cursor(), _qt(a["table"]), a["muser_col"]):
+            continue
+        scope_a = a["cols"][a["mscope_col"]]
+        for sc in (scope_a, MULTI_ORG):
+            mv = row_values(a["table"], {a["muser_col"]: f"'{MULTI_SUB}'", a["mscope_col"]: f"'{sc}'"})
+            anc(mv, a["table"]); stmts.append(insert(a["table"], mv, conflict=True) + "  -- member of 2 tenants (both orgs)")
+        xv = row_values(q, {**c["rowseed"], c["scalar_link"]: f"'{MULTI_ORG}'"}, salt=400 + c["idx"])
+        anc(xv, q); stmts.append(insert(q, xv, conflict=q_scope_parent) + "  -- org M row (visible ONLY via the second membership)")
+        multi = {"on": True, "shape": "membership", "branch": c["idx"], "extra": 1,
+                 "claims": json.dumps({"sub": MULTI_SUB, "role": "authenticated", "exp": FUTURE_EXP})}
+        # MB-3b: canonical EXISTS-membership WRITE union drift-guard. If the table ALSO takes a
+        # membership-scoped INSERT on the SAME scope column, build a FRESH org-M-scoped insert row so the
+        # emitter can probe the 2-tenant member WRITING into their SECOND tenant and bake the observed
+        # outcome (a correct WITH CHECK -> green; a later drift that blocks the second tenant -> red). Gated
+        # on a matching membership INSERT branch, so owner/other write shapes add nothing and stay byte-identical.
+        if "INSERT" in cmds and any(ic.get("handled") and ic.get("kinds") == ["membership"]
+                                    and ic.get("scalar_link") == c["scalar_link"]
+                                    for ic in per.get("INSERT", {}).get("classes", [])):
+            _im = row_values(q, {**c["rowseed"], c["scalar_link"]: f"'{MULTI_ORG}'"}, salt=480 + c["idx"]); anc(_im, q)
+            multi["ins_m"] = _im
+
+    # ── member of 2 tenants, SCALAR-SUBQUERY variant (MB-3): the same hazard written as
+    #    `qcol = (SELECT scope FROM junction WHERE juser = auth.uid())`. This branch is UNCLASSIFIED (an
+    #    unknown atom, floored by relstate on single-membership data), so the canonical detector above
+    #    never sees it and only the static lint flags it. Seed a two-membership identity (TWO junction
+    #    rows, in two of its own scopes) plus one row of the table under test, so the emitter can probe
+    #    read AND write and bake a FAILING test the moment Postgres raises 21000 (the scalar subquery
+    #    returns 2 rows). Same guards as the canonical path: skip when the table under test IS / FK-reaches
+    #    the junction (self-pollution), and skip a single-membership junction (unique user column -> the
+    #    two-membership state cannot exist). Byte-identical for every schema without this exact shape.
+    if not multi["on"]:
+        _sc_sig, _sc_cmds = None, set()
+        for _cmd0 in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+            for cc in per.get(_cmd0, {}).get("classes", []):
+                _hit = next((s for _rn in (cc.get("raw_atoms") or []) for s in [_scalar_membership_sig(_rn)] if s), None)
+                if _hit and (_sc_sig is None or (_hit["junction"] == _sc_sig["junction"] and _hit["muser"] == _sc_sig["muser"])):
+                    _sc_sig = _sc_sig or _hit
+                    _sc_cmds.add(_cmd0)
+        if _sc_sig and _sc_cmds:
+            _jt = _sc_sig["junction"]
+            _ok = q not in _touches(_jt)
+            if _ok and conn is not None and _single_unique_col(conn.cursor(), _qt(_jt), _sc_sig["muser"]):
+                _ok = False   # the junction enforces single membership -> the two-tenant state cannot arise
+            if _ok:
+                for _sc in (MULTI_ORG2, MULTI_ORG):   # TWO scopes of the member's OWN -> scalar subquery returns 2 rows
+                    _mv = row_values(_jt, {_sc_sig["muser"]: f"'{MULTI_SUB}'", _sc_sig["mscope"]: f"'{_sc}'"})
+                    anc(_mv, _jt); stmts.append(insert(_jt, _mv, conflict=True) + "  -- member of 2 tenants (scalar-subquery hazard)")
+                _xv = row_values(q, {_sc_sig["qcol"]: f"'{MULTI_ORG2}'"}, salt=460)
+                anc(_xv, q); stmts.append(insert(q, _xv, conflict=q_scope_parent) + "  -- row whose scalar policy check errors for a 2-tenant member")
+                _ins_row = row_values(q, {_sc_sig["qcol"]: f"'{MULTI_ORG2}'"}, salt=461); anc(_ins_row, q)
+                multi = {"on": True, "shape": "scalar", "cmds": sorted(_sc_cmds), "ins_row": _ins_row,
+                         "claims": json.dumps({"sub": MULTI_SUB, "role": "authenticated", "exp": FUTURE_EXP})}
+
     # INSERT-test rows: fresh value when link is unique/PK (avoids PK collision); pre-seed ancestors
     insert_plan = {}
     if "INSERT" in cmds:
@@ -297,7 +372,13 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
     return {"q": _qt(q), "seed": seed, "total_rows": total_rows, "insert_plan": insert_plan,
             "nobody_ins": nobody_ins, "primary": primary, "pkind": pkind, "rowlinked": rowlinked,
             "any_grant": any_grant, "fill": fill, "foreign_val": foreign_val,
-            "rival": {"on": rival_on, "claims": json.dumps(rival_claims)}}
+            "rival": {"on": rival_on, "claims": json.dumps(rival_claims)}, "multi": multi,
+            # aux/scope tables (membership / rbac / scalar-lookup side rows). The RE-SEED and the probe's
+            # arrange must clear THESE BEFORE `DELETE FROM q`: when q is the aux table's FK PARENT (orgs/
+            # memberships, teams/team_members), deleting q first violates the FK and -- in the emitted
+            # pgTAP file, where the reseed's DELETE ran raw -- aborted the whole transaction ("planned N
+            # ran M" under pg_prove).
+            "aux_tables": sorted({a["table"] for c in all_h for a in c["aux"]})}
 
 
 
@@ -351,6 +432,8 @@ def _synthesize_row(conn, schema, table, fixed=None, _depth=0, budget=24):
     build a row it returns None -> caller stays NOT_TESTABLE, never a fabricated pass."""
     if _depth > 6:
         return None, None, None
+    if getattr(conn, "_rlsa_no_probe", False):
+        return None, None, None   # MB-10 --no-probe: no row synthesis (which would run INSERT probes against the target)
     q = f"{schema}.{table}"
     cur = conn.cursor()
     cur.execute("""SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,

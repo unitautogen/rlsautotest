@@ -21,7 +21,8 @@ def _membership(subselect, testexpr):
     F2: a thin labeler over the shared `_subquery_sig` reader — the shape grammar lives there, once."""
     sig = _subquery_sig(subselect, testexpr)
     if (sig is not None and sig["uid"] and len(sig["corr"]) == 1
-            and not sig["extras"] and not sig["unmodeled"]):
+            and not sig["extras"] and not sig["unmodeled"] and not sig.get("joins")
+            and not sig.get("or_split")):
         mscope, rowscope = sig["corr"][0]
         if mscope and rowscope:
             return Atom(kind="membership", mtable=sig["mtable"], muser_col=sig["uid"],
@@ -256,6 +257,165 @@ def _func_selects(cur, fn):
 
 
 
+# ---- Function-body expansion (witness hints; the probe ALWAYS runs the REAL function) ---------
+# UDF_UNDERSTANDING_PLAN: expand an opaque boolean policy function's parsed body into an effective
+# predicate node, substitute the call-site constants for its parameters, and hand THAT to the
+# general witness machinery to decide what to SEED. The action side is untouched: the probe still
+# evaluates the real policy calling the real function, so a wrong or incomplete expansion produces
+# an unconfirmed witness and degrades to the mock wiring proof -- never a false pass.
+
+_EXPAND_FAIL = object()   # sentinel: an unexpandable user bool fn poisons the whole substitution
+
+
+def _is_count_positive(v):
+    """`count(*) > 0` / `count(*) >= 1` (either operand order) -> True."""
+    if _t(v) != "A_Expr":
+        return False
+    av = _v(v)
+    op = _names(av.get("name"))
+    l, r = av.get("lexpr"), av.get("rexpr")
+    def _is_count(x):
+        return _t(x) == "FuncCall" and _names(_v(x).get("funcname")).split(".")[-1] == "count"
+    def _thresh(x, opx):
+        c = _const(x)
+        return (opx == ">" and c == "0") or (opx == ">=" and c == "1")
+    if op in (">", ">=") and _is_count(l) and _thresh(r, op):
+        return True
+    if op in ("<", "<=") and _is_count(r) and _thresh(l, {"<": ">", "<=": ">="}[op]):
+        return True
+    return False
+
+
+def _subst_params(node, consts, argnames):
+    """Deep-copy `node` replacing ParamRef $N (SQL bodies) and bare ColumnRef <argname> (named
+    params / plpgsql variables) with the call-site constant nodes. Returns the new node, or
+    _EXPAND_FAIL when a parameter reference cannot be resolved to a constant."""
+    if isinstance(node, dict):
+        if "ParamRef" in node and len(node) == 1:
+            num = (node["ParamRef"] or {}).get("number")
+            if not num or num > len(consts):
+                return _EXPAND_FAIL
+            return consts[num - 1]
+        if "ColumnRef" in node and len(node) == 1:
+            cn = _colname(node)
+            if cn in argnames:
+                i = argnames.index(cn)
+                if i >= len(consts):
+                    return _EXPAND_FAIL
+                return consts[i]
+            return node
+        out = {}
+        for k, val in node.items():
+            r = _subst_params(val, consts, argnames)
+            if r is _EXPAND_FAIL:
+                return _EXPAND_FAIL
+            out[k] = r
+        return out
+    if isinstance(node, list):
+        out = []
+        for x in node:
+            r = _subst_params(x, consts, argnames)
+            if r is _EXPAND_FAIL:
+                return _EXPAND_FAIL
+            out.append(r)
+        return out
+    return node
+
+
+def _expand_fn_predicate(cur, fn, argnodes):
+    """One function's body -> a closed predicate AST with the call-site constants substituted, or
+    None. Accepted body shapes (single query only): a FROM-less `SELECT <expr>` (covers
+    `SELECT EXISTS(...)` and a plpgsql RETURN expression), and `SELECT count(*) > 0 FROM ... WHERE ...`
+    (rewritten to an EXISTS sublink). VOLATILE functions are refused (no stable witness semantics)."""
+    parts = fn.split("."); name = parts[-1]; sch = parts[-2] if len(parts) > 1 else None
+    cur.execute("""SELECT p.provolatile FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE p.proname=%s AND (%s::text IS NULL OR n.nspname=%s)
+        ORDER BY (n.nspname='public')::int LIMIT 1""", (name, sch, sch))
+    row = cur.fetchone()
+    if not row or row[0] == "v":
+        return None
+    selects, argnames = _func_selects(cur, fn)
+    if len(selects) != 1:
+        return None
+    ss = selects[0]
+    tl = ss.get("targetList", [])
+    node = None
+    if len(tl) == 1 and not ss.get("fromClause"):
+        node = tl[0].get("ResTarget", {}).get("val")
+    elif len(tl) == 1 and ss.get("fromClause"):
+        v = tl[0].get("ResTarget", {}).get("val")
+        if _is_count_positive(v):
+            sub = {k: ss[k] for k in ("fromClause", "whereClause") if k in ss}
+            sub["targetList"] = [{"ResTarget": {"val": {"A_Const": {"ival": {"ival": 1}}}}}]
+            sub["limitOption"] = "LIMIT_OPTION_DEFAULT"; sub["op"] = "SETOP_NONE"
+            node = {"SubLink": {"subLinkType": "EXISTS_SUBLINK", "subselect": {"SelectStmt": sub}}}
+    if node is None:
+        return None
+    consts = []
+    for a in (argnodes or []):
+        if _const(a) is None:
+            return None            # a non-constant argument cannot be closed over -> stay on wiring
+        consts.append(a)
+    out = _subst_params(node, consts, argnames or [])
+    return None if out is _EXPAND_FAIL else out
+
+
+def _user_bool_fn(cur, fnname, _cache={}):
+    """Is `fnname` a user-defined boolean function (SQL or plpgsql)? Cached per name."""
+    if fnname in _cache:
+        return _cache[fnname]
+    parts = fnname.split("."); name = parts[-1]; sch = parts[-2] if len(parts) > 1 else None
+    cur.execute("""SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        JOIN pg_type t ON t.oid=p.prorettype JOIN pg_language l ON l.oid=p.prolang
+        WHERE p.proname=%s AND (%s::text IS NULL OR n.nspname=%s)
+          AND t.typname='bool' AND l.lanname IN ('sql','plpgsql')
+          AND n.nspname NOT IN ('pg_catalog','information_schema','auth')""", (name, sch, sch))
+    _cache[fnname] = bool(cur.fetchone()[0])
+    return _cache[fnname]
+
+
+def _expand_udf_calls(node, cur, depth=0, seen=None):
+    """Replace EVERY call to a user-defined boolean function anywhere inside `node` with its
+    expanded body predicate, transitively (a function calling a function expands through, with a
+    depth cap and a cycle guard). Returns the substituted node, or None when any such call cannot
+    be expanded -- the caller then leaves the branch on the mock wiring path. Non-boolean and
+    builtin functions are left untouched (the witness machinery handles or refuses them itself)."""
+    seen = seen if seen is not None else frozenset()
+
+    def walk(n):
+        if isinstance(n, dict):
+            if "FuncCall" in n and len(n) == 1:
+                nm = _names((n["FuncCall"] or {}).get("funcname"))
+                if nm and _user_bool_fn(cur, nm):
+                    bare = nm.split(".")[-1]
+                    if bare in seen or depth >= 3:
+                        return _EXPAND_FAIL
+                    exp = _expand_fn_predicate(cur, nm, (n["FuncCall"] or {}).get("args") or [])
+                    if exp is None:
+                        return _EXPAND_FAIL
+                    exp2 = _expand_udf_calls(exp, cur, depth + 1, seen | {bare})
+                    return _EXPAND_FAIL if exp2 is None else exp2
+            out = {}
+            for k, v in n.items():
+                r = walk(v)
+                if r is _EXPAND_FAIL:
+                    return _EXPAND_FAIL
+                out[k] = r
+            return out
+        if isinstance(n, list):
+            out = []
+            for x in n:
+                r = walk(x)
+                if r is _EXPAND_FAIL:
+                    return _EXPAND_FAIL
+                out.append(r)
+            return out
+        return n
+
+    res = walk(node)
+    return None if res is _EXPAND_FAIL else res
+
+
 def _introspect_rbac(cur, fn, arg):
     """RBAC fn (AST): a SELECT over a (role, permission) table where the permission column is
     compared to the fn's argument and the role column to the caller's JWT claim (inline OR via a
@@ -484,15 +644,25 @@ def _cmd_dnf(pols, cmd, clause, cur):
                 if a.get("kind") == "auth_role" and a.get("value") == "authenticated": is_open = True
                 if a.get("kind") == "authuid_present": is_open = True   # auth.uid() IS NOT NULL: open to any authenticated user
             if not atoms: is_open = True
-            key = tuple(sorted(f"{a.get('kind')}|{a.get('col')}|{a.get('value')}|{a.get('mtable')}|{','.join(map(str, a.get('values', [])))}" for a in atoms))
+            key = tuple(sorted(f"{a.get('kind')}|{a.get('col')}|{a.get('value')}|{a.get('mtable')}|{','.join(map(str, a.get('values', [])))}|{a.get('text')}" for a in atoms))   # text: two DIFFERENT unknown atoms must not collide (a colliding key silently dropped the second branch)
             if key not in seen: seen.add(key); dnf.append(atoms); srcs.append({"policy": p[0], "check": chk, "raw": list(mt)})
-    rest = []
+    rest, rest_raw = [], []
     for p in restr:
         pe = eff(p)
         w = _where(pe) if pe else None
         if w:
+            rest_raw.append(w)   # MB-6: the RAW restrictive predicate node -> conjoined into every routed obligation
             for mt in _dnf_ast(w): rest += [classify_node(n, cur) for n in mt]
     dnf = [mt + rest for mt in dnf]
+    if rest_raw:
+        # A restrictive policy is AND'd onto whichever permissive branch grants (Postgres semantics). The
+        # classified path already conjoins the classified restrictive atoms above (`mt + rest`); this carries
+        # the same predicates in RAW form so the OBLIGATION ROUTER can conjoin them into an UNCLASSIFIED
+        # branch's solver node too -- otherwise a rescued witness satisfies only the permissive part, the real
+        # policy (which includes the restrictive check) denies, and the branch falls to PARTIALLY TESTED
+        # (sound, but coverage lost). Same list for every min-term of this command.
+        for s in srcs:
+            s["raw_restrict"] = list(rest_raw)
     return dnf, bool(perm), is_open, srcs
 
 
@@ -518,12 +688,18 @@ def analyze(cur, schema, table):
             cc["src_policy"] = srcs[i].get("policy") if i < len(srcs) else None
             cc["src_check"] = srcs[i].get("check") if i < len(srcs) else None
             cc["raw_atoms"] = srcs[i].get("raw") if i < len(srcs) else None   # raw AST conjunct nodes -> per-min-term solver fallback (BL-1)
+            cc["raw_restrict"] = srcs[i].get("raw_restrict") if i < len(srcs) else None   # MB-6: raw restrictive predicates to conjoin into the routed obligation
             classes.append(cc)
         per[cmd] = {"classes": classes, "open": is_open, "has_pol": has_pol}
         if cmd == "SELECT":
             per[cmd]["anon_open"] = any(("public" in (p[3] or []) or "anon" in (p[3] or []) or "anonymous" in (p[3] or [])) and _is_true_clause(p[4])
                                         for p in pols if p[2].upper() in ("SELECT", "ALL") and p[1] == "PERMISSIVE")
     notes = []
+    _pgroles = sorted({r for p in pols for r in (p[3] or []) if str(r).startswith("pg_")})
+    if _pgroles:
+        notes.append("policy audience includes built-in group role(s) " + ", ".join(_pgroles) +
+                     " -- membership in pg_* roles is computed by Postgres (not SET ROLE-able), so these"
+                     " audiences are noted but not probed as custom roles; verify their reach manually")
     for p in pols:
         if p[2].upper() in ("SELECT", "ALL") and p[1] == "PERMISSIVE" and _is_true_clause(p[4]):
             notes.append(f"policy {p[0]}: SELECT USING (true) -> every {p[3]} sees ALL rows (review)")
