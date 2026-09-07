@@ -2,7 +2,7 @@
 
 [![Featured in Supabase's July 2026 Developer Update](https://img.shields.io/badge/Featured_in-Supabase_Developer_Update-3ECF8E?logo=supabase&logoColor=white)](https://github.com/supabase/supabase/releases/tag/v1.26.07)
 
-**Deterministic pgTAP test generation for Postgres / Supabase Row-Level Security.**
+**Automated pgTAP test generation for Postgres / Supabase Row-Level Security.** You write no test SQL and no fixtures - point it at your database and it generates the whole suite for you. Deterministic, not an LLM guessing.
 
 > Featured in Supabase's [July 2026 Developer Update](https://github.com/supabase/supabase/releases/tag/v1.26.07) under "Made with Supabase."
 
