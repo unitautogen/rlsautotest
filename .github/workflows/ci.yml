@@ -78,8 +78,9 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/customrole.sql # F5: policies granted TO a custom role (reporter) -> probed via SET ROLE and shown as their own report row instead of silently vanishing from the client DNF, must stay green
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/quoted_idents.sql # #357 GUARD: PascalCase (quoted) table + columns with GUC tenancy -> the generator must QUOTE every identifier it emits, else seeds die 42703/undefined_table and every cell goes UNRELIABLE. Must stay green.
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/seedfail.sql # seedfail is now GREEN: the checkwitness feature seeds its ten-digit format CHECK by construction (the stable un-seedable negative moved to seedimpossible.sql)
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f examples/sessionident.sql # owner checks on a session GUC (current_setting) and the login role (SESSION_USER) -> classified and tested for real (GUC driven, two real session users), must stay green
           rc=0
-          for schema in public tenancy rbac rbt clearance synth adversarial mockforce wm wa wf2 wsq wn wj wcard recursion xtypes za rxf crole qident seedfail; do
+          for schema in public tenancy rbac rbt clearance synth adversarial mockforce wm wa wf2 wsq wn wj wcard recursion xtypes za rxf crole qident seedfail sid; do
             echo "===== schema: $schema ====="
             rlsautotest --db-url "$DATABASE_URL" --schema "$schema" --emit "out_$schema"
             for f in "out_$schema"/tests/database/rls/*.sql; do
@@ -98,6 +99,26 @@ jobs:
           # [solver] tests vanish and the novel branch is silently dropped — fail CI if they're missing.
           grep -rq '\[solver\]' out_adversarial/tests/database/rls/ || { echo "FAIL: BL-1 produced no [solver] tests for adversarial — the novel branches were dropped"; rc=1; }
           rlsautotest --db-url "$DATABASE_URL" --schema adversarial --debug-unhandled   # show the classifier gaps for the record
+          exit $rc
+      - name: Session-identity owner checks are tested for real and catch a loosened policy (examples/sessionident.sql)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost/app
+        run: |
+          # sid.docs (tenant = current_setting('app.tenant')) and sid.rolemine (ownr = SESSION_USER) were
+          # NOT TESTABLE before. Guard both directions: each table classifies to 8/8, and the SAME emitted
+          # suite that passes on the real policies goes red once both are loosened to USING (true).
+          rc=0
+          for t in docs rolemine; do
+            rlsautotest --db-url "$DATABASE_URL" --schema sid --table "$t" --describe | tee /tmp/sid_$t.txt
+            grep -q 'coverage: 8/8' /tmp/sid_$t.txt || { echo "FAIL: sid.$t is not 8/8"; rc=1; }
+          done
+          rlsautotest --db-url "$DATABASE_URL" --schema sid --emit out_sid_guard --no-helpers
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "ALTER POLICY tenant_iso ON sid.docs USING (true); ALTER POLICY own_rows ON sid.rolemine USING (true);"
+          for t in docs rolemine; do
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=0 -f out_sid_guard/tests/database/rls/*-rls-$t.test.sql > /tmp/sid_loose_$t.txt 2>&1 || true
+            grep -q '^ *not ok' /tmp/sid_loose_$t.txt || { echo "FAIL: loosening sid.$t to USING (true) did NOT turn its suite red"; rc=1; }
+          done
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "ALTER POLICY tenant_iso ON sid.docs USING (tenant = current_setting('app.tenant', true)); ALTER POLICY own_rows ON sid.rolemine USING (ownr = SESSION_USER);"
           exit $rc
       - name: Catch the cross-policy WITH CHECK leak (examples/transitions.sql)
         env:

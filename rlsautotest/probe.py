@@ -180,11 +180,13 @@ class ProbeBaker:
     # ---- emit-into-body test writers (the old read_test / mut_test / deny closures) ----
     def read_test(self, cjson, role, assertion):
         c = self.ctx
-        c.n[0] += 1; c.body.extend(c.ident(cjson, role)); c.body.append(assertion); c.body.append("RESET ROLE;")
+        c.n[0] += 1; c.body.extend(c.ident(cjson, role)); c.body.append(assertion)
+        c.body.extend(c.session_cleanup(cjson)); c.body.append("RESET ROLE;")   # cleanup: [] for JWT-only identities
 
     def mut_test(self, cjson, role, assertion):
         c = self.ctx
-        c.n[0] += 1; c.body.extend(c.ident(cjson, role)); c.body.append(assertion); c.body.append(c.reseed)
+        c.n[0] += 1; c.body.extend(c.ident(cjson, role)); c.body.append(assertion)
+        c.body.extend(c.session_cleanup(cjson)); c.body.append(c.reseed)
 
     def deny(self, cmd, cjson, role, who):
         """Prove an action is denied (missing grant / schema usage -> 42501)."""

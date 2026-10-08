@@ -120,7 +120,50 @@ class EmitContext:
             out.append(f"SELECT set_config('request.jwt.claim.role', '', true){term}")
         return out
 
+    @staticmethod
+    def _split_session(cjson):
+        """Split the reserved non-JWT identity keys out of a claims JSON -> (claims_json, gucs, session_role).
+        `__rlsa_guc` ({setting: value}) and `__rlsa_session` (role name) are set by build_class / the seed
+        planner's rival for GUC- and SESSION_USER-owned rows. Fast path: a claims string without the prefix is
+        returned untouched, so every JWT-only identity emits byte-identical SQL."""
+        if not cjson or '"__rlsa_' not in cjson:
+            return cjson, {}, None
+        d = json.loads(cjson)
+        gucs = d.pop("__rlsa_guc", None) or {}
+        sess = d.pop("__rlsa_session", None)
+        return json.dumps(d), gucs, sess
+
+    @staticmethod
+    def _session_wrap(gucs, sess, term, jwt_stmts):
+        """Establish the non-JWT session identity around the usual claims + SET ROLE statements.
+        SET SESSION AUTHORIZATION goes FIRST: it also resets the current role to that user, so it must
+        precede SET LOCAL ROLE. The GUCs go LAST, so they win over anything the JWT statements set (a policy
+        reading a flat claim GUC like request.jwt.claim.sub directly); custom dotted settings are settable
+        by any role, so setting them after SET ROLE is fine."""
+        pre = [f"SET LOCAL SESSION AUTHORIZATION {_qi(sess)}{term}"] if sess else []
+        post = [f"SELECT set_config({_qlit(k)}, {_qlit(v)}, true){term}" for k, v in sorted(gucs.items())]
+        return pre + jwt_stmts + post
+
+    def session_cleanup(self, cjson):
+        """EMITTED-file cleanup after a test that acted as a GUC / SESSION_USER identity. The probe runs each
+        identity in a rolled-back savepoint, but the emitted suite is one transaction: a SET LOCAL lasts until
+        it ends, so without this the next identity would inherit the session user (and `SET ROLE anon` from a
+        non-member session would error) or the tenant GUC (and see the previous identity's rows). Empty for
+        every JWT-only identity -> byte-identical output."""
+        _c, gucs, sess = self._split_session(cjson)
+        out = ["RESET SESSION AUTHORIZATION;"] if sess else []
+        out += [f"SELECT set_config({_qlit(k)}, '', true);" for k in sorted(gucs)]
+        return out
+
     def ident(self, cjson, role):
+        cjson, gucs, sess = self._split_session(cjson)
+        return self._session_wrap(gucs, sess, ";", self._ident_jwt(cjson, role))
+
+    def pident(self, cjson, role):
+        cjson, gucs, sess = self._split_session(cjson)
+        return self._session_wrap(gucs, sess, "", self._pident_jwt(cjson, role))
+
+    def _ident_jwt(self, cjson, role):
         if role == self.service_role_name:
             return ["SELECT tests.authenticate_as_service_role();"] if self.helpers else ["SELECT set_config('request.jwt.claims', '', true);", f"SET LOCAL ROLE {_qi(role)};"]
         if role == "anon" or role == "anonymous" or cjson == "":
@@ -137,7 +180,7 @@ class EmitContext:
                 return [f"SELECT tests.authenticate_as('{self.user_for(d['sub'])}');"] + self._flat(cjson, ";")
         return [f"SELECT set_config('request.jwt.claims', {_qlit(cjson)}, true);"] + self._flat(cjson, ";") + [f"SET LOCAL ROLE {_qi(role)};"]
 
-    def pident(self, cjson, role):
+    def _pident_jwt(self, cjson, role):
         if role == "anon" or cjson == "":
             return ["SELECT set_config('request.jwt.claims', '', true)"] + self._flat("", "") + [f"SET LOCAL ROLE {_qi(role) if cjson == '' else 'anon'}"]
         return [f"SELECT set_config('request.jwt.claims', {_qlit(cjson)}, true)"] + self._flat(cjson, "") + [f"SET LOCAL ROLE {_qi(role)}"]
@@ -165,7 +208,7 @@ class EmitContext:
         # negative control: a legitimate user of a DIFFERENT tenant when the table is tenant/membership-scoped,
         # else a generic other authenticated user (NOBODY).
         if self.S.get("rival", {}).get("on"):
-            out.append(("authenticated, not authorized (other tenant)", self.S["rival"]["claims"], "authenticated", None))
+            out.append((f"authenticated, not authorized ({self.S['rival'].get('label', 'other tenant')})", self.S["rival"]["claims"], "authenticated", None))
         else:
             out.append(("authenticated, not authorized", self.NB, "authenticated", None))
         out.append((self.unauth_role, "", self.unauth_role, None))
@@ -265,3 +308,5 @@ class IdentityClass(_DictCompat):
     kinds: list = None
     tenant_keys: list = None
     fn_mocks: list = None
+    guc_keys: list = None      # session GUC names this class drives (col = current_setting(...))
+    session_rival: str = None  # the second real role for a col = SESSION_USER class (the rival identity)

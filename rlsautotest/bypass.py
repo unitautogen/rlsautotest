@@ -282,9 +282,19 @@ def find_bypass(cur, schema, allow_roles=None):
         if f:
             findings.append(f)
 
-    # roles that bypass RLS
-    cur.execute("""SELECT rolname, rolsuper, rolbypassrls, rolcanlogin FROM pg_roles
-                   WHERE (rolsuper OR rolbypassrls) AND rolname NOT LIKE 'pg\\_%%' ORDER BY rolname""")
+    # roles that bypass RLS. pg_roles is CLUSTER-wide, so a BYPASSRLS role created for another database (or
+    # another schema) would otherwise be reported for every schema tested. A non-superuser BYPASSRLS role only
+    # bypasses something HERE if it can actually reach an RLS table in this schema: schema USAGE plus a table
+    # privilege (effective: direct, inherited, or via PUBLIC). rolbypassrls is not inherited through membership,
+    # so the role's own effective privileges are the right test. Superusers reach everything -> always listed.
+    cur.execute("""SELECT r.rolname, r.rolsuper, r.rolbypassrls, r.rolcanlogin FROM pg_roles r
+                   WHERE (r.rolsuper OR r.rolbypassrls) AND r.rolname NOT LIKE 'pg\\_%%'
+                     AND (r.rolsuper OR EXISTS (
+                         SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                         WHERE n.nspname = %s AND c.relkind IN ('r', 'p') AND c.relrowsecurity
+                           AND has_schema_privilege(r.oid, n.oid, 'USAGE')
+                           AND has_table_privilege(r.oid, c.oid, 'SELECT, INSERT, UPDATE, DELETE')))
+                   ORDER BY r.rolname""", (schema,))
     for rolname, issuper, bypassrls, canlogin in cur.fetchall():
         reachable = (rolname in _CLIENT_ROLES) or canlogin or _client_can_setrole(cur, rolname, roles)
         f = classify_role(rolname, issuper, bypassrls, reachable, allow)

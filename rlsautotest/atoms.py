@@ -6,6 +6,7 @@ Split out of the original single-module cli.py; behavior-preserving.
 """
 from __future__ import annotations
 import json
+import threading
 from pglast.parser import parse_sql_json
 from .structs import Atom, IdentityClass
 from .astutil import ORDER, _array_consts, _colname, _colqual, _const, _eq_pairs, _find_queries, _is_func, _is_true_clause, _is_uuid, _jwt_anywhere, _jwt_keys, _list_consts, _names, _not, _t, _unwrap, _v, _where, _subquery_sig
@@ -75,6 +76,66 @@ def _scalar_lookup(side, other):
 
 
 
+def _guc_name(n):
+    """`current_setting('name'[, missing_ok])` (casts unwrapped) -> 'name', else None. A non-constant
+    setting name cannot be driven, so it stays None (the branch falls to the general paths)."""
+    u = _unwrap(n)
+    if _t(u) == "FuncCall" and _names(_v(u).get("funcname")).split(".")[-1] == "current_setting":
+        args = _v(u).get("args", [])
+        return _const(args[0]) if args else None
+    return None
+
+
+def _is_session_user(n):
+    """The SESSION_USER keyword (parsed as SQLValueFunction SVFOP_SESSION_USER)."""
+    u = _unwrap(n)
+    return _t(u) == "SQLValueFunction" and _v(u).get("op") == "SVFOP_SESSION_USER"
+
+
+_ANALYZE_CTX = threading.local()   # the schema analyze() is classifying, per worker thread (tables run in parallel)
+
+
+def _session_roles(cur):
+    """Two roles that can act as DISTINCT session users for a `col = SESSION_USER` policy.
+
+    The probe runs `SET LOCAL SESSION AUTHORIZATION <r>` (session_user := r) and then the usual
+    `SET LOCAL ROLE authenticated`, so the acting privileges are the same `authenticated` role every other
+    identity uses and only the session identity differs. That needs: a superuser connection (only a
+    superuser session may change session authorization), and roles that are not superuser / BYPASSRLS
+    (either would skip the policy) and can SET ROLE authenticated. Roles that can also become a BYPASSRLS
+    role (an `authenticator`-style switchboard login) are excluded. Roles are cluster-wide, so a role
+    created for ANOTHER database or schema is eligible too; candidates holding a DIRECT grant on the schema
+    under test (its ACL, not inherited) are preferred, then name order, so the choice is deterministic and
+    favours the schema's own roles. Returns (roles, reason): roles is the first two, reason explains a
+    shortfall."""
+    if cur is None:
+        return [], "no database connection to discover session roles"
+    cur.execute("SELECT rolsuper FROM pg_roles WHERE rolname = session_user")
+    r = cur.fetchone()
+    if not r or not r[0]:
+        return [], ("SESSION_USER owner check needs a superuser connection: only a superuser session can "
+                    "SET SESSION AUTHORIZATION to act as two distinct session users")
+    cur.execute("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated')")
+    if not cur.fetchone()[0]:
+        return [], "SESSION_USER owner check needs the 'authenticated' client role to act through"
+    cur.execute("""SELECT r.rolname FROM pg_roles r
+        WHERE NOT r.rolsuper AND NOT r.rolbypassrls AND left(r.rolname, 3) <> 'pg_'
+          AND r.rolname NOT IN ('authenticated', 'anon', 'anonymous', 'service_role')
+          AND CASE WHEN current_setting('server_version_num')::int >= 160000
+                   THEN pg_has_role(r.oid, 'authenticated', 'SET')
+                   ELSE pg_has_role(r.oid, 'authenticated', 'MEMBER') END
+          AND NOT EXISTS (SELECT 1 FROM pg_roles b
+                          WHERE b.rolbypassrls AND b.oid <> r.oid AND pg_has_role(r.oid, b.oid, 'MEMBER'))
+        ORDER BY EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
+                         WHERE n.nspname = %s AND a.grantee = r.oid) DESC, r.rolname
+        LIMIT 2""", (getattr(_ANALYZE_CTX, "schema", None),))
+    roles = [x[0] for x in cur.fetchall()]
+    if len(roles) < 2:
+        return roles, ("SESSION_USER owner check needs two non-superuser, non-BYPASSRLS roles that can "
+                       f"SET ROLE authenticated, to act as two distinct session users; found {len(roles)}")
+    return roles, None
+
+
 def _classify_aexpr(a, cur):
     kind = a.get("kind"); op = _names(a.get("name")); L = a.get("lexpr"); R = a.get("rexpr")
     if kind == "AEXPR_OP_ANY" and op == "=":
@@ -117,6 +178,16 @@ def _classify_aexpr(a, cur):
         if _colname(other): return Atom(kind="tenant", col=_colname(other), keys=keys)
         if _const(other) is not None: return Atom(kind="claim_const", keys=keys, value=_const(other))
         return Atom(kind="unknown", text="jwt eq")
+    # col = current_setting('x'): the row belongs to whoever has the session GUC set to its value.
+    gl, gr = _guc_name(L), _guc_name(R)
+    if (gl or gr) and _colname(R if gl else L):
+        return Atom(kind="guc_owner", col=_colname(R if gl else L), keys=[gl or gr])
+    # col = SESSION_USER: the row belongs to the login (session) role.
+    if (_is_session_user(L) or _is_session_user(R)) and _colname(R if _is_session_user(L) else L):
+        roles, why = _session_roles(cur)
+        if why:
+            return Atom(kind="unknown", text=why)
+        return Atom(kind="session_owner", col=_colname(R if _is_session_user(L) else L), values=roles)
     sl = _scalar_lookup(L, R) or _scalar_lookup(R, L)   # (SELECT col FROM t WHERE key=auth.uid()) = const
     if sl: return sl
     if _colname(L) and _const(R) is not None: return Atom(kind="row_const", col=_colname(L), value=_const(R))
@@ -576,7 +647,28 @@ def _atom_scalar_lookup(at, st):
     st["aux"].append({"table": at["ltable"], "cols": {at["lkey"]: uid, at["lcol"]: at["value"]},
                       "kind": "scalar_lookup", "role_value": at["value"]})
 
+def _guc_val(idx):
+    # Distinct from every JWT `sub` value (CV) so the unique-owner INSERT path in the seed planner, which
+    # swaps in a fresh identity when the sub equals the owner literal, never mistakes a GUC owner for a uid.
+    # uuid-shaped so a `uuid_col = current_setting(..)::uuid` policy casts cleanly as well as a text column.
+    return f"9a000000-0000-4000-8000-{idx:012x}"
+
+def _atom_guc_owner(at, st):
+    """col = current_setting('name'): drive the REAL session GUC to the value the authorized row carries
+    (never mocked). The rival identity sets the same GUC to a different tenant (seeding)."""
+    v = _guc_val(st["idx"]); st["gucs"][at["keys"][0]] = v
+    st["rowseed"][at["col"]] = f"'{v}'"; st["scalar_link"] = at["col"]; st["fk_val"] = v
+    _ident_link(st, at["col"], "guc")
+
+def _atom_session_owner(at, st):
+    """col = SESSION_USER: act as a real role via SET SESSION AUTHORIZATION, own the seeded row as that
+    role. The second discovered role is the rival (a different real session user)."""
+    r = at["values"][0]; st["session"] = r; st["session_rival"] = at["values"][1]
+    st["rowseed"][at["col"]] = "'" + r.replace("'", "''") + "'"; st["scalar_link"] = at["col"]; st["fk_val"] = r
+    _ident_link(st, at["col"], "session")
+
 ATOM_HANDLERS = {
+    "guc_owner": _atom_guc_owner, "session_owner": _atom_session_owner,
     "owner": _atom_owner, "const_identity": _atom_const_identity, "tenant": _atom_tenant,
     "claim_const": _atom_claim_const, "row_const": _atom_row_const, "membership": _atom_membership,
     "array_col": _atom_array_col, "temporal": _atom_temporal, "rbac": _atom_rbac,
@@ -590,13 +682,21 @@ def build_class(min_term, idx, col_dom=None):
     st = {"idx": idx, "col_dom": col_dom,
           "claims": {"sub": CV[idx % len(CV)], "role": "authenticated"},
           "rowseed": {}, "aux": [], "scalar_link": None, "scalar_links": [], "fk_val": None, "handled": True,
-          "reason": None, "has_temporal": False, "tenant_keys": [], "fn_mocks": []}
+          "reason": None, "has_temporal": False, "tenant_keys": [], "fn_mocks": [],
+          "gucs": {}, "session": None, "session_rival": None}
     for at in min_term:
         h = ATOM_HANDLERS.get(at["kind"])
         if h is None:
             st["handled"], st["reason"] = False, f"unhandled atom: {at.get('text')}"
         else:
             h(at, st)
+    # Non-JWT session identity (GUC / SESSION_USER) rides inside the claims under reserved `__rlsa_*` keys,
+    # so every probe/emit path that already threads a claims JSON drives it unchanged. EmitContext.ident /
+    # pident strip these keys before setting request.jwt.claims. Absent for every JWT-only class.
+    if st["gucs"]:
+        st["claims"]["__rlsa_guc"] = dict(st["gucs"])
+    if st["session"]:
+        st["claims"]["__rlsa_session"] = st["session"]
     # Every synthetic authenticated identity carries a future 'exp' so an expiry-aware helper that a policy
     # OR's alongside a handled branch (e.g. `has_role(...) OR user_id = auth.uid()`) returns false for this
     # identity instead of RAISE'ing invalid_jwt (P0001) when the real policy is probed.
@@ -606,7 +706,8 @@ def build_class(min_term, idx, col_dom=None):
                          fk_val=st["fk_val"], rowlinked=bool(st["rowseed"]),
                          handled=st["handled"], reason=st["reason"], has_temporal=st["has_temporal"],
                          kinds=[a["kind"] for a in min_term], tenant_keys=st["tenant_keys"],
-                         fn_mocks=st["fn_mocks"])
+                         fn_mocks=st["fn_mocks"],
+                         guc_keys=(sorted(st["gucs"]) or None), session_rival=st["session_rival"])
 
 
 
@@ -668,6 +769,7 @@ def _cmd_dnf(pols, cmd, clause, cur):
 
 
 def analyze(cur, schema, table):
+    _ANALYZE_CTX.schema = schema   # read by _session_roles to prefer the schema's own roles
     cur.execute("SELECT policyname, permissive, cmd, roles, qual, with_check FROM pg_policies WHERE schemaname=%s AND tablename=%s", (schema, table))
     pols = cur.fetchall()
     cur.execute("""SELECT a.attname, array_agg(e.enumlabel ORDER BY e.enumsortorder)

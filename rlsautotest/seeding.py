@@ -254,9 +254,17 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
     #    (having tenancy != having A's tenancy), and a buggy policy like `org_id IS NOT NULL` is caught.
     rival_claims = {"sub": RIVAL_SUB, "role": "authenticated", "exp": FUTURE_EXP}
     rival_on = False
+    rival_label = None
     for c in all_h:
         for ks in c.get("tenant_keys", []):
             _set_claim(rival_claims, ks, RIVAL_ORG); rival_on = True
+        # GUC-owned rows (col = current_setting('x')): the rival sets the SAME setting to a different
+        # tenant value (org B), so a green deny proves isolation between two set tenants, not just "unset".
+        for gk in c.get("guc_keys") or []:
+            rival_claims.setdefault("__rlsa_guc", {})[gk] = RIVAL_ORG; rival_on = True
+        # SESSION_USER-owned rows: the rival is the second real role, acting as its own session user.
+        if c.get("session_rival") and "__rlsa_session" not in rival_claims:
+            rival_claims["__rlsa_session"] = c["session_rival"]; rival_on = True; rival_label = "other session user"
     def _touches(t0):                                  # t0 + its transitive FK-parent tables
         seen, st = set(), [t0]
         while st:
@@ -372,7 +380,8 @@ def _seed_plan(schema, table, per, cmds, cols, fkmap, colsmap, enums, unique_col
     return {"q": _qt(q), "seed": seed, "total_rows": total_rows, "insert_plan": insert_plan,
             "nobody_ins": nobody_ins, "primary": primary, "pkind": pkind, "rowlinked": rowlinked,
             "any_grant": any_grant, "fill": fill, "foreign_val": foreign_val,
-            "rival": {"on": rival_on, "claims": json.dumps(rival_claims)}, "multi": multi,
+            "rival": {"on": rival_on, "claims": json.dumps(rival_claims),
+                      **({"label": rival_label} if rival_label else {})}, "multi": multi,
             # aux/scope tables (membership / rbac / scalar-lookup side rows). The RE-SEED and the probe's
             # arrange must clear THESE BEFORE `DELETE FROM q`: when q is the aux table's FK PARENT (orgs/
             # memberships, teams/team_members), deleting q first violates the FK and -- in the emitted

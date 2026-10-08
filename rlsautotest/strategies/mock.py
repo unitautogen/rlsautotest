@@ -49,7 +49,7 @@ def _policy_bool_udfs(conn, schema, table):
     cur = conn.cursor()
     cur.execute("""SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid), pg_get_functiondef(p.oid)
         FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace JOIN pg_type t ON t.oid=p.prorettype
-        WHERE t.typname='bool' AND n.nspname NOT IN ('pg_catalog','information_schema','auth')""")
+        WHERE t.typname='bool' AND p.prokind='f' AND n.nspname NOT IN ('pg_catalog','information_schema','auth')""")
     out = []
     for nsp, name, args, fdef in cur.fetchall():
         if (nsp, name) in called or (None, name) in called:   # qualified call, or a bare call resolved by search_path

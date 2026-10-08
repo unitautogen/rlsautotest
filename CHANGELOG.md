@@ -4,6 +4,15 @@ All notable changes to **rlsautotest** are documented here. The format is based 
 [Keep a Changelog](https://keepachangelog.com/); this project is pre-1.0 and versions
 roughly follow semantic versioning.
 
+## [0.7.1] - 2026-10-08
+
+### Added
+- **Owner checks on a session GUC or the login role are now tested for real.** `USING (tenant = current_setting('app.tenant', true))` and `USING (ownr = SESSION_USER)` used to classify as NOT TESTABLE ("unhandled atom: eq") and score 0/8. Both are now recognised as row-owner checks. For the GUC shape, the authorized identity sets the REAL setting to its row's tenant and the not-authorized identity sets it to a DIFFERENT tenant (never a mock, never just "unset"). For the `SESSION_USER` shape, the probe acts as two real roles via `SET LOCAL SESSION AUTHORIZATION` and then the usual `SET ROLE authenticated`, so privileges stay those of the client role and only the session identity differs. The emitted suite resets the session user and clears the GUC after each test so the next identity starts clean. `SESSION_USER` needs a superuser connection and two non-superuser, non-BYPASSRLS roles that can `SET ROLE authenticated` (roles granted on the schema under test are preferred); without them the table stays honestly NOT TESTABLE with that reason. Probe-and-bake as always: a wrong guess degrades to UNRELIABLE, never a false pass. New fixture `examples/sessionident.sql` plus a CI step proving both directions: 8/8 on the real policies, and the same suite goes red once both policies are loosened to `USING (true)`. Suites for JWT-only tables are byte-identical.
+
+### Fixed
+- **Bypass-role findings (L014) no longer list roles that cannot reach the schema under test.** Roles are cluster-wide, so a BYPASSRLS role created for another database appeared in every report. A non-superuser BYPASSRLS role is now reported only when it holds schema USAGE plus a table privilege on an RLS table in the schema being tested; superusers are still always reported.
+- **`_policy_bool_udfs` skips aggregate and window functions.** `pg_get_functiondef` raised on PostGIS aggregates such as `st_samealignment`; the scan now only reads plain functions (`prokind = 'f'`).
+
 ## [0.7.0] - 2026-08-07
 
 ### Added

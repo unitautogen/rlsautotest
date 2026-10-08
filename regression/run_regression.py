@@ -54,6 +54,7 @@ GREEN = [
     ("relstatewrite.sql", "rsw"),     # MB-4: relational-state (cardinality) FOR ALL -> INSERT/UPDATE/DELETE write batteries
     ("recursionwrite.sql", "rcw"),    # MB-4: self-referential hierarchy FOR ALL -> UPDATE/DELETE write batteries (INSERT stays NT)
     ("updcheck.sql", "updcheck"), ("seedfail.sql", "seedfail"),
+    ("sessionident.sql", "sid"),      # owner checks on a session GUC (current_setting) and SESSION_USER -> classified, GUC driven, two real session users (was NT)
 ]
 # fixture, schema, required marker(s) in the failing report
 NEGATIVE = [
@@ -349,7 +350,7 @@ def main():
         failures.append(f"[allow-unreliable] check errored: {e}")
 
     if not a.skip_pytest:
-        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "tests/test_smoke.py", "tests/test_bypassprobe.py", "tests/test_allow_unreliable.py"],
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "tests/test_smoke.py", "tests/test_bypassprobe.py", "tests/test_allow_unreliable.py", "tests/test_session_ident.py"],
                            capture_output=True, text=True, cwd=REPO)
         print("pytest:", (r.stdout + r.stderr).strip().splitlines()[-1])
         if r.returncode != 0:
